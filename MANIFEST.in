@@ -1,0 +1,9 @@
+include LICENSE
+include CHANGELOG.md
+include README.md
+include SECURITY.md
+include install.sh
+include uninstall.sh
+include codex-watch-guardian@.service
+recursive-include systemd *.service
+recursive-include .github *.yml

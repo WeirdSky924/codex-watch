@@ -490,6 +490,55 @@ tmux attach -t codex-goal
 tmux attach -t project-a
 ```
 
+### 使用键盘查看历史记录
+
+依次按：
+
+```text
+Ctrl-b
+[
+```
+
+进入复制/滚动模式后，可以使用方向键、`PageUp`、`PageDown`、`g` 和 `G` 查看历史：
+
+- `g`：跳到最早的记录。
+- `G`：回到最新位置。
+- `/关键词`：向下搜索。
+- `?关键词`：向上搜索。
+- `n`、`N`：切换搜索结果。
+- `q` 或 `Esc`：退出复制/滚动模式。
+
+### 永久开启鼠标滚轮
+
+只对当前 tmux server 临时开启：
+
+```bash
+tmux set-option -g mouse on
+```
+
+永久开启，并避免重复写入相同配置：
+
+```bash
+touch "$HOME/.tmux.conf"
+grep -qxF 'set -g mouse on' "$HOME/.tmux.conf" || \
+  printf '\nset -g mouse on\n' >> "$HOME/.tmux.conf"
+tmux source-file "$HOME/.tmux.conf"
+```
+
+确认配置已经生效：
+
+```bash
+tmux show-options -g -v mouse
+```
+
+期望输出：
+
+```text
+on
+```
+
+开启后可以直接使用鼠标滚轮查看历史。滚动后按 `q` 或 `Esc` 返回最新终端画面。该配置只改变 tmux 的鼠标交互，不会停止或重启 Codex。
+
 ### 查看所有 tmux 会话
 
 ```bash

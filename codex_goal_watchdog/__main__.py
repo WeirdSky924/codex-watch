@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--compact-model", default="gpt-5.6-luna")
     start.add_argument("--compact-reasoning-effort", default="xhigh")
     start.add_argument("--resume-prompt", default=DEFAULT_RESUME_PROMPT)
-    start.add_argument("--cooldown-seconds", type=int, default=0)
+    start.add_argument("--cooldown-seconds", type=int, default=300)
     start.add_argument("--max-recoveries", type=int, default=0)
     start.add_argument("--compact-wait-seconds", type=int, default=600)
     start.add_argument("--log-path", default="")
@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     monitor.add_argument("--compact-reasoning-effort", default="xhigh")
     monitor.add_argument("--codex-args-json", default="[]")
     monitor.add_argument("--resume-prompt", default=DEFAULT_RESUME_PROMPT)
-    monitor.add_argument("--cooldown-seconds", type=int, default=0)
+    monitor.add_argument("--cooldown-seconds", type=int, default=300)
     monitor.add_argument("--max-recoveries", type=int, default=0)
     monitor.add_argument("--compact-wait-seconds", type=int, default=600)
 
@@ -174,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
             "@codex_args_json": json.dumps(codex_args),
             "@codex_cooldown_seconds": str(args.cooldown_seconds),
             "@codex_max_recoveries": str(args.max_recoveries),
+            "@codex_recovery_count": "0",
             "@codex_compact_wait_seconds": str(args.compact_wait_seconds),
             "@codex_log_path": log_path,
             "@codex_resume_prompt": args.resume_prompt,

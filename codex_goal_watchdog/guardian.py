@@ -63,6 +63,34 @@ def _tmux_option(session: str, name: str, default: str = "") -> str:
     return value or default
 
 
+def _next_recovery_attempt(
+    session: str,
+    *,
+    option_getter: Callable[[str, str, str], str] = _tmux_option,
+    runner=subprocess.run,
+) -> int:
+    try:
+        current = max(
+            0,
+            int(option_getter(session, "@codex_recovery_count", "0")),
+        )
+    except ValueError:
+        current = 0
+    attempt = current + 1
+    runner(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            session,
+            "@codex_recovery_count",
+            str(attempt),
+        ],
+        check=True,
+    )
+    return attempt
+
+
 def _pipe_active(session: str) -> bool:
     result = subprocess.run(
         ["tmux", "list-panes", "-t", session, "-F", "#{pane_pipe}"],
@@ -143,7 +171,7 @@ def _recovery_config(
         ),
         codex_args=tuple(json.loads(codex_args_json)),
         cooldown_seconds=int(
-            option_getter(session, "@codex_cooldown_seconds", "0")
+            option_getter(session, "@codex_cooldown_seconds", "300")
         ),
         max_recoveries=int(
             option_getter(session, "@codex_max_recoveries", "0")
@@ -189,13 +217,19 @@ def run_guardian(
                 reason = _recovery_reason_on_screen(session)
                 if reason is None:
                     return
+                recovery_attempt = _next_recovery_attempt(session)
                 _append_log(
                     log_path,
-                    f"visible recoverable error found while monitor was down: {reason}",
+                    "visible recoverable error found while monitor was down: "
+                    f"{reason}; recovery #{recovery_attempt}",
                 )
                 execute_steps(
                     session,
-                    build_recovery_steps(config, reason=reason),
+                    build_recovery_steps(
+                        config,
+                        reason=reason,
+                        recovery_attempt=recovery_attempt,
+                    ),
                 )
 
             def restart_after_update() -> None:

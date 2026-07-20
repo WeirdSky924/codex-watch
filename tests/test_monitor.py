@@ -93,6 +93,54 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertIn("/compact", [step.value for step in calls[0][1]])
 
+    def test_run_monitor_retries_payment_required_without_attempt_limit(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "■ unexpected status 402 Payment Required: upstream request failed\n"
+                for _ in range(5)
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                cooldown_seconds=300,
+                max_recoveries=0,
+            ),
+            now=iter(float(index) for index in range(5)).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(5, len(calls))
+        self.assertEqual("0", calls[0][1][4].value)
+        for _, steps in calls[1:]:
+            self.assertEqual("300", steps[4].value)
+
+    def test_run_monitor_continues_persisted_recovery_count_after_reattach(self):
+        calls = []
+        persisted_counts = []
+
+        run_monitor(
+            lines=[
+                "■ unexpected status 402 Payment Required: upstream request failed\n"
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                cooldown_seconds=300,
+                max_recoveries=0,
+            ),
+            initial_recovery_count=1,
+            save_recovery_count=persisted_counts.append,
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([2], persisted_counts)
+        self.assertEqual("300", calls[0][1][4].value)
+
 
 if __name__ == "__main__":
     unittest.main()

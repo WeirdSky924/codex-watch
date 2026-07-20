@@ -26,7 +26,7 @@ class RecoveryControllerTests(unittest.TestCase):
         self.assertEqual("codex_upstream_stalled", event.reason)
         self.assertEqual(1, controller.recovery_count)
 
-    def test_ignores_duplicate_events_during_cooldown(self):
+    def test_cooldown_does_not_drop_later_fatal_events(self):
         controller = RecoveryController(
             RecoveryConfig(cooldown_seconds=120, max_recoveries=3)
         )
@@ -40,8 +40,8 @@ class RecoveryControllerTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(first)
-        self.assertIsNone(second)
-        self.assertEqual(1, controller.recovery_count)
+        self.assertIsNotNone(second)
+        self.assertEqual(2, controller.recovery_count)
 
     def test_stops_after_max_recoveries(self):
         controller = RecoveryController(
@@ -77,7 +77,7 @@ class RecoveryControllerTests(unittest.TestCase):
         self.assertEqual(10, controller.recovery_count)
 
     def test_classifies_retryable_terminal_http_errors(self):
-        for status in (429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
+        for status in (402, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
             with self.subTest(status=status):
                 self.assertEqual(
                     f"retryable_http_{status}",
@@ -170,6 +170,7 @@ class RecoveryStepTests(unittest.TestCase):
             startup_wait_seconds=5,
             model_switch_delay_seconds=3,
             compact_wait_seconds=90,
+            cooldown_seconds=300,
             resume_prompt="继续刚才被 5m0s 中断的 goal。",
         )
 
@@ -181,7 +182,7 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep("sleep", "2"),
                 RecoveryStep("text", "/quit"),
                 RecoveryStep("wait_shell", "30"),
-                RecoveryStep("sleep", "1"),
+                RecoveryStep("sleep", "0"),
                 RecoveryStep(
                     "text",
                     "env -u NO_COLOR COLORTERM=truecolor "
@@ -232,10 +233,10 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertEqual("gpt-5.6-luna", config.compact_model)
         self.assertEqual("xhigh", config.compact_reasoning_effort)
 
-    def test_default_recovery_policy_is_unlimited_without_cooldown(self):
+    def test_default_recovery_policy_is_unlimited_with_five_minute_cooldown(self):
         config = RecoveryConfig()
 
-        self.assertEqual(0, config.cooldown_seconds)
+        self.assertEqual(300, config.cooldown_seconds)
         self.assertEqual(0, config.max_recoveries)
 
     def test_recovery_refuses_to_resume_without_pinned_thread(self):
@@ -260,6 +261,65 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertFalse(any("gpt-5.6-luna" in value for value in values))
         self.assertTrue(any("gpt-5.6-sol" in value for value in values))
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
+
+    def test_payment_required_waits_five_minutes_then_restarts_sol(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            primary_model="gpt-5.6-sol",
+            primary_reasoning_effort="max",
+            codex_args=("--dangerously-bypass-approvals-and-sandbox",),
+            cooldown_seconds=300,
+            resume_prompt="继续中断的 goal。",
+        )
+
+        first_steps = build_recovery_steps(
+            config,
+            reason="retryable_http_402",
+            recovery_attempt=1,
+        )
+        retry_steps = build_recovery_steps(
+            config,
+            reason="retryable_http_402",
+            recovery_attempt=2,
+        )
+        values = [step.value for step in retry_steps]
+
+        self.assertEqual(RecoveryStep("sleep", "0"), first_steps[4])
+        self.assertEqual(RecoveryStep("wait_shell", "30"), retry_steps[3])
+        self.assertEqual(RecoveryStep("sleep", "300"), retry_steps[4])
+        self.assertNotIn("/compact", values)
+        self.assertTrue(any("gpt-5.6-sol" in value for value in values))
+        self.assertEqual("resume_goal_or_prompt", retry_steps[-1].kind)
+
+    def test_all_fatal_recovery_paths_share_immediate_then_delayed_policy(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            cooldown_seconds=300,
+        )
+
+        for reason in (
+            "codex_upstream_stalled",
+            "context_window_exhausted",
+            "retryable_http_402",
+            "retryable_http_502",
+            "retryable_network",
+            "retryable_upstream_error",
+        ):
+            with self.subTest(reason=reason):
+                first_steps = build_recovery_steps(
+                    config,
+                    reason=reason,
+                    recovery_attempt=1,
+                )
+                retry_steps = build_recovery_steps(
+                    config,
+                    reason=reason,
+                    recovery_attempt=2,
+                )
+
+                self.assertEqual(RecoveryStep("sleep", "0"), first_steps[4])
+                self.assertEqual(RecoveryStep("wait_shell", "30"), retry_steps[3])
+                self.assertEqual(RecoveryStep("sleep", "300"), retry_steps[4])
 
     def test_upstream_error_recovery_restarts_sol_without_compaction(self):
         config = RecoveryConfig(

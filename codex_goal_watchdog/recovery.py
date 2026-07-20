@@ -25,7 +25,7 @@ DEFAULT_RESUME_PROMPT = (
     "继续刚才被 5m0s 中断的 goal。从当前仓库状态和最近上下文继续，"
     "不要重复已经完成的操作；先检查现状，再推进未完成步骤。"
 )
-RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
+RETRYABLE_HTTP_CODES = (402, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
 RETRYABLE_HTTP_RE = re.compile(
     r"\b(" + "|".join(str(code) for code in RETRYABLE_HTTP_CODES) + r")\b"
 )
@@ -87,7 +87,7 @@ class RecoveryConfig:
     compact_reasoning_effort: str = "xhigh"
     codex_args: tuple[str, ...] = ()
     stall_pattern: str = DEFAULT_STALL_PATTERN
-    cooldown_seconds: int = 0
+    cooldown_seconds: int = 300
     max_recoveries: int = 0
     abort_delay_seconds: int = 2
     quit_wait_seconds: int = 3
@@ -114,10 +114,14 @@ class RecoveryStep:
 class RecoveryController:
     """Detects recoverable stalls while preventing recovery loops."""
 
-    def __init__(self, config: RecoveryConfig) -> None:
+    def __init__(
+        self,
+        config: RecoveryConfig,
+        *,
+        initial_recovery_count: int = 0,
+    ) -> None:
         self.config = config
-        self.recovery_count = 0
-        self._last_recovery_at: float | None = None
+        self.recovery_count = max(0, initial_recovery_count)
 
     def observe(self, line: str, now: float) -> RecoveryEvent | None:
         reason = classify_recovery_reason(line)
@@ -130,14 +134,7 @@ class RecoveryController:
             and self.recovery_count >= self.config.max_recoveries
         ):
             return None
-        if (
-            self._last_recovery_at is not None
-            and now - self._last_recovery_at < self.config.cooldown_seconds
-        ):
-            return None
-
         self.recovery_count += 1
-        self._last_recovery_at = now
         return RecoveryEvent(
             reason=reason,
             observed_at=now,
@@ -166,11 +163,15 @@ def build_post_update_restart_steps(config: RecoveryConfig) -> list[RecoveryStep
 
 
 def build_recovery_steps(
-    config: RecoveryConfig, *, reason: str = "codex_upstream_stalled"
+    config: RecoveryConfig,
+    *,
+    reason: str = "codex_upstream_stalled",
+    recovery_attempt: int = 1,
 ) -> list[RecoveryStep]:
     """Build tmux actions for model fallback, compaction, and resume."""
     if not config.thread_id:
         raise ValueError("recovery requires a pinned Codex thread ID")
+    restart_delay = config.cooldown_seconds if recovery_attempt > 1 else 0
     compact_command = shlex.join(
         build_codex_command(
             model=config.compact_model,
@@ -193,7 +194,7 @@ def build_recovery_steps(
             RecoveryStep("sleep", str(config.abort_delay_seconds)),
             RecoveryStep("text", "/quit"),
             RecoveryStep("wait_shell", "30"),
-            RecoveryStep("sleep", "1"),
+            RecoveryStep("sleep", str(max(0, restart_delay))),
             RecoveryStep("text", primary_command),
             RecoveryStep("wait_codex", "30"),
             RecoveryStep("sleep", str(config.startup_wait_seconds)),
@@ -204,7 +205,7 @@ def build_recovery_steps(
         RecoveryStep("sleep", str(config.abort_delay_seconds)),
         RecoveryStep("text", "/quit"),
         RecoveryStep("wait_shell", "30"),
-        RecoveryStep("sleep", "1"),
+        RecoveryStep("sleep", str(max(0, restart_delay))),
         RecoveryStep("text", compact_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),

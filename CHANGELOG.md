@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-07-20
+
+### Changed
+
+- Treat terminal HTTP 402 responses as fatal errors handled by the standard
+  primary-model recovery flow.
+- Attempt the first fatal recovery immediately, then wait five minutes before
+  every subsequent retry while keeping recovery attempts unlimited by default.
+- Apply the cooldown as a real serialized delay instead of discarding fatal
+  events observed during the cooldown window.
+
 ## [0.1.1] - 2026-07-19
 
 ### Fixed

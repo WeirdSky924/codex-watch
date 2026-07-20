@@ -280,7 +280,7 @@ class TmuxControlTests(unittest.TestCase):
         self.assertIn("--codex-args-json", command)
         self.assertIn("dangerously-bypass-approvals-and-sandbox", command)
         self.assertIn("--resume-prompt", command)
-        self.assertIn("--cooldown-seconds 0", command)
+        self.assertIn("--cooldown-seconds 300", command)
         self.assertIn("--max-recoveries 0", command)
         self.assertIn(">> '/tmp/codex watchdog.log' 2>&1", command)
 

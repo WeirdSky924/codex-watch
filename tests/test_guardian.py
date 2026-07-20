@@ -1,6 +1,7 @@
 import unittest
 
 from codex_goal_watchdog.guardian import (
+    _next_recovery_attempt,
     _recovery_config,
     _update_completed_on_shell,
     guard_once,
@@ -8,6 +9,30 @@ from codex_goal_watchdog.guardian import (
 
 
 class GuardianTests(unittest.TestCase):
+    def test_next_recovery_attempt_persists_tmux_count(self):
+        calls = []
+
+        attempt = _next_recovery_attempt(
+            "codex-goal",
+            option_getter=lambda session, name, default="": "1",
+            runner=lambda command, **kwargs: calls.append(command),
+        )
+
+        self.assertEqual(2, attempt)
+        self.assertEqual(
+            [
+                [
+                    "tmux",
+                    "set-option",
+                    "-t",
+                    "codex-goal",
+                    "@codex_recovery_count",
+                    "2",
+                ]
+            ],
+            calls,
+        )
+
     def test_guard_once_does_nothing_when_monitor_pipe_is_healthy(self):
         calls = []
 

@@ -248,7 +248,7 @@ def monitor_pipe_command(
     codex_args: list[str],
     resume_prompt: str,
     log_path: str,
-    cooldown_seconds: int = 0,
+    cooldown_seconds: int = 300,
     max_recoveries: int = 0,
     compact_wait_seconds: int = 120,
 ) -> str:

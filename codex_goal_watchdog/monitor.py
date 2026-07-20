@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -47,10 +48,15 @@ def run_monitor(
     now: Callable[[], float] = time.time,
     execute: Callable[[str, list], None] | None = None,
     log: Callable[[str], None] | None = None,
+    initial_recovery_count: int = 0,
+    save_recovery_count: Callable[[int], None] | None = None,
 ) -> None:
     from .recovery import RecoveryController
 
-    controller = RecoveryController(config)
+    controller = RecoveryController(
+        config,
+        initial_recovery_count=initial_recovery_count,
+    )
     emit = log or (lambda message: print(message, flush=True))
 
     def default_execute(tmux_target: str, steps: list) -> None:
@@ -69,7 +75,43 @@ def run_monitor(
             f"[codex-goal-watchdog] recovery #{controller.recovery_count}: "
             f"{event.reason}"
         )
-        run_execute(target, build_recovery_steps(config, reason=event.reason))
+        if save_recovery_count is not None:
+            save_recovery_count(controller.recovery_count)
+        run_execute(
+            target,
+            build_recovery_steps(
+                config,
+                reason=event.reason,
+                recovery_attempt=controller.recovery_count,
+            ),
+        )
+
+
+def _tmux_recovery_count(target: str) -> int:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, "@codex_recovery_count"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        return max(0, int(result.stdout.strip())) if result.returncode == 0 else 0
+    except ValueError:
+        return 0
+
+
+def _save_tmux_recovery_count(target: str, count: int) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            "@codex_recovery_count",
+            str(max(0, count)),
+        ],
+        check=True,
+    )
 
 
 def monitor_stdin(target: str, config: RecoveryConfig) -> None:
@@ -78,4 +120,6 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         lines=iter_decoded_chunks(sys.stdin.buffer),
         target=target,
         config=config,
+        initial_recovery_count=_tmux_recovery_count(target),
+        save_recovery_count=lambda count: _save_tmux_recovery_count(target, count),
     )

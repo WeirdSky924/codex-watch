@@ -362,20 +362,22 @@ codex-watch
 默认设置：
 
 ```text
-cooldown seconds:    0
+cooldown seconds:    300
 maximum recoveries:  0
 ```
 
-`maximum recoveries=0` 表示无限重试。要限制重试频率和次数：
+`cooldown seconds=300` 表示第一次 fatal recovery 立即执行；如果恢复后再次 fatal，下一次恢复会先退出失败的 Codex，在 Shell 中等待 5 分钟，再重新启动。`maximum recoveries=0` 表示后续重试次数不受限制。
+
+要修改等待时间或限制次数：
 
 ```bash
 codex-watch \
   --safe \
-  --cooldown-seconds 30 \
+  --cooldown-seconds 600 \
   --max-recoveries 5
 ```
 
-恢复链始终串行执行，不会同时启动两条恢复流程。
+`--cooldown-seconds 0` 表示不等待并立即重启。恢复链始终串行执行，不会同时启动两条恢复流程，也不会因为处于冷静期而丢弃下一次 fatal recovery。
 
 ### 压缩等待时间
 
@@ -698,11 +700,13 @@ Linger=yes
 
 只有 Codex TUI 中带 `■` 的 fatal error 行会触发恢复。源码、测试、工具输出或普通 Agent 消息中出现相同文本不会触发重启。
 
+所有识别到的 fatal error 都进入同一个串行恢复状态机：第一次立即恢复固定 thread 并处理 Goal 状态；如果恢复失败并再次出现 fatal，则退出失败进程、等待默认 300 秒，再执行同一恢复流程。后续失败继续每次等待 300 秒，默认次数无限。
+
 | 错误 | 自动操作 |
 | --- | --- |
 | `codex upstream stalled: no real data for 5m0s` | 切到 compact model，恢复固定 thread，执行 `/compact`，等待真实压缩事件，再切回 primary model 并继续 Goal |
 | Codex context window exhausted | 执行相同的 compact 流程 |
-| HTTP 429、500、502-504、520-524 | 直接使用 primary model 重启固定 thread |
+| HTTP 402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
 | Codex 自更新完成后退回 Shell | 使用更新后的 Codex 恢复固定 thread |
@@ -710,6 +714,8 @@ Linger=yes
 恢复 paused、blocked 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。没有可识别 Goal 状态时才发送文本续接提示。
 
 从 `0.1.1` 开始，大型会话恢复时会最多等待 10 分钟，持续检查 `Resume paused goal?` 选择页；出现后自动选择 `Resume goal`。如果已经显示 `Pursuing goal`，不会再注入多余文本。
+
+从 `0.1.2` 开始，HTTP 402 也属于 fatal recovery；所有 fatal recovery 都先立即尝试一次，失败后的后续重试默认等待 5 分钟。5m0s/context exhausted 的 compact 分支完成压缩后切回 primary model 属于同一恢复链内部切换，不会再次等待 5 分钟。
 
 ## 10. 多项目配置示例
 
@@ -972,7 +978,7 @@ sha256sum -c SHA256SUMS
 --thread-id UUID                   恢复明确指定的 thread
 --safe                             不启用最高权限绕过
 --no-attach                        后台启动，不立即进入 tmux
---cooldown-seconds N               两次恢复之间的冷却秒数
+--cooldown-seconds N               首次恢复失败后再次重试前的等待秒数，默认 300
 --max-recoveries N                 最大恢复次数，0 表示无限
 --compact-wait-seconds N           等待真实压缩事件的超时
 --resume-prompt TEXT               没有 Goal 状态时使用的续接文本

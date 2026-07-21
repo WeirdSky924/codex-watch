@@ -13,6 +13,17 @@ from .recovery import RecoveryStep
 from .sessions import compaction_event_exists_after, find_thread_rollout_path
 
 
+PAUSED_GOAL_PICKER_MARKERS = (
+    "Resume paused goal?",
+    "Resume goal",
+    "Leave paused",
+)
+
+
+def paused_goal_picker_visible(text: str) -> bool:
+    return all(marker in text for marker in PAUSED_GOAL_PICKER_MARKERS)
+
+
 def commands_for_step(target: str, step: RecoveryStep) -> list[list[str]]:
     if step.kind == "key":
         return [["tmux", "send-keys", "-t", target, step.value]]
@@ -110,6 +121,7 @@ def handle_goal_prompt(
     prompt: str,
     timeout_seconds: float = 600,
     poll_seconds: float = 0.5,
+    send_fallback_prompt: bool = True,
     runner=subprocess.run,
     sleeper=time.sleep,
     now=time.monotonic,
@@ -125,7 +137,7 @@ def handle_goal_prompt(
             text=True,
             check=True,
         )
-        picker_visible = "Resume paused goal?" in result.stdout
+        picker_visible = paused_goal_picker_visible(result.stdout)
         if picker_visible:
             keys = ["Down", "Enter"] if action == "leave_paused" else ["Enter"]
             for key in keys:
@@ -154,7 +166,7 @@ def handle_goal_prompt(
             break
         sleeper(poll_seconds)
 
-    if action == "resume":
+    if action == "resume" and send_fallback_prompt:
         for command in commands_for_step(target, RecoveryStep("text", prompt)):
             runner(command, check=True)
     return False

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-07-21
+
+### Fixed
+
+- Resume a visible paused Goal when `codex-watch` is started or reattached
+  manually.
+- Detect delayed `Resume paused goal?` pickers in the output monitor and select
+  `Resume goal` without injecting fallback text into ordinary idle sessions.
+- Explain how to connect an unmanaged tmux session to an existing Codex thread.
+
 ## [0.1.2] - 2026-07-20
 
 ### Changed

@@ -57,6 +57,37 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual([], calls)
 
+    def test_run_monitor_resumes_delayed_paused_goal_picker(self):
+        resumed_targets = []
+
+        run_monitor(
+            lines=[
+                "Loading conversation history...\n",
+                "Resume paused goal?\n1. Resume goal\n2. Leave paused\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            now=iter([100.0, 101.0]).__next__,
+            resume_goal=resumed_targets.append,
+            log=lambda message: None,
+        )
+
+        self.assertEqual(["codex-goal"], resumed_targets)
+
+    def test_run_monitor_ignores_plain_text_picker_mention(self):
+        resumed_targets = []
+
+        run_monitor(
+            lines=["The text Resume paused goal? may appear in documentation.\n"],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            now=lambda: 100.0,
+            resume_goal=resumed_targets.append,
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], resumed_targets)
+
     def test_run_monitor_detects_wrapped_ansi_stall_output(self):
         calls = []
 

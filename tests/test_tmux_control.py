@@ -67,6 +67,58 @@ class TmuxControlTests(unittest.TestCase):
             calls,
         )
 
+    def test_handle_goal_prompt_can_skip_fallback_when_no_picker(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = "gpt-5.6-sol max"
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="继续 goal",
+            timeout_seconds=0,
+            send_fallback_prompt=False,
+            runner=runner,
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(
+            [["tmux", "capture-pane", "-p", "-t", "codex-goal"]],
+            calls,
+        )
+
+    def test_handle_goal_prompt_ignores_plain_text_picker_mention(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = "The text Resume paused goal? may appear in documentation."
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="",
+            timeout_seconds=0,
+            send_fallback_prompt=False,
+            runner=runner,
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(
+            [["tmux", "capture-pane", "-p", "-t", "codex-goal"]],
+            calls,
+        )
+
     def test_handle_goal_prompt_waits_for_delayed_picker(self):
         calls = []
         captures = iter(

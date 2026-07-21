@@ -11,13 +11,23 @@ from collections.abc import Callable, Iterable
 from typing import BinaryIO
 
 from .recovery import RecoveryConfig, build_recovery_steps
-from .tmux_control import execute_steps
+from .tmux_control import (
+    execute_steps,
+    handle_goal_prompt,
+    paused_goal_picker_visible,
+)
 
 
 ANSI_ESCAPE_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b\x07]*(?:\x07|\x1b\\)|[@-_])"
 )
 ROLLING_BUFFER_SIZE = 8192
+GOAL_RESUME_STATUS_MARKERS = (
+    "Goal paused (/goal resume)",
+    "Goal blocked (/goal resume)",
+    "Goal hit usage limits (/goal resume)",
+)
+GOAL_RESUME_RETRY_SECONDS = 10
 
 
 def normalize_terminal_text(value: str) -> str:
@@ -47,6 +57,7 @@ def run_monitor(
     config: RecoveryConfig,
     now: Callable[[], float] = time.time,
     execute: Callable[[str, list], None] | None = None,
+    resume_goal: Callable[[str], None] | None = None,
     log: Callable[[str], None] | None = None,
     initial_recovery_count: int = 0,
     save_recovery_count: Callable[[int], None] | None = None,
@@ -62,29 +73,54 @@ def run_monitor(
     def default_execute(tmux_target: str, steps: list) -> None:
         execute_steps(tmux_target, steps)
 
+    def default_resume_goal(tmux_target: str) -> None:
+        handle_goal_prompt(
+            tmux_target,
+            action="resume",
+            prompt="",
+            timeout_seconds=0,
+            send_fallback_prompt=False,
+        )
+
     run_execute = execute or default_execute
+    run_resume_goal = resume_goal or default_resume_goal
     rolling_output = ""
+    last_goal_resume_at: float | None = None
     for line in lines:
         rolling_output = normalize_terminal_text(f"{rolling_output} {line}")
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
-        event = controller.observe(rolling_output, now=now())
-        if event is None:
+        observed_at = now()
+        event = controller.observe(rolling_output, now=observed_at)
+        if event is not None:
+            rolling_output = ""
+            emit(
+                f"[codex-goal-watchdog] recovery #{controller.recovery_count}: "
+                f"{event.reason}"
+            )
+            if save_recovery_count is not None:
+                save_recovery_count(controller.recovery_count)
+            run_execute(
+                target,
+                build_recovery_steps(
+                    config,
+                    reason=event.reason,
+                    recovery_attempt=controller.recovery_count,
+                ),
+            )
             continue
-        rolling_output = ""
-        emit(
-            f"[codex-goal-watchdog] recovery #{controller.recovery_count}: "
-            f"{event.reason}"
+
+        goal_resume_visible = paused_goal_picker_visible(rolling_output) or any(
+            marker in rolling_output for marker in GOAL_RESUME_STATUS_MARKERS
         )
-        if save_recovery_count is not None:
-            save_recovery_count(controller.recovery_count)
-        run_execute(
-            target,
-            build_recovery_steps(
-                config,
-                reason=event.reason,
-                recovery_attempt=controller.recovery_count,
-            ),
+        retry_ready = (
+            last_goal_resume_at is None
+            or observed_at - last_goal_resume_at >= GOAL_RESUME_RETRY_SECONDS
         )
+        if goal_resume_visible and retry_ready:
+            emit("[codex-goal-watchdog] resuming paused goal")
+            run_resume_goal(target)
+            last_goal_resume_at = observed_at
+            rolling_output = ""
 
 
 def _tmux_recovery_count(target: str) -> int:

@@ -62,6 +62,31 @@ class ConsoleEntrypointTests(unittest.TestCase):
         self.assertIn("unused tmux session name", message)
         self.assertIn("codex-watch --session <NEW_SESSION>", message)
 
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.tmux_get_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440000",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    def test_manual_attach_resumes_visible_paused_goal(
+        self,
+        _session_exists_mock,
+        _get_thread_id_mock,
+        _run_mock,
+        handle_goal_prompt_mock,
+    ):
+        result = main(["start", "--session", "existing-session", "--no-attach"])
+
+        self.assertEqual(0, result)
+        handle_goal_prompt_mock.assert_called_once_with(
+            "existing-session",
+            action="resume",
+            prompt="",
+            timeout_seconds=0,
+            send_fallback_prompt=False,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

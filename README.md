@@ -717,6 +717,8 @@ Linger=yes
 
 从 `0.1.2` 开始，HTTP 402 也属于 fatal recovery；所有 fatal recovery 都先立即尝试一次，失败后的后续重试默认等待 5 分钟。5m0s/context exhausted 的 compact 分支完成压缩后切回 primary model 属于同一恢复链内部切换，不会再次等待 5 分钟。
 
+从 `0.1.3` 开始，手工启动、`--resume`、`--thread-id` 恢复以及重新接入已有 tmux session 时，watchdog 都会立即检查当前 Goal 状态。若大型 thread 仍在回放历史，monitor 会在稍后出现 `Resume paused goal?` 时自动选择 `Resume goal`；普通空闲会话不会被注入续接文本。
+
 ## 10. 多项目配置示例
 
 项目 A：
@@ -854,7 +856,7 @@ systemctl --user restart codex-watch-guardian@codex-goal.service
 codex-watch --version
 ```
 
-`0.1.1` 及以后会持续等待并自动选择 `Resume goal`。旧版本需要升级。大型 thread 的历史回放可能持续数分钟，期间不要重复启动第二条恢复流程。
+`0.1.3` 及以后会在手工启动时立即检查，并由 monitor 持续识别稍后出现的选择页，然后自动选择 `Resume goal`。旧版本需要升级。大型 thread 的历史回放可能持续数分钟，期间不要重复启动第二条恢复流程。
 
 ### tmux 中颜色异常
 

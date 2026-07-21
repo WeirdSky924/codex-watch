@@ -27,7 +27,7 @@ from .guardian import run_guardian
 from .paths import default_log_path
 from .recovery import DEFAULT_RESUME_PROMPT, RecoveryConfig
 from .sessions import find_latest_thread_id, validate_thread_id, wait_for_new_thread_id
-from .tmux_control import monitor_pipe_command
+from .tmux_control import handle_goal_prompt, monitor_pipe_command
 
 
 def _existing_session_without_thread_message(session: str) -> str:
@@ -217,12 +217,17 @@ def main(argv: list[str] | None = None) -> int:
         compact_wait_seconds=args.compact_wait_seconds,
     )
 
-    commands = [tmux_pipe_pane_command(args.session, pipe_command)]
+    run_command(tmux_pipe_pane_command(args.session, pipe_command))
+    if not args.dry_run:
+        handle_goal_prompt(
+            args.session,
+            action="resume",
+            prompt="",
+            timeout_seconds=0,
+            send_fallback_prompt=False,
+        )
     if not args.no_attach:
-        commands.append(tmux_attach_command(args.session))
-
-    for command in commands:
-        run_command(command)
+        run_command(tmux_attach_command(args.session))
     return 0
 
 

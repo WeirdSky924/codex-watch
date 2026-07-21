@@ -30,6 +30,27 @@ from .sessions import find_latest_thread_id, validate_thread_id, wait_for_new_th
 from .tmux_control import monitor_pipe_command
 
 
+def _existing_session_without_thread_message(session: str) -> str:
+    session_arg = shlex.quote(session)
+    return (
+        f"tmux session {session!r} already exists.\n"
+        "It was not initialized by codex-watch and has no pinned Codex thread ID.\n"
+        "codex-watch cannot safely determine which Codex conversation to monitor.\n\n"
+        "To bring an existing Codex conversation under codex-watch:\n"
+        "  1. First, create or resume a Codex conversation in the target project.\n"
+        "  2. Obtain its thread UUID from Codex's \"To continue this session...\"\n"
+        "     message.\n"
+        "  3. Resume it in an unused tmux session:\n"
+        "     codex-watch --session <NEW_SESSION> --thread-id <UUID>\n\n"
+        "If that Codex conversation is already running inside this tmux session,\n"
+        "pin the existing session directly:\n"
+        f"  codex-watch --session {session_arg} --thread-id <UUID>\n\n"
+        "To let codex-watch create a new Codex conversation automatically, use an\n"
+        "unused tmux session name:\n"
+        "  codex-watch --session <NEW_SESSION>"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="codex-goal-watchdog",
@@ -125,8 +146,7 @@ def main(argv: list[str] | None = None) -> int:
                 thread_id = "00000000-0000-0000-0000-000000000000"
             else:
                 raise SystemExit(
-                    "existing tmux session has no pinned Codex thread ID; "
-                    "restart with --thread-id <UUID>"
+                    _existing_session_without_thread_message(args.session)
                 )
     elif should_resume and thread_id is None:
         thread_id = find_latest_thread_id(cwd=working_dir)

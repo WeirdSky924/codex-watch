@@ -800,14 +800,35 @@ codex
 出现：
 
 ```text
-existing tmux session has no pinned Codex thread ID
+tmux session 'codex-goal' already exists.
+It was not initialized by codex-watch and has no pinned Codex thread ID.
 ```
 
-说明该 tmux 可能不是由 `codex-watch` 正确创建。先确认里面没有需要保留的任务，再使用新的 session 名称和明确 thread ID：
+说明同名 tmux session 已存在，但其中没有 watchdog 所需的固定 thread ID。watchdog 无法安全判断应该监控哪一个 Codex 会话。
+
+如果需要把已有 Codex 会话接入 watchdog：
+
+1. 进入目标项目目录，先直接运行 `codex`，创建或恢复目标会话。
+2. 从 Codex 输出的 `To continue this session, run codex resume <UUID>` 中取得 thread UUID。
+3. 退出原 Codex 进程，选择一个未占用的 tmux session 名称，让 watchdog 恢复该 thread：
 
 ```bash
 codex-watch --session recovered-session --thread-id "$THREAD_ID" --safe
 ```
+
+如果目标 Codex 进程本来就运行在报错所指的 tmux session 内，可以用该 session 名和 thread UUID 原地接管：
+
+```bash
+codex-watch --session existing-session --thread-id "$THREAD_ID" --safe
+```
+
+如果不需要恢复已有对话，只想让 watchdog 自动创建一个全新的 Codex 会话，使用一个未占用的 session 名即可，不需要 `--thread-id`：
+
+```bash
+codex-watch --session new-session --safe
+```
+
+不要为了消除提示直接关闭已有 tmux session；其中可能仍有正在运行的任务。
 
 ### fatal error 后没有恢复
 

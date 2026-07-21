@@ -5,7 +5,7 @@ from io import StringIO
 from unittest.mock import patch
 
 from codex_goal_watchdog import __version__
-from codex_goal_watchdog.__main__ import guardian_main, start_main
+from codex_goal_watchdog.__main__ import guardian_main, main, start_main
 
 
 class ConsoleEntrypointTests(unittest.TestCase):
@@ -40,6 +40,27 @@ class ConsoleEntrypointTests(unittest.TestCase):
 
                 self.assertEqual(0, raised.exception.code)
                 self.assertEqual(f"{command} {__version__}", output.getvalue().strip())
+
+    @patch("codex_goal_watchdog.__main__.tmux_get_thread_id", return_value=None)
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    def test_existing_unmanaged_tmux_explains_how_to_connect_codex_session(
+        self,
+        _session_exists_mock,
+        _get_thread_id_mock,
+    ):
+        with self.assertRaises(SystemExit) as raised:
+            main(["start", "--session", "existing-session"])
+
+        message = str(raised.exception)
+        self.assertIn("not initialized by codex-watch", message)
+        self.assertIn("create or resume a Codex conversation", message)
+        self.assertIn("thread UUID", message)
+        self.assertIn(
+            "codex-watch --session existing-session --thread-id <UUID>",
+            message,
+        )
+        self.assertIn("unused tmux session name", message)
+        self.assertIn("codex-watch --session <NEW_SESSION>", message)
 
 
 if __name__ == "__main__":

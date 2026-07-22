@@ -142,6 +142,24 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertIn("/compact", [step.value for step in calls[0][1]])
 
+    def test_run_monitor_recovers_model_capacity_warning_without_compaction(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "⚠ Selected model is at capacity. Please try a different model\n"
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertNotIn("/compact", [step.value for step in calls[0][1]])
+        self.assertEqual("0", calls[0][1][4].value)
+
     def test_run_monitor_retries_payment_required_without_attempt_limit(self):
         calls = []
 

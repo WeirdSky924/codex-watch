@@ -135,6 +135,21 @@ class RecoveryControllerTests(unittest.TestCase):
             )
         )
 
+    def test_classifies_model_capacity_terminal_warning(self):
+        self.assertEqual(
+            "model_at_capacity",
+            classify_recovery_reason(
+                "⚠ Selected model is at capacity. Please try a different model"
+            ),
+        )
+
+    def test_ignores_model_capacity_message_without_terminal_warning_marker(self):
+        self.assertIsNone(
+            classify_recovery_reason(
+                "Selected model is at capacity. Please try a different model"
+            )
+        )
+
 
 class RecoveryStepTests(unittest.TestCase):
     def test_startup_update_verifies_version_before_starting_fresh_codex(self):
@@ -336,6 +351,7 @@ class RecoveryStepTests(unittest.TestCase):
             "retryable_http_502",
             "retryable_network",
             "retryable_upstream_error",
+            "model_at_capacity",
         ):
             with self.subTest(reason=reason):
                 first_steps = build_recovery_steps(

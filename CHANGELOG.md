@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-07-22
+
+### Fixed
+
+- Treat the terminal `Selected model is at capacity` warning as a fatal error
+  handled by the standard immediate-then-delayed recovery flow.
+- Wait for tmux-injected text to settle before pressing Enter, preventing Codex
+  from leaving `/quit`, `/compact`, or Goal resume commands as multiline input.
+
 ## [0.1.4] - 2026-07-22
 
 ### Fixed

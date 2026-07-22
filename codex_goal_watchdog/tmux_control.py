@@ -26,6 +26,7 @@ UPDATE_PROMPT_RE = re.compile(
 CODEX_VERSION_RE = re.compile(
     r"\b(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b"
 )
+TEXT_SUBMIT_SETTLE_SECONDS = 0.5
 
 
 def paused_goal_picker_visible(text: str) -> bool:
@@ -140,6 +141,20 @@ def commands_for_step(target: str, step: RecoveryStep) -> list[list[str]]:
     if step.kind == "sleep":
         return []
     raise ValueError(f"unsupported recovery step kind: {step.kind}")
+
+
+def _submit_text(
+    target: str,
+    value: str,
+    *,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+) -> None:
+    commands = commands_for_step(target, RecoveryStep("text", value))
+    runner(commands[0], check=True)
+    # Codex treats a rapid text-plus-Enter burst as pasted multiline input.
+    sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
+    runner(commands[1], check=True)
 
 
 def wait_for_pane_state(
@@ -259,10 +274,12 @@ def handle_goal_prompt(
         )
         if goal_resume_required:
             if action == "resume":
-                for command in commands_for_step(
-                    target, RecoveryStep("text", "/goal resume")
-                ):
-                    runner(command, check=True)
+                _submit_text(
+                    target,
+                    "/goal resume",
+                    runner=runner,
+                    sleeper=sleeper,
+                )
             return True
 
         if action == "resume" and "Pursuing goal" in result.stdout:
@@ -272,8 +289,7 @@ def handle_goal_prompt(
         sleeper(poll_seconds)
 
     if action == "resume" and send_fallback_prompt:
-        for command in commands_for_step(target, RecoveryStep("text", prompt)):
-            runner(command, check=True)
+        _submit_text(target, prompt, runner=runner, sleeper=sleeper)
     return False
 
 
@@ -356,6 +372,14 @@ def execute_steps(
                 target,
                 action=action,
                 prompt=step.value,
+                runner=runner,
+                sleeper=sleeper,
+            )
+            continue
+        if step.kind == "text" and not dry_run:
+            _submit_text(
+                target,
+                step.value,
                 runner=runner,
                 sleeper=sleeper,
             )

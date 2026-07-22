@@ -698,7 +698,7 @@ Linger=yes
 
 ## 9. 自动恢复规则
 
-只有 Codex TUI 中带 `■` 的 fatal error 行会触发恢复。源码、测试、工具输出或普通 Agent 消息中出现相同文本不会触发重启。
+Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model is at capacity. Please try a different model` 容量告警也按 fatal error 处理。源码、测试、工具输出或普通 Agent 消息中出现没有对应终端标记的相同文本，不会触发重启。
 
 所有识别到的 fatal error 都进入同一个串行恢复状态机：第一次立即恢复固定 thread 并处理 Goal 状态；如果恢复失败并再次出现 fatal，则退出失败进程、等待默认 300 秒，再执行同一恢复流程。后续失败继续每次等待 300 秒，默认次数无限。
 
@@ -709,6 +709,7 @@ Linger=yes
 | HTTP 402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
+| `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
 | Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread |
 
 恢复 paused、blocked 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。没有可识别 Goal 状态时才发送文本续接提示。
@@ -720,6 +721,10 @@ Linger=yes
 从 `0.1.3` 开始，手工启动、`--resume`、`--thread-id` 恢复以及重新接入已有 tmux session 时，watchdog 都会立即检查当前 Goal 状态。若大型 thread 仍在回放历史，monitor 会在稍后出现 `Resume paused goal?` 时自动选择 `Resume goal`；普通空闲会话不会被注入续接文本。
 
 从 `0.1.4` 开始，Codex 更新页即使出现在 thread ID 创建之前也会由 watchdog 处理。watchdog 会选择 `Update now`、等待官方安装命令结束，然后执行 `codex --version` 核验；如果版本仍低于更新页目标，会额外执行一次 `codex update` 并再次核验。只有真实版本达到目标后才会启动或恢复 Codex，不能再用旧版本继续运行并把更新页留在 tmux 中。
+
+从 `0.1.5` 开始，`Selected model is at capacity` 容量告警进入统一 fatal recovery 流程：首次立即恢复，后续失败按冷静期继续重试，默认不限制次数。
+
+同一版本还会在 tmux 输入 `/quit`、`/compact`、`/goal resume`、Codex 启动命令或续接提示后短暂等待，再发送 Enter，避免 Codex 将过快的“文字 + Enter”识别为带换行的粘贴内容并停在输入框。
 
 ## 10. 多项目配置示例
 

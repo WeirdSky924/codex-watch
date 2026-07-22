@@ -17,6 +17,9 @@ CONTEXT_WINDOW_EXHAUSTED_PATTERN = (
     "Codex ran out of room in the model's context window. "
     "Start a new thread or clear earlier history before retrying."
 )
+MODEL_AT_CAPACITY_PATTERN = (
+    "Selected model is at capacity. Please try a different model"
+)
 COMPACTION_RECOVERY_REASONS = {
     "codex_upstream_stalled",
     "context_window_exhausted",
@@ -52,7 +55,11 @@ def _is_retryable_upstream_error(text: str) -> bool:
 
 
 def classify_recovery_reason(text: str) -> str | None:
-    """Classify only Codex TUI fatal-error rows, not ordinary transcript text."""
+    """Classify Codex TUI terminal errors, not ordinary transcript text."""
+    for segment in text.split("⚠")[1:]:
+        warning_text = segment.lstrip()[:1200]
+        if warning_text.startswith(MODEL_AT_CAPACITY_PATTERN):
+            return "model_at_capacity"
     if "■" not in text:
         return None
     for segment in text.split("■")[1:]:

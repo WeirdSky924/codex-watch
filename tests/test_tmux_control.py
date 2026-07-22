@@ -5,6 +5,7 @@ from codex_goal_watchdog.tmux_control import (
     capture_update_prompt_version,
     commands_for_step,
     ensure_codex_version,
+    execute_steps,
     handle_goal_prompt,
     monitor_pipe_command,
     update_prompt_version,
@@ -269,6 +270,7 @@ class TmuxControlTests(unittest.TestCase):
         for status in ("Goal paused (/goal resume)", "Goal blocked (/goal resume)"):
             with self.subTest(status=status):
                 calls = []
+                sleeps = []
 
                 def runner(command, **kwargs):
                     calls.append(command)
@@ -283,9 +285,11 @@ class TmuxControlTests(unittest.TestCase):
                     action="resume",
                     prompt="继续 goal",
                     runner=runner,
+                    sleeper=sleeps.append,
                 )
 
                 self.assertTrue(handled)
+                self.assertEqual([0.5], sleeps)
                 self.assertEqual(
                     [
                         ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
@@ -380,6 +384,31 @@ class TmuxControlTests(unittest.TestCase):
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
             commands,
+        )
+
+    def test_execute_steps_waits_for_text_to_settle_before_enter(self):
+        events = []
+
+        execute_steps(
+            "codex-goal",
+            [RecoveryStep("text", "/quit")],
+            runner=lambda command, **kwargs: events.append(("run", command)),
+            sleeper=lambda seconds: events.append(("sleep", seconds)),
+        )
+
+        self.assertEqual(
+            [
+                (
+                    "run",
+                    ["tmux", "send-keys", "-t", "codex-goal", "-l", "/quit"],
+                ),
+                ("sleep", 0.5),
+                (
+                    "run",
+                    ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
+                ),
+            ],
+            events,
         )
 
     def test_monitor_pipe_command_quotes_paths_and_prompt(self):

@@ -1,6 +1,7 @@
 import unittest
 
 from codex_goal_watchdog.guardian import (
+    _guardian_update_restart_needed,
     _next_recovery_attempt,
     _recovery_config,
     _update_completed_on_shell,
@@ -9,6 +10,24 @@ from codex_goal_watchdog.guardian import (
 
 
 class GuardianTests(unittest.TestCase):
+    def test_guardian_defers_update_restart_while_monitor_owns_update(self):
+        self.assertFalse(
+            _guardian_update_restart_needed(
+                "codex-goal",
+                option_getter=lambda session, name, default="": "0.145.0",
+                completion_checker=lambda session: True,
+            )
+        )
+
+    def test_guardian_restarts_legacy_update_without_pending_marker(self):
+        self.assertTrue(
+            _guardian_update_restart_needed(
+                "codex-goal",
+                option_getter=lambda session, name, default="": "",
+                completion_checker=lambda session: True,
+            )
+        )
+
     def test_next_recovery_attempt_persists_tmux_count(self):
         calls = []
 

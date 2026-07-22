@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
-from .monitor import normalize_terminal_text
+from .monitor import PENDING_UPDATE_OPTION, normalize_terminal_text
 from .paths import default_log_path
 from .recovery import (
     DEFAULT_RESUME_PROMPT,
@@ -130,6 +130,17 @@ def _update_completed_on_shell(
     )
     return screen_result.returncode == 0 and UPDATE_SUCCESS_MARKER in (
         normalize_terminal_text(screen_result.stdout)
+    )
+
+
+def _guardian_update_restart_needed(
+    session: str,
+    *,
+    option_getter: Callable[[str, str, str], str] = _tmux_option,
+    completion_checker: Callable[[str], bool] = _update_completed_on_shell,
+) -> bool:
+    return not option_getter(session, PENDING_UPDATE_OPTION, "") and (
+        completion_checker(session)
     )
 
 
@@ -271,7 +282,9 @@ def run_guardian(
                 stalled_screen=lambda: _recovery_reason_on_screen(session) is not None,
                 recover=recover,
                 attach_monitor=attach_monitor,
-                update_restart_needed=lambda: _update_completed_on_shell(session),
+                update_restart_needed=lambda: _guardian_update_restart_needed(
+                    session
+                ),
                 restart_after_update=restart_after_update,
             )
             if status != last_status or status not in {"healthy", "session_missing"}:

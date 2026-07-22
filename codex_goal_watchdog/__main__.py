@@ -25,9 +25,23 @@ from .launcher import (
 from .monitor import monitor_stdin
 from .guardian import run_guardian
 from .paths import default_log_path
-from .recovery import DEFAULT_RESUME_PROMPT, RecoveryConfig
-from .sessions import find_latest_thread_id, validate_thread_id, wait_for_new_thread_id
-from .tmux_control import handle_goal_prompt, monitor_pipe_command
+from .recovery import (
+    DEFAULT_RESUME_PROMPT,
+    RecoveryConfig,
+    build_startup_update_steps,
+)
+from .sessions import (
+    DEFAULT_SHELL_SNAPSHOTS_ROOT,
+    find_latest_thread_id,
+    validate_thread_id,
+    wait_for_new_thread_id,
+)
+from .tmux_control import (
+    capture_update_prompt_version,
+    execute_steps,
+    handle_goal_prompt,
+    monitor_pipe_command,
+)
 
 
 def _existing_session_without_thread_message(session: str) -> str:
@@ -137,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
     session_exists = tmux_session_exists(args.session)
     thread_id = validate_thread_id(args.thread_id) if args.thread_id else None
     should_resume = args.resume or thread_id is not None
+    started_after = datetime.now(timezone.utc)
+    unmanaged_existing_session = False
 
     if session_exists:
         pinned_thread_id = tmux_get_thread_id(args.session)
@@ -145,15 +161,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 thread_id = "00000000-0000-0000-0000-000000000000"
             else:
-                raise SystemExit(
-                    _existing_session_without_thread_message(args.session)
-                )
+                unmanaged_existing_session = True
     elif should_resume and thread_id is None:
         thread_id = find_latest_thread_id(cwd=working_dir)
         if thread_id is None and not args.dry_run:
             raise SystemExit(f"no Codex thread found for {working_dir}")
 
-    started_after = datetime.now(timezone.utc)
     codex_command = build_codex_command(
         model=args.primary_model,
         reasoning_effort=args.primary_reasoning_effort,
@@ -167,6 +180,35 @@ def main(argv: list[str] | None = None) -> int:
             return
         subprocess.run(command, check=True)
 
+    def recover_startup_update() -> bool:
+        expected_version = capture_update_prompt_version(args.session)
+        if expected_version is None:
+            return False
+        print(
+            "[codex-goal-watchdog] installing startup Codex update: "
+            f"target={expected_version}",
+            flush=True,
+        )
+        execute_steps(
+            args.session,
+            build_startup_update_steps(codex_command, expected_version),
+        )
+        return True
+
+    if unmanaged_existing_session:
+        if not recover_startup_update():
+            raise SystemExit(_existing_session_without_thread_message(args.session))
+        thread_id = wait_for_new_thread_id(
+            cwd=working_dir,
+            started_after=started_after,
+            shell_snapshots_root=DEFAULT_SHELL_SNAPSHOTS_ROOT,
+            on_wait=recover_startup_update,
+        )
+        if thread_id is None:
+            raise SystemExit(
+                "Codex was updated but its new thread ID could not be detected"
+            )
+
     if not session_exists:
         run_command(tmux_new_session_command(args.session, codex_command))
         if thread_id is None:
@@ -176,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
                 thread_id = wait_for_new_thread_id(
                     cwd=working_dir,
                     started_after=started_after,
+                    shell_snapshots_root=DEFAULT_SHELL_SNAPSHOTS_ROOT,
+                    on_wait=recover_startup_update,
                 )
                 if thread_id is None:
                     raise SystemExit(

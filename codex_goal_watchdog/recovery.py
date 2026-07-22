@@ -142,6 +142,53 @@ class RecoveryController:
         )
 
 
+def build_startup_update_steps(
+    codex_command: list[str], expected_version: str
+) -> list[RecoveryStep]:
+    """Install a startup update before Codex has created a thread."""
+    return [
+        RecoveryStep("key", "1"),
+        RecoveryStep("wait_shell", "300"),
+        RecoveryStep("ensure_codex_version", expected_version),
+        RecoveryStep("text", shlex.join(codex_command)),
+        RecoveryStep("wait_codex", "30"),
+    ]
+
+
+def build_codex_update_completion_steps(
+    config: RecoveryConfig, expected_version: str
+) -> list[RecoveryStep]:
+    """Verify an updater result, then restore the pinned Codex thread."""
+    if not config.thread_id:
+        raise ValueError("Codex update recovery requires a pinned thread ID")
+    primary_command = shlex.join(
+        build_codex_command(
+            model=config.primary_model,
+            reasoning_effort=config.primary_reasoning_effort,
+            codex_args=config.codex_args,
+            resume_thread_id=config.thread_id,
+        )
+    )
+    return [
+        RecoveryStep("wait_shell", "300"),
+        RecoveryStep("ensure_codex_version", expected_version),
+        RecoveryStep("text", primary_command),
+        RecoveryStep("wait_codex", "30"),
+        RecoveryStep("sleep", str(config.startup_wait_seconds)),
+        RecoveryStep("resume_goal_or_prompt", config.resume_prompt),
+    ]
+
+
+def build_codex_update_steps(
+    config: RecoveryConfig, expected_version: str
+) -> list[RecoveryStep]:
+    """Accept the official updater and restore only after version verification."""
+    return [
+        RecoveryStep("key", "1"),
+        *build_codex_update_completion_steps(config, expected_version),
+    ]
+
+
 def build_post_update_restart_steps(config: RecoveryConfig) -> list[RecoveryStep]:
     """Restart the pinned thread after the Codex updater returns to the shell."""
     if not config.thread_id:
@@ -155,6 +202,7 @@ def build_post_update_restart_steps(config: RecoveryConfig) -> list[RecoveryStep
         )
     )
     return [
+        RecoveryStep("update_codex", ""),
         RecoveryStep("text", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),

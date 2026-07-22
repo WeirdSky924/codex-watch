@@ -456,7 +456,7 @@ codex-watch --safe --no-attach
 
 1. 创建名为 `codex-goal` 的 tmux 会话。
 2. 在 tmux 中启动 Codex。
-3. 检测并固定新创建的 thread ID。
+3. 检测并固定新创建的 thread ID；空白首页尚未写入 rollout 时会读取 Codex 自己创建的 shell snapshot。
 4. 保存模型、权限和恢复参数到当前 tmux 会话。
 5. 挂载输出 monitor。
 6. 默认自动进入 tmux 界面。
@@ -709,7 +709,7 @@ Linger=yes
 | HTTP 402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
-| Codex 自更新完成后退回 Shell | 使用更新后的 Codex 恢复固定 thread |
+| Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread |
 
 恢复 paused、blocked 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。没有可识别 Goal 状态时才发送文本续接提示。
 
@@ -718,6 +718,8 @@ Linger=yes
 从 `0.1.2` 开始，HTTP 402 也属于 fatal recovery；所有 fatal recovery 都先立即尝试一次，失败后的后续重试默认等待 5 分钟。5m0s/context exhausted 的 compact 分支完成压缩后切回 primary model 属于同一恢复链内部切换，不会再次等待 5 分钟。
 
 从 `0.1.3` 开始，手工启动、`--resume`、`--thread-id` 恢复以及重新接入已有 tmux session 时，watchdog 都会立即检查当前 Goal 状态。若大型 thread 仍在回放历史，monitor 会在稍后出现 `Resume paused goal?` 时自动选择 `Resume goal`；普通空闲会话不会被注入续接文本。
+
+从 `0.1.4` 开始，Codex 更新页即使出现在 thread ID 创建之前也会由 watchdog 处理。watchdog 会选择 `Update now`、等待官方安装命令结束，然后执行 `codex --version` 核验；如果版本仍低于更新页目标，会额外执行一次 `codex update` 并再次核验。只有真实版本达到目标后才会启动或恢复 Codex，不能再用旧版本继续运行并把更新页留在 tmux 中。
 
 ## 10. 多项目配置示例
 
@@ -857,6 +859,23 @@ codex-watch --version
 ```
 
 `0.1.3` 及以后会在手工启动时立即检查，并由 monitor 持续识别稍后出现的选择页，然后自动选择 `Resume goal`。旧版本需要升级。大型 thread 的历史回放可能持续数分钟，期间不要重复启动第二条恢复流程。
+
+### Codex 更新后仍显示旧版本
+
+先确认 watchdog 版本：
+
+```bash
+codex-watch --version
+```
+
+`0.1.4` 及以后会核验真实安装版本，并在官方更新没有落盘时自动补跑 `codex update`。查看更新处理记录：
+
+```bash
+tail -n 100 "$HOME/.local/state/codex-goal-watchdog/watchdog.log"
+codex --version
+```
+
+若日志显示 `Codex update did not install the requested version`，说明包管理器或网络更新确实失败；watchdog 会停止恢复旧版本，而不是越过错误继续启动。
 
 ### tmux 中颜色异常
 

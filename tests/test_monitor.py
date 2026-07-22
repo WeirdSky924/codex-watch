@@ -88,6 +88,24 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual([], resumed_targets)
 
+    def test_run_monitor_executes_real_update_for_complete_picker(self):
+        updates = []
+
+        run_monitor(
+            lines=[
+                "Update available! 0.144.6 -> 0.145.0\n",
+                "1. Update now (runs `npm install -g @openai/codex`)\n",
+                "2. Skip\n3. Skip until next version\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            now=iter([100.0, 101.0, 102.0]).__next__,
+            update_codex=lambda target, version: updates.append((target, version)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([("codex-goal", "0.145.0")], updates)
+
     def test_run_monitor_detects_wrapped_ansi_stall_output(self):
         calls = []
 

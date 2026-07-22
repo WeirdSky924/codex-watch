@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-07-22
+
+### Fixed
+
+- Handle the Codex update picker before a fresh session has created its thread
+  ID, preventing an unmanaged tmux session from being left behind.
+- Pin a fresh blank Codex session from its shell snapshot before the rollout
+  file exists, without inheriting an outer Codex process's internal variables.
+- Verify the installed Codex version after the official updater exits and run
+  `codex update` once more when the requested version was not installed.
+- Resume pinned threads only after update verification succeeds, while keeping
+  interrupted updates recoverable by the output monitor and guardian.
+
 ## [0.1.3] - 2026-07-21
 
 ### Fixed

@@ -4,8 +4,10 @@ from codex_goal_watchdog.recovery import (
     RecoveryConfig,
     RecoveryController,
     RecoveryStep,
+    build_codex_update_steps,
     build_post_update_restart_steps,
     build_recovery_steps,
+    build_startup_update_steps,
     classify_recovery_reason,
 )
 
@@ -135,6 +137,33 @@ class RecoveryControllerTests(unittest.TestCase):
 
 
 class RecoveryStepTests(unittest.TestCase):
+    def test_startup_update_verifies_version_before_starting_fresh_codex(self):
+        codex_command = ["codex", "--no-alt-screen", "-m", "gpt-5.6-sol"]
+
+        steps = build_startup_update_steps(codex_command, "0.145.0")
+
+        self.assertEqual("key", steps[0].kind)
+        self.assertEqual("1", steps[0].value)
+        self.assertEqual("wait_shell", steps[1].kind)
+        self.assertEqual(RecoveryStep("ensure_codex_version", "0.145.0"), steps[2])
+        self.assertEqual("codex --no-alt-screen -m gpt-5.6-sol", steps[3].value)
+        self.assertEqual("wait_codex", steps[4].kind)
+
+    def test_thread_update_resumes_pinned_goal_after_version_verification(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            primary_model="gpt-5.6-sol",
+            primary_reasoning_effort="max",
+            resume_prompt="继续更新前的 goal。",
+        )
+
+        steps = build_codex_update_steps(config, "0.145.0")
+
+        self.assertEqual(RecoveryStep("key", "1"), steps[0])
+        self.assertEqual(RecoveryStep("ensure_codex_version", "0.145.0"), steps[2])
+        self.assertIn(config.thread_id, steps[3].value)
+        self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
+
     def test_post_update_restart_resumes_sol_directly_from_shell(self):
         config = RecoveryConfig(
             thread_id="550e8400-e29b-41d4-a716-446655440000",
@@ -148,9 +177,10 @@ class RecoveryStepTests(unittest.TestCase):
         steps = build_post_update_restart_steps(config)
         values = [step.value for step in steps]
 
-        self.assertEqual("text", steps[0].kind)
-        self.assertIn("gpt-5.6-sol", steps[0].value)
-        self.assertIn(config.thread_id, steps[0].value)
+        self.assertEqual(RecoveryStep("update_codex", ""), steps[0])
+        self.assertEqual("text", steps[1].kind)
+        self.assertIn("gpt-5.6-sol", steps[1].value)
+        self.assertIn(config.thread_id, steps[1].value)
         self.assertNotIn("C-c", values)
         self.assertNotIn("/quit", values)
         self.assertNotIn("/compact", values)
@@ -185,7 +215,8 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep("sleep", "0"),
                 RecoveryStep(
                     "text",
-                    "env -u NO_COLOR COLORTERM=truecolor "
+                    "env -u NO_COLOR -u CODEX_THREAD_ID -u CODEX_CI "
+                    "COLORTERM=truecolor "
                     "codex --no-alt-screen -m gpt-5.6-luna -c "
                     "'model_reasoning_effort=\"xhigh\"' "
                     "--dangerously-bypass-approvals-and-sandbox resume "
@@ -209,7 +240,8 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep("sleep", "1"),
                 RecoveryStep(
                     "text",
-                    "env -u NO_COLOR COLORTERM=truecolor "
+                    "env -u NO_COLOR -u CODEX_THREAD_ID -u CODEX_CI "
+                    "COLORTERM=truecolor "
                     "codex --no-alt-screen -m gpt-5.6-sol -c "
                     "'model_reasoning_effort=\"max\"' "
                     "--dangerously-bypass-approvals-and-sandbox resume "

@@ -10,11 +10,18 @@ import time
 from collections.abc import Callable, Iterable
 from typing import BinaryIO
 
-from .recovery import RecoveryConfig, build_recovery_steps
+from .recovery import (
+    RecoveryConfig,
+    build_codex_update_completion_steps,
+    build_codex_update_steps,
+    build_recovery_steps,
+)
 from .tmux_control import (
+    capture_update_prompt_version,
     execute_steps,
     handle_goal_prompt,
     paused_goal_picker_visible,
+    update_prompt_version,
 )
 
 
@@ -28,6 +35,7 @@ GOAL_RESUME_STATUS_MARKERS = (
     "Goal hit usage limits (/goal resume)",
 )
 GOAL_RESUME_RETRY_SECONDS = 10
+PENDING_UPDATE_OPTION = "@codex_pending_update_version"
 
 
 def normalize_terminal_text(value: str) -> str:
@@ -58,6 +66,7 @@ def run_monitor(
     now: Callable[[], float] = time.time,
     execute: Callable[[str, list], None] | None = None,
     resume_goal: Callable[[str], None] | None = None,
+    update_codex: Callable[[str, str], None] | None = None,
     log: Callable[[str], None] | None = None,
     initial_recovery_count: int = 0,
     save_recovery_count: Callable[[int], None] | None = None,
@@ -82,8 +91,15 @@ def run_monitor(
             send_fallback_prompt=False,
         )
 
+    def default_update_codex(tmux_target: str, expected_version: str) -> None:
+        visible_version = capture_update_prompt_version(tmux_target)
+        if visible_version is None:
+            return
+        _run_codex_update(tmux_target, config, visible_version)
+
     run_execute = execute or default_execute
     run_resume_goal = resume_goal or default_resume_goal
+    run_update_codex = update_codex or default_update_codex
     rolling_output = ""
     last_goal_resume_at: float | None = None
     for line in lines:
@@ -107,6 +123,16 @@ def run_monitor(
                     recovery_attempt=controller.recovery_count,
                 ),
             )
+            continue
+
+        expected_update_version = update_prompt_version(rolling_output)
+        if expected_update_version is not None:
+            emit(
+                "[codex-goal-watchdog] installing Codex update: "
+                f"target={expected_update_version}"
+            )
+            run_update_codex(target, expected_update_version)
+            rolling_output = ""
             continue
 
         goal_resume_visible = paused_goal_picker_visible(rolling_output) or any(
@@ -150,8 +176,69 @@ def _save_tmux_recovery_count(target: str, count: int) -> None:
     )
 
 
+def _pending_update_version(target: str) -> str:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, PENDING_UPDATE_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _set_pending_update_version(target: str, version: str) -> None:
+    subprocess.run(
+        ["tmux", "set-option", "-t", target, PENDING_UPDATE_OPTION, version],
+        check=True,
+    )
+
+
+def _clear_pending_update_version(target: str) -> None:
+    subprocess.run(
+        ["tmux", "set-option", "-u", "-t", target, PENDING_UPDATE_OPTION],
+        check=True,
+    )
+
+
+def _run_codex_update(
+    target: str,
+    config: RecoveryConfig,
+    expected_version: str,
+) -> None:
+    _set_pending_update_version(target, expected_version)
+    execute_steps(target, build_codex_update_steps(config, expected_version))
+    _clear_pending_update_version(target)
+
+
+def _resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
+    visible_version = capture_update_prompt_version(target)
+    if visible_version is not None:
+        print(
+            "[codex-goal-watchdog] installing visible Codex update: "
+            f"target={visible_version}",
+            flush=True,
+        )
+        _run_codex_update(target, config, visible_version)
+        return
+
+    pending_version = _pending_update_version(target)
+    if not pending_version:
+        return
+    print(
+        "[codex-goal-watchdog] completing interrupted Codex update: "
+        f"target={pending_version}",
+        flush=True,
+    )
+    execute_steps(
+        target,
+        build_codex_update_completion_steps(config, pending_version),
+    )
+    _clear_pending_update_version(target)
+
+
 def monitor_stdin(target: str, config: RecoveryConfig) -> None:
     print(f"[codex-goal-watchdog] monitor started: target={target}", flush=True)
+    _resume_interrupted_update(target, config)
     run_monitor(
         lines=iter_decoded_chunks(sys.stdin.buffer),
         target=target,

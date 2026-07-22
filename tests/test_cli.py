@@ -87,6 +87,41 @@ class ConsoleEntrypointTests(unittest.TestCase):
             send_fallback_prompt=False,
         )
 
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.execute_steps")
+    @patch(
+        "codex_goal_watchdog.__main__.capture_update_prompt_version",
+        return_value="0.145.0",
+    )
+    @patch("codex_goal_watchdog.__main__.wait_for_new_thread_id")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)
+    def test_fresh_start_handles_update_before_waiting_for_thread_id(
+        self,
+        _session_exists_mock,
+        _run_mock,
+        wait_for_thread_mock,
+        _capture_update_mock,
+        execute_steps_mock,
+        _handle_goal_prompt_mock,
+    ):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+
+        def wait_for_thread(**kwargs):
+            self.assertTrue(kwargs["on_wait"]())
+            return thread_id
+
+        wait_for_thread_mock.side_effect = wait_for_thread
+
+        with redirect_stdout(StringIO()):
+            result = main(["start", "--session", "fresh-session", "--no-attach"])
+
+        self.assertEqual(0, result)
+        update_steps = execute_steps_mock.call_args.args[1]
+        self.assertEqual("1", update_steps[0].value)
+        self.assertEqual("ensure_codex_version", update_steps[2].kind)
+        self.assertEqual("0.145.0", update_steps[2].value)
+
 
 if __name__ == "__main__":
     unittest.main()

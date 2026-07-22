@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -18,10 +19,114 @@ PAUSED_GOAL_PICKER_MARKERS = (
     "Resume goal",
     "Leave paused",
 )
+UPDATE_PROMPT_RE = re.compile(
+    r"Update available!\s+v?(?P<current>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
+    r"\s*->\s*v?(?P<latest>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
+)
+CODEX_VERSION_RE = re.compile(
+    r"\b(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b"
+)
 
 
 def paused_goal_picker_visible(text: str) -> bool:
     return all(marker in text for marker in PAUSED_GOAL_PICKER_MARKERS)
+
+
+def update_prompt_version(text: str) -> str | None:
+    match = UPDATE_PROMPT_RE.search(text)
+    if (
+        match is None
+        or "Update now (runs" not in text
+        or "Skip until next version" not in text
+    ):
+        return None
+    return match.group("latest")
+
+
+def capture_update_prompt_version(
+    target: str, *, runner=subprocess.run
+) -> str | None:
+    result = runner(
+        ["tmux", "capture-pane", "-p", "-t", target],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(result, "returncode", 0) != 0:
+        return None
+    visible_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not visible_lines or "Update available!" not in visible_lines[0]:
+        return None
+    return update_prompt_version(result.stdout)
+
+
+def _version_key(value: str) -> tuple[int, int, int, int]:
+    core, separator, _suffix = value.partition("-")
+    numbers = tuple(int(part) for part in core.split("+")[0].split("."))
+    if len(numbers) != 3:
+        raise ValueError(f"unsupported Codex version: {value}")
+    return (*numbers, 0 if separator else 1)
+
+
+def _installed_codex_version(*, runner=subprocess.run) -> str | None:
+    try:
+        result = runner(
+            ["codex", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    match = CODEX_VERSION_RE.search(result.stdout)
+    return match.group("version") if match else None
+
+
+def _wait_for_installed_codex_version(
+    *,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+    attempts: int = 10,
+) -> str | None:
+    for attempt in range(max(1, attempts)):
+        actual_version = _installed_codex_version(runner=runner)
+        if actual_version is not None:
+            return actual_version
+        if attempt + 1 < attempts:
+            sleeper(0.5)
+    return None
+
+
+def ensure_codex_version(
+    expected_version: str,
+    *,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+) -> str:
+    actual_version = _wait_for_installed_codex_version(
+        runner=runner,
+        sleeper=sleeper,
+    )
+    if actual_version is not None and _version_key(actual_version) >= _version_key(
+        expected_version
+    ):
+        return actual_version
+
+    runner(["codex", "update"], check=True)
+    actual_version = _wait_for_installed_codex_version(
+        runner=runner,
+        sleeper=sleeper,
+    )
+    if actual_version is None or _version_key(actual_version) < _version_key(
+        expected_version
+    ):
+        raise RuntimeError(
+            "Codex update did not install the requested version: "
+            f"expected at least {expected_version}, got {actual_version or '<unknown>'}"
+        )
+    return actual_version
 
 
 def commands_for_step(target: str, step: RecoveryStep) -> list[list[str]]:
@@ -201,6 +306,21 @@ def execute_steps(
                 runner=runner,
                 sleeper=sleeper,
             )
+            continue
+        if step.kind == "ensure_codex_version":
+            if dry_run:
+                print(
+                    f"DRY-RUN: ensure Codex version >= {step.value}",
+                    flush=True,
+                )
+                continue
+            ensure_codex_version(step.value, runner=runner)
+            continue
+        if step.kind == "update_codex":
+            if dry_run:
+                print("DRY-RUN: codex update", flush=True)
+                continue
+            runner(["codex", "update"], check=True)
             continue
         if step.kind == "mark_compaction":
             path = find_thread_rollout_path(thread_id=step.value)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from uuid import UUID
 
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+DEFAULT_SHELL_SNAPSHOTS_ROOT = Path.home() / ".codex" / "shell_snapshots"
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,7 @@ def find_new_thread_id(
     cwd: Path,
     started_after: datetime,
     sessions_root: Path = DEFAULT_SESSIONS_ROOT,
+    shell_snapshots_root: Path | None = None,
 ) -> str | None:
     resolved_cwd = cwd.resolve()
     threshold = started_after.astimezone(timezone.utc)
@@ -97,8 +100,36 @@ def find_new_thread_id(
         if record.cwd == resolved_cwd and record.started_at >= threshold
     ]
     if not matches:
-        return None
+        return _find_new_shell_snapshot_thread_id(
+            started_after=threshold,
+            shell_snapshots_root=shell_snapshots_root,
+        )
     return max(matches, key=lambda record: record.started_at).thread_id
+
+
+def _find_new_shell_snapshot_thread_id(
+    *,
+    started_after: datetime,
+    shell_snapshots_root: Path | None,
+) -> str | None:
+    if shell_snapshots_root is None or not shell_snapshots_root.exists():
+        return None
+    threshold = started_after.timestamp()
+    matches: list[tuple[float, str]] = []
+    for path in shell_snapshots_root.glob("*.sh"):
+        thread_id_text, separator, _rest = path.name.partition(".")
+        if not separator:
+            continue
+        try:
+            thread_id = validate_thread_id(thread_id_text)
+            modified_at = path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if modified_at >= threshold:
+            matches.append((modified_at, thread_id))
+    if not matches:
+        return None
+    return max(matches)[1]
 
 
 def wait_for_new_thread_id(
@@ -106,18 +137,25 @@ def wait_for_new_thread_id(
     cwd: Path,
     started_after: datetime,
     sessions_root: Path = DEFAULT_SESSIONS_ROOT,
+    shell_snapshots_root: Path | None = None,
     timeout_seconds: float = 15,
+    on_wait: Callable[[], bool] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
 ) -> str | None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
+    deadline = now() + timeout_seconds
+    while now() < deadline:
         thread_id = find_new_thread_id(
             cwd=cwd,
             started_after=started_after,
             sessions_root=sessions_root,
+            shell_snapshots_root=shell_snapshots_root,
         )
         if thread_id:
             return thread_id
-        time.sleep(0.1)
+        if on_wait is not None and on_wait():
+            deadline = now() + timeout_seconds
+        sleeper(0.1)
     return None
 
 

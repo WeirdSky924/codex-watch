@@ -2,14 +2,95 @@ import unittest
 
 from codex_goal_watchdog.recovery import RecoveryStep
 from codex_goal_watchdog.tmux_control import (
+    capture_update_prompt_version,
     commands_for_step,
+    ensure_codex_version,
     handle_goal_prompt,
     monitor_pipe_command,
+    update_prompt_version,
     wait_for_pane_state,
 )
 
 
 class TmuxControlTests(unittest.TestCase):
+    def test_update_prompt_version_requires_complete_update_picker(self):
+        screen = (
+            "Update available! 0.144.6 -> 0.145.0\n"
+            "1. Update now (runs `npm install -g @openai/codex`)\n"
+            "2. Skip\n"
+            "3. Skip until next version\n"
+        )
+
+        self.assertEqual("0.145.0", update_prompt_version(screen))
+        self.assertIsNone(update_prompt_version("Update available! in documentation"))
+
+    def test_capture_update_prompt_version_reads_tmux_screen(self):
+        def runner(command, **kwargs):
+            class Result:
+                stdout = (
+                    "Update available! 0.144.6 -> 0.145.0\n"
+                    "1. Update now (runs `npm install -g @openai/codex`)\n"
+                    "2. Skip\n3. Skip until next version\n"
+                )
+
+            return Result()
+
+        self.assertEqual(
+            "0.145.0",
+            capture_update_prompt_version("codex-goal", runner=runner),
+        )
+
+    def test_capture_update_prompt_version_ignores_transcript_quote(self):
+        def runner(command, **kwargs):
+            class Result:
+                stdout = (
+                    "OpenAI Codex\n"
+                    "Quoted: Update available! 0.144.6 -> 0.145.0\n"
+                    "1. Update now (runs `npm install -g @openai/codex`)\n"
+                    "2. Skip\n3. Skip until next version\n"
+                )
+
+            return Result()
+
+        self.assertIsNone(
+            capture_update_prompt_version("codex-goal", runner=runner)
+        )
+
+    def test_ensure_codex_version_retries_real_update_when_still_old(self):
+        calls = []
+        versions = iter(["codex-cli 0.144.6\n", "codex-cli 0.145.0\n"])
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                returncode = 0
+                stdout = next(versions) if command == ["codex", "--version"] else ""
+
+            return Result()
+
+        ensure_codex_version("0.145.0", runner=runner)
+
+        self.assertEqual(
+            [
+                ["codex", "--version"],
+                ["codex", "update"],
+                ["codex", "--version"],
+            ],
+            calls,
+        )
+
+    def test_ensure_codex_version_rejects_false_success(self):
+        def runner(command, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = "codex-cli 0.144.6\n" if command == ["codex", "--version"] else ""
+
+            return Result()
+
+        with self.assertRaisesRegex(RuntimeError, "expected at least 0.145.0"):
+            ensure_codex_version("0.145.0", runner=runner)
+
     def test_handle_goal_prompt_leaves_goal_paused_for_compaction(self):
         calls = []
 

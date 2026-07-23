@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import replace
+from pathlib import Path
 from typing import BinaryIO
 
 from .recovery import (
@@ -16,6 +18,7 @@ from .recovery import (
     build_codex_update_steps,
     build_recovery_steps,
 )
+from .sessions import find_active_cli_thread_id
 from .tmux_control import (
     capture_update_prompt_version,
     execute_steps,
@@ -70,6 +73,8 @@ def run_monitor(
     log: Callable[[str], None] | None = None,
     initial_recovery_count: int = 0,
     save_recovery_count: Callable[[int], None] | None = None,
+    resolve_thread_id: Callable[[str], str | None] | None = None,
+    save_thread_id: Callable[[str], None] | None = None,
 ) -> None:
     from .recovery import RecoveryController
 
@@ -103,6 +108,20 @@ def run_monitor(
     rolling_output = ""
     last_goal_resume_at: float | None = None
     for line in lines:
+        resolved_thread_id = (
+            resolve_thread_id(target) if resolve_thread_id is not None else None
+        )
+        if resolved_thread_id and resolved_thread_id != config.thread_id:
+            config = replace(config, thread_id=resolved_thread_id)
+            controller = RecoveryController(config, initial_recovery_count=0)
+            rolling_output = ""
+            last_goal_resume_at = None
+            if save_thread_id is not None:
+                save_thread_id(resolved_thread_id)
+            emit(
+                "[codex-goal-watchdog] rebound thread after /clear: "
+                f"{resolved_thread_id}"
+            )
         rolling_output = normalize_terminal_text(f"{rolling_output} {line}")
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
         observed_at = now()
@@ -176,6 +195,39 @@ def _save_tmux_recovery_count(target: str, count: int) -> None:
     )
 
 
+def _save_tmux_thread_id(target: str, thread_id: str) -> None:
+    subprocess.run(
+        ["tmux", "set-option", "-t", target, "@codex_thread_id", thread_id],
+        check=True,
+    )
+    _save_tmux_recovery_count(target, 0)
+
+
+def _tmux_pane_identity(target: str) -> tuple[int, Path] | None:
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_pid}\t#{pane_current_path}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    pid_text, separator, cwd_text = result.stdout.strip().partition("\t")
+    if not separator or not cwd_text:
+        return None
+    try:
+        return int(pid_text), Path(cwd_text).resolve()
+    except (OSError, ValueError):
+        return None
+
+
 def _pending_update_version(target: str) -> str:
     result = subprocess.run(
         ["tmux", "show-option", "-v", "-t", target, PENDING_UPDATE_OPTION],
@@ -238,6 +290,23 @@ def _resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
 
 def monitor_stdin(target: str, config: RecoveryConfig) -> None:
     print(f"[codex-goal-watchdog] monitor started: target={target}", flush=True)
+    pane_identity = _tmux_pane_identity(target)
+
+    def resolve_thread_id(_target: str) -> str | None:
+        if pane_identity is None:
+            return None
+        pane_pid, cwd = pane_identity
+        return find_active_cli_thread_id(pane_pid=pane_pid, cwd=cwd)
+
+    active_thread_id = resolve_thread_id(target)
+    if active_thread_id and active_thread_id != config.thread_id:
+        config = replace(config, thread_id=active_thread_id)
+        _save_tmux_thread_id(target, active_thread_id)
+        print(
+            "[codex-goal-watchdog] rebound active thread: "
+            f"{active_thread_id}",
+            flush=True,
+        )
     _resume_interrupted_update(target, config)
     run_monitor(
         lines=iter_decoded_chunks(sys.stdin.buffer),
@@ -245,4 +314,6 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         config=config,
         initial_recovery_count=_tmux_recovery_count(target),
         save_recovery_count=lambda count: _save_tmux_recovery_count(target, count),
+        resolve_thread_id=resolve_thread_id,
+        save_thread_id=lambda thread_id: _save_tmux_thread_id(target, thread_id),
     )

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from codex_goal_watchdog.sessions import (
     compaction_event_exists_after,
+    find_active_cli_thread_id,
     find_latest_thread_id,
     find_new_thread_id,
     find_thread_rollout_path,
@@ -21,6 +22,7 @@ class SessionResolverTests(unittest.TestCase):
         thread_id: str,
         cwd: str,
         started_at: datetime,
+        source="cli",
     ) -> Path:
         path = root / f"rollout-{thread_id}.jsonl"
         payload = {
@@ -29,6 +31,7 @@ class SessionResolverTests(unittest.TestCase):
             "payload": {
                 "id": thread_id,
                 "cwd": cwd,
+                "source": source,
                 "timestamp": started_at.isoformat().replace("+00:00", "Z"),
             },
         }
@@ -102,6 +105,64 @@ class SessionResolverTests(unittest.TestCase):
             )
 
         self.assertEqual(thread_id, actual)
+
+    def test_find_active_cli_thread_uses_open_rollout_and_ignores_subagents(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sessions_root = root / "sessions"
+            sessions_root.mkdir()
+            proc_root = root / "proc"
+            pane_pid = 100
+            child_pid = 101
+            unrelated_pid = 999
+            for pid in (pane_pid, child_pid, unrelated_pid):
+                (proc_root / str(pid) / "task" / str(pid)).mkdir(parents=True)
+                (proc_root / str(pid) / "fd").mkdir()
+            (proc_root / str(pane_pid) / "task" / str(pane_pid) / "children").write_text(
+                str(child_pid), encoding="utf-8"
+            )
+            (proc_root / str(child_pid) / "task" / str(child_pid) / "children").write_text(
+                "", encoding="utf-8"
+            )
+            (proc_root / str(unrelated_pid) / "task" / str(unrelated_pid) / "children").write_text(
+                "", encoding="utf-8"
+            )
+            old_main = self._write_session(
+                sessions_root,
+                thread_id="550e8400-e29b-41d4-a716-446655440000",
+                cwd="/workspace/target",
+                started_at=datetime(2026, 7, 14, 10, tzinfo=timezone.utc),
+            )
+            new_main = self._write_session(
+                sessions_root,
+                thread_id="550e8400-e29b-41d4-a716-446655440001",
+                cwd="/workspace/target",
+                started_at=datetime(2026, 7, 14, 12, tzinfo=timezone.utc),
+            )
+            subagent = self._write_session(
+                sessions_root,
+                thread_id="550e8400-e29b-41d4-a716-446655440002",
+                cwd="/workspace/target",
+                started_at=datetime(2026, 7, 14, 13, tzinfo=timezone.utc),
+                source={"subagent": {"thread_spawn": {"depth": 1}}},
+            )
+            unrelated = self._write_session(
+                sessions_root,
+                thread_id="550e8400-e29b-41d4-a716-446655440003",
+                cwd="/workspace/target",
+                started_at=datetime(2026, 7, 14, 14, tzinfo=timezone.utc),
+            )
+            for fd, path in enumerate((old_main, new_main, subagent), start=3):
+                (proc_root / str(child_pid) / "fd" / str(fd)).symlink_to(path)
+            (proc_root / str(unrelated_pid) / "fd" / "3").symlink_to(unrelated)
+
+            actual = find_active_cli_thread_id(
+                pane_pid=pane_pid,
+                cwd=Path("/workspace/target"),
+                proc_root=proc_root,
+            )
+
+        self.assertEqual("550e8400-e29b-41d4-a716-446655440001", actual)
 
     def test_find_thread_rollout_path_and_compaction_event(self):
         with tempfile.TemporaryDirectory() as temp_dir:

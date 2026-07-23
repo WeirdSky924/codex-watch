@@ -208,6 +208,39 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([2], persisted_counts)
         self.assertEqual("300", calls[0][1][4].value)
 
+    def test_run_monitor_rebinds_after_clear_before_recovery(self):
+        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        calls = []
+        rebound_ids = []
+        persisted_counts = []
+
+        run_monitor(
+            lines=[
+                "■ unexpected status 503 Service Unavailable: "
+                "service temporarily unavailable\n"
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                cooldown_seconds=300,
+                max_recoveries=0,
+            ),
+            initial_recovery_count=4,
+            resolve_thread_id=lambda target: new_thread_id,
+            save_thread_id=rebound_ids.append,
+            save_recovery_count=persisted_counts.append,
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([new_thread_id], rebound_ids)
+        self.assertEqual([1], persisted_counts)
+        self.assertEqual("0", calls[0][1][4].value)
+        self.assertTrue(
+            any(new_thread_id in step.value for step in calls[0][1])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

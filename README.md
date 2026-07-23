@@ -726,6 +726,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 
 同一版本还会在 tmux 输入 `/quit`、`/compact`、`/goal resume`、Codex 启动命令或续接提示后短暂等待，再发送 Enter，避免 Codex 将过快的“文字 + Enter”识别为带换行的粘贴内容并停在输入框。
 
+从 `0.1.6` 开始，在受管 Codex 会话中执行 `/clear` 后，watchdog 会从当前 tmux pane 的 Codex 进程树中识别最新顶层 CLI rollout，自动更新固定 thread ID，并将新 thread 的恢复计数重置为 0。子 Agent thread 和同目录下其他 Codex 进程不会被误绑定。
+
 ## 10. 多项目配置示例
 
 项目 A：

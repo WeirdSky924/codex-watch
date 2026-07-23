@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2026-07-23
+
+### Fixed
+
+- Rebind the watched thread after Codex `/clear` by resolving the newest
+  top-level CLI rollout opened by the tmux pane process.
+- Ignore subagent rollouts and unrelated Codex processes while rebinding, then
+  persist the new thread ID and reset its recovery count.
+
 ## [0.1.5] - 2026-07-22
 
 ### Fixed

@@ -22,6 +22,7 @@ class SessionRecord:
     cwd: Path
     started_at: datetime
     modified_at: float
+    source: object
 
 
 def validate_thread_id(value: str) -> str:
@@ -55,6 +56,7 @@ def _read_session_record(path: Path) -> SessionRecord | None:
             cwd=cwd,
             started_at=_parse_timestamp(timestamp),
             modified_at=path.stat().st_mtime,
+            source=payload.get("source", "cli"),
         )
     except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError):
         return None
@@ -83,6 +85,64 @@ def find_latest_thread_id(
     if not matches:
         return None
     return max(matches, key=lambda record: record.modified_at).thread_id
+
+
+def _process_tree_pids(*, pane_pid: int, proc_root: Path) -> set[int]:
+    discovered: set[int] = set()
+    pending = [pane_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in discovered:
+            continue
+        discovered.add(pid)
+        children_path = proc_root / str(pid) / "task" / str(pid) / "children"
+        try:
+            children = children_path.read_text(encoding="utf-8").split()
+        except OSError:
+            continue
+        for value in children:
+            try:
+                pending.append(int(value))
+            except ValueError:
+                continue
+    return discovered
+
+
+def find_active_cli_thread_id(
+    *,
+    pane_pid: int,
+    cwd: Path,
+    proc_root: Path = Path("/proc"),
+) -> str | None:
+    """Find the newest top-level CLI rollout opened by a tmux pane process."""
+    resolved_cwd = cwd.resolve()
+    records: dict[str, SessionRecord] = {}
+    for pid in _process_tree_pids(pane_pid=pane_pid, proc_root=proc_root):
+        fd_root = proc_root / str(pid) / "fd"
+        try:
+            descriptors = tuple(fd_root.iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                path = descriptor.resolve(strict=True)
+            except OSError:
+                continue
+            if not path.name.startswith("rollout-") or path.suffix != ".jsonl":
+                continue
+            record = _read_session_record(path)
+            if (
+                record is not None
+                and record.cwd == resolved_cwd
+                and record.source == "cli"
+            ):
+                records[record.thread_id] = record
+    if not records:
+        return None
+    return max(
+        records.values(),
+        key=lambda record: (record.started_at, record.modified_at),
+    ).thread_id
 
 
 def find_new_thread_id(

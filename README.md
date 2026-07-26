@@ -706,7 +706,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | --- | --- |
 | `codex upstream stalled: no real data for 5m0s` | 切到 compact model，恢复固定 thread，执行 `/compact`，等待真实压缩事件，再切回 primary model 并继续 Goal |
 | Codex context window exhausted | 执行相同的 compact 流程 |
-| HTTP 402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
+| HTTP 401（包括 `API DISABLE`）、402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
 | `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
@@ -727,6 +727,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 同一版本还会在 tmux 输入 `/quit`、`/compact`、`/goal resume`、Codex 启动命令或续接提示后短暂等待，再发送 Enter，避免 Codex 将过快的“文字 + Enter”识别为带换行的粘贴内容并停在输入框。
 
 从 `0.1.6` 开始，在受管 Codex 会话中执行 `/clear` 后，watchdog 会从当前 tmux pane 的 Codex 进程树中识别最新顶层 CLI rollout，自动更新固定 thread ID，并将新 thread 的恢复计数重置为 0。子 Agent thread 和同目录下其他 Codex 进程不会被误绑定。
+
+从 `0.1.7` 开始，Codex TUI 中带 `■` fatal 标记的 HTTP 401（包括 `API DISABLE`）进入统一恢复流程：首次立即恢复，后续失败按冷静期继续重试，默认不限制次数。
 
 ## 10. 多项目配置示例
 

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7] - 2026-07-26
+
+### Changed
+
+- Treat terminal HTTP 401 errors, including `API DISABLE`, as fatal errors
+  handled by the standard immediate-then-delayed recovery flow.
+
 ## [0.1.6] - 2026-07-23
 
 ### Fixed

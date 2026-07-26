@@ -79,13 +79,25 @@ class RecoveryControllerTests(unittest.TestCase):
         self.assertEqual(10, controller.recovery_count)
 
     def test_classifies_retryable_terminal_http_errors(self):
-        for status in (402, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
+        for status in (401, 402, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
             with self.subTest(status=status):
                 self.assertEqual(
                     f"retryable_http_{status}",
                     classify_recovery_reason(
                         f"■ unexpected status {status} Bad Gateway: upstream request failed"
                     ),
+                )
+
+    def test_classifies_terminal_401_api_disabled(self):
+        for message in (
+            "■ unexpected status 401 Unauthorized: API DISABLE",
+            "■ 401 API DISABLE",
+            "■ API disabled: status 401",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(
+                    "retryable_http_401",
+                    classify_recovery_reason(message),
                 )
 
     def test_does_not_classify_http_codes_without_terminal_error_marker(self):

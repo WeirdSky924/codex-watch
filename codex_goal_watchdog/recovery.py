@@ -28,7 +28,20 @@ DEFAULT_RESUME_PROMPT = (
     "继续刚才被 5m0s 中断的 goal。从当前仓库状态和最近上下文继续，"
     "不要重复已经完成的操作；先检查现状，再推进未完成步骤。"
 )
-RETRYABLE_HTTP_CODES = (402, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
+RETRYABLE_HTTP_CODES = (
+    401,
+    402,
+    429,
+    500,
+    502,
+    503,
+    504,
+    520,
+    521,
+    522,
+    523,
+    524,
+)
 RETRYABLE_HTTP_RE = re.compile(
     r"\b(" + "|".join(str(code) for code in RETRYABLE_HTTP_CODES) + r")\b"
 )
@@ -74,7 +87,7 @@ def classify_recovery_reason(text: str) -> str | None:
         error_shaped = re.search(
             r"unexpected status|too many requests|bad gateway|gateway timeout|"
             r"service unavailable|stream disconnected|request failed|upstream error|"
-            r"cloudflare",
+            r"api disabl(?:e|ed)|cloudflare",
             error_text,
             re.IGNORECASE,
         )

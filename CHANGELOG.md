@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.8] - 2026-07-26
+
+### Fixed
+
+- Persist each watchdog session's pinned Codex thread outside tmux and restore
+  that exact thread when the named tmux session no longer exists.
+- Update the persistent binding after Codex `/clear`, while keeping subagent and
+  unrelated Codex rollouts excluded from thread rebinding.
+- Add `--new` to explicitly replace a saved watchdog-session binding with a
+  fresh Codex thread; keep `--resume` as an explicit latest-thread-by-directory
+  operation.
+
 ## [0.1.7] - 2026-07-26
 
 ### Changed

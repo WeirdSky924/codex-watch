@@ -21,8 +21,8 @@ Codex Goal Watchdog 用 tmux 托管 Codex CLI，并在长时间 Goal 因上游�
 # 首次启动一个新 Codex 会话
 codex-watch --safe
 
-# 恢复当前项目目录最近一次 Codex 会话
-codex-watch --resume --safe
+# tmux 消失后，恢复 codex-goal 自己上次绑定的 Codex 会话
+codex-watch --safe
 
 # 重新进入正在运行的 tmux 会话
 tmux attach -t codex-goal
@@ -299,9 +299,17 @@ codex-watch \
 
 ### 配置保存在哪里
 
-watchdog 会把 thread ID、模型、effort、恢复次数和续接提示保存在当前 tmux session 的 `@codex_*` 选项中。这些选项可以支持当前 tmux 内的自动恢复，但服务器重启后会随 tmux 一起消失。
+watchdog 会把模型、effort、恢复次数和续接提示保存在当前 tmux session 的 `@codex_*` 选项中。这些运行态选项会在 tmux 消失后一起消失。
 
-当前版本没有单独的永久配置文件。自定义模型用户应保存一个自己的启动脚本，避免每次重新输入长命令。
+固定 thread ID 还会按 `--session` 名称持久保存到：
+
+```text
+~/.local/state/codex-goal-watchdog/bindings/
+```
+
+因此 `codex-watch --session project-a` 恢复的是 `project-a` 自己上次固定的 thread，不会选择 Codex 全局最近会话。同一目录使用多个 watchdog 时应给每个实例设置不同的 `--session`。执行 `/clear` 后，monitor 会把新 thread ID 同时写入 tmux 和该持久绑定。
+
+模型等自定义参数仍应保存在自己的启动脚本中，避免每次重新输入长命令。
 
 下面示例会创建 `my-codex-watch`。先把四个 `replace-with-...` 值和 session 名称改成自己的配置：
 
@@ -336,8 +344,11 @@ my-codex-watch --dry-run
 
 ```bash
 my-codex-watch
+my-codex-watch --new
 my-codex-watch --resume
 ```
+
+不带模式参数时恢复 `project-a` 自己的持久绑定；`--new` 明确创建新 thread 并覆盖该绑定；`--resume` 明确改为选择当前目录最近的 Codex thread，并将选择结果绑定给 `project-a`。
 
 如果确实需要最高权限模式，从脚本中删除 `--safe`。不要同时保留一个含密钥的启动脚本；provider 密钥应继续由 Codex 自己的认证配置管理。
 
@@ -454,10 +465,10 @@ codex-watch --safe --no-attach
 
 正常启动后会发生以下事情：
 
-1. 创建名为 `codex-goal` 的 tmux 会话。
-2. 在 tmux 中启动 Codex。
-3. 检测并固定新创建的 thread ID；空白首页尚未写入 rollout 时会读取 Codex 自己创建的 shell snapshot。
-4. 保存模型、权限和恢复参数到当前 tmux 会话。
+1. 查找 `codex-goal` 自己持久保存的 thread ID；存在时恢复该 ID，不存在时才创建新 thread。
+2. 创建名为 `codex-goal` 的 tmux 会话并启动 Codex。
+3. 固定实际 thread ID；新建空白首页尚未写入 rollout 时会读取 Codex 自己创建的 shell snapshot。
+4. 持久保存 `codex-goal` 与 thread ID 的绑定，并保存运行参数到当前 tmux 会话。
 5. 挂载输出 monitor。
 6. 默认自动进入 tmux 界面。
 
@@ -588,16 +599,18 @@ tail -f "$HOME/.local/state/codex-goal-watchdog/watchdog.log"
 ```bash
 PROJECT_DIR="$HOME/projects/your-project"
 cd "$PROJECT_DIR"
-codex-watch --resume --safe
+codex-watch --safe
 ```
 
-当前版本的 guardian 会在开机后启动，但不会猜测项目目录并自动创建缺失的 tmux 会话。因此整机重启后必须执行一次上面的恢复命令。
+该命令会恢复 `codex-goal` 自己上次固定的 thread，而不是 Codex 在该目录或全局的最近 thread。只有需要主动改绑到当前目录最近 thread 时才使用 `--resume`；需要放弃旧绑定并创建全新 thread 时使用 `--new`。
+
+当前版本的 guardian 会在开机后启动，但不会自动创建缺失的 tmux 会话。因此整机重启后仍须进入原项目目录执行一次上面的恢复命令。
 
 使用自定义模型时，必须重新传入模型参数，或者使用前面创建的固定启动脚本：
 
 ```bash
 cd "$PROJECT_DIR"
-my-codex-watch --resume
+my-codex-watch
 ```
 
 如果恢复界面后 Goal 处于暂停状态且没有自动继续，在 Codex 中执行：
@@ -615,6 +628,16 @@ codex-watch --thread-id "$THREAD_ID" --safe
 ```
 
 指定 thread 比“选择当前目录最近记录”更精确。watchdog 的自动恢复始终使用固定 UUID，不使用 `resume --last`，避免被其他 Codex 进程重定向到错误 thread。
+
+### 明确创建新 thread
+
+需要放弃该 watchdog session 的旧绑定并新建时执行：
+
+```bash
+codex-watch --session codex-goal --new --safe
+```
+
+如果同名 tmux 仍存在，`--new` 会拒绝执行，防止覆盖一个仍在运行的会话。先确认旧任务已经结束并关闭 tmux，或者改用新的 `--session` 名称。
 
 ### `--resume` 找不到记录
 
@@ -730,6 +753,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 
 从 `0.1.7` 开始，Codex TUI 中带 `■` fatal 标记的 HTTP 401（包括 `API DISABLE`）进入统一恢复流程：首次立即恢复，后续失败按冷静期继续重试，默认不限制次数。
 
+从 `0.1.8` 开始，每个 `--session` 的固定 thread ID 会持久保存在 watchdog 状态目录。tmux 消失后，不带模式参数重新启动会恢复该 watchdog session 自己的 ID；`/clear` 后的新 ID 会同步覆盖持久绑定。`--resume` 仅在显式使用时选择当前目录最近的 Codex thread，`--new` 用于明确创建新 thread。
+
 ## 10. 多项目配置示例
 
 项目 A：
@@ -781,10 +806,10 @@ tail -f "$HOME/.local/state/codex-goal-watchdog/watchdog.log"
 这表示 guardian 正常运行，但对应 tmux session 不存在。进入项目目录并启动或恢复：
 
 ```bash
-codex-watch --resume --safe
+codex-watch --safe
 ```
 
-如果项目从未创建过 Codex 会话，去掉 `--resume`。
+存在该 watchdog session 的持久绑定时会恢复其固定 thread；没有绑定时会创建新 thread。不要为了普通重启添加 `--resume`，否则会改为选择当前目录最近的 Codex thread。
 
 ### 出现 `required command not found`
 
@@ -1025,8 +1050,10 @@ sha256sum -c SHA256SUMS
 --primary-reasoning-effort VALUE   主模型推理强度
 --compact-model MODEL              执行压缩的模型
 --compact-reasoning-effort VALUE   压缩模型推理强度
---resume                           恢复当前目录最近的 thread
+默认（无模式参数）                 恢复该 --session 自己持久绑定的 thread；无绑定时新建
+--resume                           明确选择当前目录最近的 Codex thread 并改绑
 --thread-id UUID                   恢复明确指定的 thread
+--new                              明确新建 thread 并覆盖该 --session 的旧绑定
 --safe                             不启用最高权限绕过
 --no-attach                        后台启动，不立即进入 tmux
 --cooldown-seconds N               首次恢复失败后再次重试前的等待秒数，默认 300

@@ -1,7 +1,13 @@
 import io
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from codex_goal_watchdog.monitor import iter_decoded_chunks, run_monitor
+from codex_goal_watchdog.monitor import (
+    _save_tmux_thread_id,
+    iter_decoded_chunks,
+    run_monitor,
+)
 from codex_goal_watchdog.recovery import RecoveryConfig
 
 
@@ -239,6 +245,28 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual("0", calls[0][1][4].value)
         self.assertTrue(
             any(new_thread_id in step.value for step in calls[0][1])
+        )
+
+    @patch("codex_goal_watchdog.monitor.save_session_binding")
+    @patch(
+        "codex_goal_watchdog.monitor._tmux_pane_identity",
+        return_value=(123, Path("/workspace/project-a")),
+    )
+    @patch("codex_goal_watchdog.monitor.subprocess.run")
+    def test_clear_rebind_persists_new_thread_for_next_tmux_start(
+        self,
+        _run_mock,
+        _pane_identity_mock,
+        save_binding_mock,
+    ):
+        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+
+        _save_tmux_thread_id("project-a", new_thread_id)
+
+        save_binding_mock.assert_called_once_with(
+            session="project-a",
+            thread_id=new_thread_id,
+            cwd=Path("/workspace/project-a"),
         )
 
 

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
+from .bindings import load_session_binding, save_session_binding
 from .launcher import (
     build_codex_command,
     normalize_codex_args,
@@ -86,8 +87,14 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--max-recoveries", type=int, default=0)
     start.add_argument("--compact-wait-seconds", type=int, default=600)
     start.add_argument("--log-path", default="")
-    start.add_argument("--resume", action="store_true")
-    start.add_argument("--thread-id", default="")
+    start_mode = start.add_mutually_exclusive_group()
+    start_mode.add_argument("--resume", action="store_true")
+    start_mode.add_argument("--thread-id", default="")
+    start_mode.add_argument(
+        "--new",
+        action="store_true",
+        help="create a new thread and replace this watchdog session's binding",
+    )
     start.add_argument(
         "--safe",
         action="store_true",
@@ -151,10 +158,16 @@ def main(argv: list[str] | None = None) -> int:
     session_exists = tmux_session_exists(args.session)
     thread_id = validate_thread_id(args.thread_id) if args.thread_id else None
     should_resume = args.resume or thread_id is not None
+    session_binding = None
     started_after = datetime.now(timezone.utc)
     unmanaged_existing_session = False
 
     if session_exists:
+        if args.new:
+            raise SystemExit(
+                f"tmux session {args.session!r} already exists; "
+                "use another --session name or close it before using --new"
+            )
         pinned_thread_id = tmux_get_thread_id(args.session)
         thread_id = thread_id or pinned_thread_id
         if thread_id is None:
@@ -162,10 +175,22 @@ def main(argv: list[str] | None = None) -> int:
                 thread_id = "00000000-0000-0000-0000-000000000000"
             else:
                 unmanaged_existing_session = True
-    elif should_resume and thread_id is None:
+    elif args.resume and thread_id is None:
         thread_id = find_latest_thread_id(cwd=working_dir)
         if thread_id is None and not args.dry_run:
             raise SystemExit(f"no Codex thread found for {working_dir}")
+    elif thread_id is None and not args.new:
+        session_binding = load_session_binding(args.session)
+        if session_binding is not None:
+            if session_binding.cwd != working_dir:
+                raise SystemExit(
+                    f"codex-watch session {args.session!r} is bound to "
+                    f"{session_binding.cwd}, but the current directory is "
+                    f"{working_dir}. Start from the bound directory, use a "
+                    "different --session name, or pass --new to replace the binding."
+                )
+            thread_id = session_binding.thread_id
+            should_resume = True
 
     codex_command = build_codex_command(
         model=args.primary_model,
@@ -230,6 +255,11 @@ def main(argv: list[str] | None = None) -> int:
     assert thread_id is not None
     if not args.dry_run:
         run_command(tmux_set_thread_id_command(args.session, thread_id))
+        save_session_binding(
+            session=args.session,
+            thread_id=thread_id,
+            cwd=working_dir,
+        )
         option_values = {
             "@codex_primary_model": args.primary_model,
             "@codex_primary_effort": args.primary_reasoning_effort,

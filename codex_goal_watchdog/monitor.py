@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import BinaryIO
 
+from .bindings import save_session_binding
 from .recovery import (
     RecoveryConfig,
     build_codex_update_completion_steps,
@@ -201,6 +202,14 @@ def _save_tmux_thread_id(target: str, thread_id: str) -> None:
         check=True,
     )
     _save_tmux_recovery_count(target, 0)
+    pane_identity = _tmux_pane_identity(target)
+    if pane_identity is not None:
+        _, cwd = pane_identity
+        save_session_binding(
+            session=target,
+            thread_id=thread_id,
+            cwd=cwd,
+        )
 
 
 def _tmux_pane_identity(target: str) -> tuple[int, Path] | None:

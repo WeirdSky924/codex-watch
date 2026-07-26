@@ -2,10 +2,12 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from codex_goal_watchdog import __version__
 from codex_goal_watchdog.__main__ import guardian_main, main, start_main
+from codex_goal_watchdog.bindings import SessionBinding
 
 
 class ConsoleEntrypointTests(unittest.TestCase):
@@ -62,6 +64,7 @@ class ConsoleEntrypointTests(unittest.TestCase):
         self.assertIn("unused tmux session name", message)
         self.assertIn("codex-watch --session <NEW_SESSION>", message)
 
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
     @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
     @patch("codex_goal_watchdog.__main__.subprocess.run")
     @patch(
@@ -75,6 +78,7 @@ class ConsoleEntrypointTests(unittest.TestCase):
         _get_thread_id_mock,
         _run_mock,
         handle_goal_prompt_mock,
+        _save_binding_mock,
     ):
         result = main(["start", "--session", "existing-session", "--no-attach"])
 
@@ -87,6 +91,11 @@ class ConsoleEntrypointTests(unittest.TestCase):
             send_fallback_prompt=False,
         )
 
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch(
+        "codex_goal_watchdog.__main__.load_session_binding",
+        return_value=None,
+    )
     @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
     @patch("codex_goal_watchdog.__main__.execute_steps")
     @patch(
@@ -104,6 +113,8 @@ class ConsoleEntrypointTests(unittest.TestCase):
         _capture_update_mock,
         execute_steps_mock,
         _handle_goal_prompt_mock,
+        _load_binding_mock,
+        _save_binding_mock,
     ):
         thread_id = "550e8400-e29b-41d4-a716-446655440000"
 
@@ -121,6 +132,138 @@ class ConsoleEntrypointTests(unittest.TestCase):
         self.assertEqual("1", update_steps[0].value)
         self.assertEqual("ensure_codex_version", update_steps[2].kind)
         self.assertEqual("0.145.0", update_steps[2].value)
+
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch("codex_goal_watchdog.__main__.find_latest_thread_id")
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_default_start_resumes_thread_pinned_to_watchdog_session(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        find_latest_mock,
+        run_mock,
+        _handle_goal_prompt_mock,
+        save_binding_mock,
+    ):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id=thread_id,
+            cwd=Path.cwd().resolve(),
+        )
+
+        result = main(["start", "--session", "project-a", "--no-attach"])
+
+        self.assertEqual(0, result)
+        find_latest_mock.assert_not_called()
+        new_session_command = next(
+            call.args[0]
+            for call in run_mock.call_args_list
+            if call.args[0][0:2] == ["tmux", "new-session"]
+        )
+        self.assertIn(f"resume {thread_id}", new_session_command[-1])
+        save_binding_mock.assert_called_with(
+            session="project-a",
+            thread_id=thread_id,
+            cwd=Path.cwd().resolve(),
+        )
+
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_default_start_rejects_binding_from_another_directory(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        run_mock,
+    ):
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            cwd=Path("/workspace/other"),
+        )
+
+        with self.assertRaises(SystemExit) as raised:
+            main(["start", "--session", "project-a", "--no-attach"])
+
+        self.assertIn("is bound to /workspace/other", str(raised.exception))
+        self.assertIn("--new", str(raised.exception))
+        run_mock.assert_not_called()
+
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.find_latest_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440001",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_explicit_resume_uses_latest_directory_thread_not_session_binding(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        _find_latest_mock,
+        run_mock,
+        _handle_goal_prompt_mock,
+        _save_binding_mock,
+    ):
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            cwd=Path.cwd().resolve(),
+        )
+
+        result = main(
+            ["start", "--session", "project-a", "--resume", "--no-attach"]
+        )
+
+        self.assertEqual(0, result)
+        new_session_command = next(
+            call.args[0]
+            for call in run_mock.call_args_list
+            if call.args[0][0:2] == ["tmux", "new-session"]
+        )
+        self.assertIn(
+            "resume 550e8400-e29b-41d4-a716-446655440001",
+            new_session_command[-1],
+        )
+
+    @patch("codex_goal_watchdog.__main__.find_latest_thread_id")
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)
+    def test_new_forces_fresh_thread_without_reading_previous_binding(
+        self,
+        _session_exists_mock,
+        load_binding_mock,
+        find_latest_mock,
+    ):
+        output = StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "start",
+                    "--session",
+                    "project-a",
+                    "--new",
+                    "--dry-run",
+                    "--no-attach",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        load_binding_mock.assert_not_called()
+        find_latest_mock.assert_not_called()
+        new_session_line = next(
+            line
+            for line in output.getvalue().splitlines()
+            if line.startswith("tmux new-session")
+        )
+        self.assertNotIn(" resume ", new_session_line)
 
 
 if __name__ == "__main__":

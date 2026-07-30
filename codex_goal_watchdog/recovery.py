@@ -67,34 +67,45 @@ def _is_retryable_upstream_error(text: str) -> bool:
     )
 
 
+def classify_recovery_message(message: str) -> str | None:
+    """Classify one structured task failure without terminal row markers."""
+    if MODEL_AT_CAPACITY_PATTERN in message:
+        return "model_at_capacity"
+    if DEFAULT_STALL_PATTERN in message:
+        return "codex_upstream_stalled"
+    if CONTEXT_WINDOW_EXHAUSTED_PATTERN in message:
+        return "context_window_exhausted"
+    if _is_retryable_upstream_error(message):
+        return "retryable_upstream_error"
+    status = RETRYABLE_HTTP_RE.search(message)
+    error_shaped = re.search(
+        r"unexpected status|too many requests|bad gateway|gateway timeout|"
+        r"service unavailable|stream disconnected|request failed|upstream error|"
+        r"api disabl(?:e|ed)|cloudflare",
+        message,
+        re.IGNORECASE,
+    )
+    if status and error_shaped:
+        return f"retryable_http_{status.group(1)}"
+    if RETRYABLE_NETWORK_RE.search(message):
+        return "retryable_network"
+    return None
+
+
 def classify_recovery_reason(text: str) -> str | None:
     """Classify Codex TUI terminal errors, not ordinary transcript text."""
     for segment in text.split("⚠")[1:]:
         warning_text = segment.lstrip()[:1200]
-        if warning_text.startswith(MODEL_AT_CAPACITY_PATTERN):
-            return "model_at_capacity"
+        reason = classify_recovery_message(warning_text)
+        if reason == "model_at_capacity":
+            return reason
     if "■" not in text:
         return None
     for segment in text.split("■")[1:]:
         error_text = segment[:1200]
-        if DEFAULT_STALL_PATTERN in error_text:
-            return "codex_upstream_stalled"
-        if CONTEXT_WINDOW_EXHAUSTED_PATTERN in error_text:
-            return "context_window_exhausted"
-        if _is_retryable_upstream_error(error_text):
-            return "retryable_upstream_error"
-        status = RETRYABLE_HTTP_RE.search(error_text)
-        error_shaped = re.search(
-            r"unexpected status|too many requests|bad gateway|gateway timeout|"
-            r"service unavailable|stream disconnected|request failed|upstream error|"
-            r"api disabl(?:e|ed)|cloudflare",
-            error_text,
-            re.IGNORECASE,
-        )
-        if status and error_shaped:
-            return f"retryable_http_{status.group(1)}"
-        if RETRYABLE_NETWORK_RE.search(error_text):
-            return "retryable_network"
+        reason = classify_recovery_message(error_text)
+        if reason is not None:
+            return reason
     return None
 
 

@@ -8,6 +8,7 @@ from codex_goal_watchdog.recovery import (
     build_post_update_restart_steps,
     build_recovery_steps,
     build_startup_update_steps,
+    classify_recovery_message,
     classify_recovery_reason,
 )
 
@@ -152,6 +153,21 @@ class RecoveryControllerTests(unittest.TestCase):
             "model_at_capacity",
             classify_recovery_reason(
                 "⚠ Selected model is at capacity. Please try a different model"
+            ),
+        )
+
+    def test_classifies_structured_rollout_failure_messages(self):
+        self.assertEqual(
+            "retryable_http_503",
+            classify_recovery_message(
+                "unexpected status 503 Service Unavailable: "
+                "Service temporarily unavailable"
+            ),
+        )
+        self.assertEqual(
+            "model_at_capacity",
+            classify_recovery_message(
+                "Selected model is at capacity. Please try a different model."
             ),
         )
 

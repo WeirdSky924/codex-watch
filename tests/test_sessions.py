@@ -7,6 +7,7 @@ from pathlib import Path
 from codex_goal_watchdog.sessions import (
     compaction_event_exists_after,
     find_active_cli_thread_id,
+    find_latest_task_failure,
     find_latest_thread_id,
     find_new_thread_id,
     find_thread_rollout_path,
@@ -59,6 +60,51 @@ class SessionResolverTests(unittest.TestCase):
             )
 
         self.assertEqual("550e8400-e29b-41d4-a716-446655440000", actual)
+
+    def test_find_latest_task_failure_returns_stable_turn_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 7, 30, 8, tzinfo=timezone.utc),
+            )
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-07-30T08:01:00Z",
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "task_complete",
+                                "turn_id": "turn-503",
+                                "error": {
+                                    "message": (
+                                        "unexpected status 503 "
+                                        "Service Unavailable"
+                                    ),
+                                    "codex_error_info": "other",
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+            failure = find_latest_task_failure(
+                thread_id=thread_id,
+                sessions_root=root,
+            )
+
+        self.assertIsNotNone(failure)
+        assert failure is not None
+        self.assertEqual("turn-503", failure.incident_id)
+        self.assertEqual(
+            "unexpected status 503 Service Unavailable",
+            failure.message,
+        )
 
     def test_find_new_thread_id_uses_session_start_not_file_mtime(self):
         with tempfile.TemporaryDirectory() as temp_dir:

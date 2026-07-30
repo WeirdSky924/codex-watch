@@ -727,6 +727,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 
 从 `0.1.9` 开始，fatal recovery 还要求最近一次可见 Goal 状态是 `Pursuing goal` 或 `Goal blocked (/goal resume)`。如果 Goal 已经 achieved、没有 Goal、处于 paused 或 usage-limited 状态，watchdog 不会因为 fatal 行重启 Codex，也不会发送 fatal-recovery 续接提示；启动和历史回放阶段的 paused Goal 自动恢复逻辑不变。这样可以避免任务完成后的旧错误触发无限重启。
 
+从 `0.1.10` 开始，可见 fatal 行还必须与当前固定 thread 的新 rollout `task_complete` 事件一致。watchdog 会在发送任何 `Ctrl-C` 前持久化该事件的 `turn_id`；inline TUI 后续重绘同一条 503、容量或其他 fatal 行时只会忽略，不会打断新恢复的 turn。同类错误如果发生在新的 turn 中会得到新的 `turn_id`，仍按原冷静期和无限重试配置恢复。
+
 | 错误 | 自动操作 |
 | --- | --- |
 | `codex upstream stalled: no real data for 5m0s` | 切到 compact model，恢复固定 thread，执行 `/compact`，等待真实压缩事件，再切回 primary model 并继续 Goal |
@@ -758,6 +760,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 从 `0.1.8` 开始，每个 `--session` 的固定 thread ID 会持久保存在 watchdog 状态目录。tmux 消失后，不带模式参数重新启动会恢复该 watchdog session 自己的 ID；`/clear` 后的新 ID 会同步覆盖持久绑定。`--resume` 仅在显式使用时选择当前目录最近的 Codex thread，`--new` 用于明确创建新 thread。
 
 从 `0.1.9` 开始，fatal recovery 只在最近 Goal 状态为 `Pursuing goal` 或 `Goal blocked (/goal resume)` 时运行。Goal 完成后即使屏幕上残留 `503`、`upstream_error` 或其他 fatal 行，也不会再触发恢复链。
+
+从 `0.1.10` 开始，monitor 与 guardian 使用 rollout `task_complete` 的 `turn_id` 对 fatal 事件去重。恢复后残留在 tmux 历史中的旧错误不会再次触发 `Ctrl-C`；真正的新失败仍会自动恢复。
 
 ## 10. 多项目配置示例
 

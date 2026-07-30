@@ -5,6 +5,7 @@ from codex_goal_watchdog.guardian import (
     _next_recovery_attempt,
     _recovery_config,
     _recovery_reason_on_screen,
+    _unhandled_recovery_incident_on_screen,
     _update_completed_on_shell,
     guard_once,
 )
@@ -192,6 +193,37 @@ class GuardianTests(unittest.TestCase):
         self.assertEqual(
             "retryable_http_503",
             _recovery_reason_on_screen("codex-goal", runner=runner),
+        )
+
+    def test_guardian_ignores_already_handled_visible_failure(self):
+        incident = _unhandled_recovery_incident_on_screen(
+            "codex-goal",
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            screen_reason=lambda session: "retryable_http_503",
+            incident_resolver=lambda thread_id: (
+                "turn-503",
+                "retryable_http_503",
+            ),
+            option_getter=lambda session, name, default="": "turn-503",
+        )
+
+        self.assertIsNone(incident)
+
+    def test_guardian_accepts_new_visible_failure(self):
+        incident = _unhandled_recovery_incident_on_screen(
+            "codex-goal",
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            screen_reason=lambda session: "retryable_http_503",
+            incident_resolver=lambda thread_id: (
+                "turn-503-new",
+                "retryable_http_503",
+            ),
+            option_getter=lambda session, name, default="": "turn-503-old",
+        )
+
+        self.assertEqual(
+            ("turn-503-new", "retryable_http_503"),
+            incident,
         )
 
 

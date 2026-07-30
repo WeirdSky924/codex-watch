@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.10] - 2026-07-30
+
+### Fixed
+
+- Correlate visible fatal rows with the matching rollout `task_complete`
+  `turn_id` before recovery, so inline TUI redraws cannot replay an old 503 or
+  capacity error and interrupt a newly resumed Goal.
+- Persist the last handled fatal turn in tmux and apply the same deduplication
+  in the pipe monitor and guardian. A later turn with the same error still
+  enters the configured unlimited immediate-then-delayed recovery flow.
+
 ## [0.1.9] - 2026-07-30
 
 ### Fixed

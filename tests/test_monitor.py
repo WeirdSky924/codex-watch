@@ -107,6 +107,61 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(1, len(calls))
 
+    def test_run_monitor_ignores_redraw_of_same_rollout_failure(self):
+        calls = []
+        persisted_incidents = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+                "Goal paused (/goal resume)\n",
+                "Pursuing goal (5m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=iter(float(index) for index in range(5)).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            resume_goal=lambda target: None,
+            resolve_recovery_incident=lambda thread_id: (
+                "turn-503",
+                "retryable_http_503",
+            ),
+            save_recovery_incident_id=persisted_incidents.append,
+            log=lambda message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(["turn-503"], persisted_incidents)
+
+    def test_run_monitor_recovers_same_error_for_a_new_turn(self):
+        calls = []
+        incidents = iter(
+            [
+                ("turn-503-a", "retryable_http_503"),
+                ("turn-503-b", "retryable_http_503"),
+            ]
+        )
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+                "Pursuing goal (5m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=iter(float(index) for index in range(4)).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            resume_goal=lambda target: None,
+            resolve_recovery_incident=lambda thread_id: next(incidents),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(2, len(calls))
+
     def test_run_monitor_does_not_execute_for_non_matching_lines(self):
         calls = []
 

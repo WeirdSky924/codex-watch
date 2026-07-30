@@ -18,9 +18,10 @@ from .recovery import (
     build_codex_update_completion_steps,
     build_codex_update_steps,
     build_recovery_steps,
+    classify_recovery_message,
     classify_recovery_reason,
 )
-from .sessions import find_active_cli_thread_id
+from .sessions import find_active_cli_thread_id, find_latest_task_failure
 from .tmux_control import (
     capture_update_prompt_version,
     execute_steps,
@@ -41,6 +42,7 @@ GOAL_RESUME_STATUS_MARKERS = (
 )
 GOAL_RESUME_RETRY_SECONDS = 10
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
+LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
 RECOVERABLE_GOAL_STATES = {"pursuing", "blocked"}
 GOAL_STATE_MARKERS = (
     ("pursuing", "Pursuing goal"),
@@ -77,6 +79,16 @@ def recovery_allowed_for_goal(value: str) -> bool:
     return recovery_allowed_for_goal_state(recovery_goal_state(value))
 
 
+def recovery_incident_for_thread(thread_id: str) -> tuple[str, str] | None:
+    failure = find_latest_task_failure(thread_id=thread_id)
+    if failure is None:
+        return None
+    reason = classify_recovery_message(failure.message)
+    if reason is None:
+        return None
+    return failure.incident_id, reason
+
+
 def iter_decoded_chunks(
     stream: BinaryIO, *, chunk_size: int = 4096
 ) -> Iterable[str]:
@@ -106,6 +118,11 @@ def run_monitor(
     save_recovery_count: Callable[[int], None] | None = None,
     resolve_thread_id: Callable[[str], str | None] | None = None,
     save_thread_id: Callable[[str], None] | None = None,
+    resolve_recovery_incident: (
+        Callable[[str], tuple[str, str] | None] | None
+    ) = None,
+    initial_recovery_incident_id: str = "",
+    save_recovery_incident_id: Callable[[str], None] | None = None,
 ) -> None:
     from .recovery import RecoveryController
 
@@ -139,6 +156,7 @@ def run_monitor(
     rolling_output = ""
     last_goal_resume_at: float | None = None
     latest_goal_state: str | None = None
+    last_recovery_incident_id = initial_recovery_incident_id
     for line in lines:
         resolved_thread_id = (
             resolve_thread_id(target) if resolve_thread_id is not None else None
@@ -149,6 +167,7 @@ def run_monitor(
             rolling_output = ""
             last_goal_resume_at = None
             latest_goal_state = None
+            last_recovery_incident_id = ""
             if save_thread_id is not None:
                 save_thread_id(resolved_thread_id)
             emit(
@@ -163,6 +182,26 @@ def run_monitor(
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
         observed_at = now()
         recovery_reason = classify_recovery_reason(rolling_output)
+        if recovery_reason is not None and resolve_recovery_incident is not None:
+            incident = resolve_recovery_incident(config.thread_id)
+            if incident is None or incident[1] != recovery_reason:
+                emit(
+                    "[codex-goal-watchdog] ignored terminal error without "
+                    f"matching rollout event: {recovery_reason}"
+                )
+                rolling_output = ""
+                continue
+            incident_id, _ = incident
+            if incident_id == last_recovery_incident_id:
+                emit(
+                    "[codex-goal-watchdog] ignored redrawn fatal event: "
+                    f"{incident_id}"
+                )
+                rolling_output = ""
+                continue
+            last_recovery_incident_id = incident_id
+            if save_recovery_incident_id is not None:
+                save_recovery_incident_id(incident_id)
         rolling_goal_state = recovery_goal_state(rolling_output)
         effective_goal_state = rolling_goal_state or latest_goal_state
         if recovery_reason is not None and not recovery_allowed_for_goal_state(
@@ -239,6 +278,30 @@ def _save_tmux_recovery_count(target: str, count: int) -> None:
             target,
             "@codex_recovery_count",
             str(max(0, count)),
+        ],
+        check=True,
+    )
+
+
+def _tmux_recovery_incident_id(target: str) -> str:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, LAST_RECOVERY_INCIDENT_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _save_tmux_recovery_incident_id(target: str, incident_id: str) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            LAST_RECOVERY_INCIDENT_OPTION,
+            incident_id,
         ],
         check=True,
     )
@@ -365,6 +428,12 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
             flush=True,
         )
     _resume_interrupted_update(target, config)
+    initial_incident_id = _tmux_recovery_incident_id(target)
+    if not initial_incident_id:
+        current_incident = recovery_incident_for_thread(config.thread_id)
+        if current_incident is not None:
+            initial_incident_id = current_incident[0]
+            _save_tmux_recovery_incident_id(target, initial_incident_id)
     run_monitor(
         lines=iter_decoded_chunks(sys.stdin.buffer),
         target=target,
@@ -373,4 +442,9 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         save_recovery_count=lambda count: _save_tmux_recovery_count(target, count),
         resolve_thread_id=resolve_thread_id,
         save_thread_id=lambda thread_id: _save_tmux_thread_id(target, thread_id),
+        resolve_recovery_incident=recovery_incident_for_thread,
+        initial_recovery_incident_id=initial_incident_id,
+        save_recovery_incident_id=lambda incident_id: (
+            _save_tmux_recovery_incident_id(target, incident_id)
+        ),
     )

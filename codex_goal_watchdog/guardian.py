@@ -10,8 +10,11 @@ from pathlib import Path
 
 from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
 from .monitor import (
+    LAST_RECOVERY_INCIDENT_OPTION,
     PENDING_UPDATE_OPTION,
+    _save_tmux_recovery_incident_id,
     normalize_terminal_text,
+    recovery_incident_for_thread,
     recovery_allowed_for_goal,
 )
 from .paths import default_log_path
@@ -163,6 +166,31 @@ def _recovery_reason_on_screen(session: str, *, runner=subprocess.run) -> str | 
     return classify_recovery_reason(screen)
 
 
+def _unhandled_recovery_incident_on_screen(
+    session: str,
+    *,
+    thread_id: str,
+    screen_reason: Callable[[str], str | None] = _recovery_reason_on_screen,
+    incident_resolver: Callable[
+        [str], tuple[str, str] | None
+    ] = recovery_incident_for_thread,
+    option_getter: Callable[[str, str, str], str] = _tmux_option,
+) -> tuple[str, str] | None:
+    reason = screen_reason(session)
+    if reason is None:
+        return None
+    incident = incident_resolver(thread_id)
+    if incident is None or incident[1] != reason:
+        return None
+    if incident[0] == option_getter(
+        session,
+        LAST_RECOVERY_INCIDENT_OPTION,
+        "",
+    ):
+        return None
+    return incident
+
+
 def _recovery_config(
     session: str,
     *,
@@ -229,12 +257,23 @@ def run_guardian(
                     _tmux_option(session, "@codex_log_path", str(default_log_path()))
                 ).expanduser()
             config = _recovery_config(session) if session_exists else None
+            pending_incident: tuple[str, str] | None = None
+
+            def stalled_screen() -> bool:
+                nonlocal pending_incident
+                assert config is not None
+                pending_incident = _unhandled_recovery_incident_on_screen(
+                    session,
+                    thread_id=config.thread_id,
+                )
+                return pending_incident is not None
 
             def recover() -> None:
                 assert config is not None
-                reason = _recovery_reason_on_screen(session)
-                if reason is None:
+                if pending_incident is None:
                     return
+                incident_id, reason = pending_incident
+                _save_tmux_recovery_incident_id(session, incident_id)
                 recovery_attempt = _next_recovery_attempt(session)
                 _append_log(
                     log_path,
@@ -286,7 +325,7 @@ def run_guardian(
             status = guard_once(
                 session_exists=lambda: tmux_session_exists(session),
                 pipe_active=lambda: _pipe_active(session),
-                stalled_screen=lambda: _recovery_reason_on_screen(session) is not None,
+                stalled_screen=stalled_screen,
                 recover=recover,
                 attach_monitor=attach_monitor,
                 update_restart_needed=lambda: _guardian_update_restart_needed(

@@ -25,6 +25,13 @@ class SessionRecord:
     source: object
 
 
+@dataclass(frozen=True)
+class TaskFailure:
+    incident_id: str
+    message: str
+    codex_error_info: str | None
+
+
 def validate_thread_id(value: str) -> str:
     try:
         return str(UUID(value))
@@ -227,6 +234,48 @@ def find_thread_rollout_path(
         if record.thread_id == normalized:
             return record.path
     return None
+
+
+def find_latest_task_failure(
+    *, thread_id: str, sessions_root: Path = DEFAULT_SESSIONS_ROOT
+) -> TaskFailure | None:
+    path = find_thread_rollout_path(
+        thread_id=thread_id,
+        sessions_root=sessions_root,
+    )
+    if path is None:
+        return None
+    latest: TaskFailure | None = None
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = event.get("payload", {})
+                error = payload.get("error")
+                if (
+                    event.get("type") != "event_msg"
+                    or payload.get("type") != "task_complete"
+                    or not isinstance(error, dict)
+                    or not isinstance(error.get("message"), str)
+                ):
+                    continue
+                incident_id = payload.get("turn_id") or event.get("timestamp")
+                if not isinstance(incident_id, str) or not incident_id:
+                    continue
+                error_info = error.get("codex_error_info")
+                latest = TaskFailure(
+                    incident_id=incident_id,
+                    message=error["message"],
+                    codex_error_info=(
+                        error_info if isinstance(error_info, str) else None
+                    ),
+                )
+    except OSError:
+        return None
+    return latest
 
 
 def compaction_event_exists_after(path: Path, *, offset: int) -> bool:

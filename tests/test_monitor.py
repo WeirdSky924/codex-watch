@@ -34,6 +34,7 @@ class MonitorTests(unittest.TestCase):
 
         run_monitor(
             lines=[
+                "Pursuing goal (4m)\n",
                 "ordinary output\n",
                 "■ stream disconnected before completion: codex upstream stalled: "
                 "no real data for 5m0s, connection recycled\n",
@@ -42,12 +43,69 @@ class MonitorTests(unittest.TestCase):
             config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
             now=lambda: 100.0,
             execute=lambda target, steps: calls.append((target, steps)),
+            resume_goal=lambda target: None,
             log=lambda message: None,
         )
 
         self.assertEqual(1, len(calls))
         self.assertEqual("codex-goal", calls[0][0])
         self.assertEqual("key", calls[0][1][0].kind)
+
+    def test_run_monitor_suppresses_recovery_after_goal_achieved(self):
+        calls = []
+        persisted_counts = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "Goal achieved\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            save_recovery_count=persisted_counts.append,
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], calls)
+        self.assertEqual([], persisted_counts)
+
+    def test_run_monitor_suppresses_recovery_without_goal_state(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            resume_goal=lambda target: None,
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], calls)
+
+    def test_run_monitor_recovers_when_goal_blocked(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "Goal blocked (/goal resume)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            resume_goal=lambda target: None,
+            log=lambda message: None,
+        )
+
+        self.assertEqual(1, len(calls))
 
     def test_run_monitor_does_not_execute_for_non_matching_lines(self):
         calls = []
@@ -117,6 +175,7 @@ class MonitorTests(unittest.TestCase):
 
         run_monitor(
             lines=[
+                "Pursuing goal (4m)\n",
                 "\x1b[31m■ stream disconnected: codex upstream stalled:\x1b[0m\n",
                 "no real data for 5m0s,\n",
                 "connection recycled\n",
@@ -135,6 +194,7 @@ class MonitorTests(unittest.TestCase):
 
         run_monitor(
             lines=[
+                "Pursuing goal (4m)\n",
                 "■ Codex ran out of room in the model's context window. "
                 "Start a new thread or clear earlier history before retrying.\n"
             ],
@@ -153,6 +213,7 @@ class MonitorTests(unittest.TestCase):
 
         run_monitor(
             lines=[
+                "Pursuing goal (4m)\n",
                 "⚠ Selected model is at capacity. Please try a different model\n"
             ],
             target="codex-goal",
@@ -171,8 +232,11 @@ class MonitorTests(unittest.TestCase):
 
         run_monitor(
             lines=[
-                "■ unexpected status 402 Payment Required: upstream request failed\n"
-                for _ in range(5)
+                "Pursuing goal (4m)\n",
+                *[
+                    "■ unexpected status 402 Payment Required: upstream request failed\n"
+                    for _ in range(5)
+                ],
             ],
             target="codex-goal",
             config=RecoveryConfig(
@@ -180,7 +244,7 @@ class MonitorTests(unittest.TestCase):
                 cooldown_seconds=300,
                 max_recoveries=0,
             ),
-            now=iter(float(index) for index in range(5)).__next__,
+            now=iter(float(index) for index in range(6)).__next__,
             execute=lambda target, steps: calls.append((target, steps)),
             log=lambda message: None,
         )
@@ -196,6 +260,7 @@ class MonitorTests(unittest.TestCase):
 
         run_monitor(
             lines=[
+                "Pursuing goal (4m)\n",
                 "■ unexpected status 402 Payment Required: upstream request failed\n"
             ],
             target="codex-goal",
@@ -222,6 +287,7 @@ class MonitorTests(unittest.TestCase):
 
         run_monitor(
             lines=[
+                "Pursuing goal (4m)\n",
                 "■ unexpected status 503 Service Unavailable: "
                 "service temporarily unavailable\n"
             ],

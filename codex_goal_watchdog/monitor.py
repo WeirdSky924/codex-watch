@@ -18,6 +18,7 @@ from .recovery import (
     build_codex_update_completion_steps,
     build_codex_update_steps,
     build_recovery_steps,
+    classify_recovery_reason,
 )
 from .sessions import find_active_cli_thread_id
 from .tmux_control import (
@@ -40,11 +41,40 @@ GOAL_RESUME_STATUS_MARKERS = (
 )
 GOAL_RESUME_RETRY_SECONDS = 10
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
+RECOVERABLE_GOAL_STATES = {"pursuing", "blocked"}
+GOAL_STATE_MARKERS = (
+    ("pursuing", "Pursuing goal"),
+    ("blocked", "Goal blocked (/goal resume)"),
+    ("paused", "Goal paused (/goal resume)"),
+    ("usage_limited", "Goal hit usage limits (/goal resume)"),
+    ("achieved", "Goal achieved"),
+    ("achieved", "Goal complete"),
+    ("achieved", "Goal completed"),
+)
 
 
 def normalize_terminal_text(value: str) -> str:
     """Remove terminal control sequences and normalize visual line wrapping."""
     return " ".join(ANSI_ESCAPE_RE.sub("", value).split())
+
+
+def recovery_goal_state(value: str) -> str | None:
+    latest_state: str | None = None
+    latest_index = -1
+    for state, marker in GOAL_STATE_MARKERS:
+        index = value.rfind(marker)
+        if index > latest_index:
+            latest_index = index
+            latest_state = state
+    return latest_state
+
+
+def recovery_allowed_for_goal_state(state: str | None) -> bool:
+    return state in RECOVERABLE_GOAL_STATES
+
+
+def recovery_allowed_for_goal(value: str) -> bool:
+    return recovery_allowed_for_goal_state(recovery_goal_state(value))
 
 
 def iter_decoded_chunks(
@@ -108,6 +138,7 @@ def run_monitor(
     run_update_codex = update_codex or default_update_codex
     rolling_output = ""
     last_goal_resume_at: float | None = None
+    latest_goal_state: str | None = None
     for line in lines:
         resolved_thread_id = (
             resolve_thread_id(target) if resolve_thread_id is not None else None
@@ -117,15 +148,32 @@ def run_monitor(
             controller = RecoveryController(config, initial_recovery_count=0)
             rolling_output = ""
             last_goal_resume_at = None
+            latest_goal_state = None
             if save_thread_id is not None:
                 save_thread_id(resolved_thread_id)
             emit(
                 "[codex-goal-watchdog] rebound thread after /clear: "
                 f"{resolved_thread_id}"
             )
-        rolling_output = normalize_terminal_text(f"{rolling_output} {line}")
+        normalized_line = normalize_terminal_text(line)
+        line_goal_state = recovery_goal_state(normalized_line)
+        if line_goal_state is not None:
+            latest_goal_state = line_goal_state
+        rolling_output = normalize_terminal_text(f"{rolling_output} {normalized_line}")
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
         observed_at = now()
+        recovery_reason = classify_recovery_reason(rolling_output)
+        rolling_goal_state = recovery_goal_state(rolling_output)
+        effective_goal_state = rolling_goal_state or latest_goal_state
+        if recovery_reason is not None and not recovery_allowed_for_goal_state(
+            effective_goal_state
+        ):
+            emit(
+                "[codex-goal-watchdog] suppressed recovery outside active "
+                f"or blocked goal: {recovery_reason}"
+            )
+            rolling_output = ""
+            continue
         event = controller.observe(rolling_output, now=observed_at)
         if event is not None:
             rolling_output = ""

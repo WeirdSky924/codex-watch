@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.9] - 2026-07-30
+
+### Fixed
+
+- Suppress fatal recovery when Codex is no longer inside an active Goal, such
+  as after `Goal achieved`, so stale terminal errors do not repeatedly restart
+  a completed session and inject continuation prompts.
+- Allow fatal recovery only when the latest observed Goal state is `Pursuing
+  goal` or `Goal blocked (/goal resume)`; guardian visible-screen recovery uses
+  the same gate as the pipe monitor.
+
 ## [0.1.8] - 2026-07-26
 
 ### Fixed

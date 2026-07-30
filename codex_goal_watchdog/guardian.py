@@ -9,7 +9,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
-from .monitor import PENDING_UPDATE_OPTION, normalize_terminal_text
+from .monitor import (
+    PENDING_UPDATE_OPTION,
+    normalize_terminal_text,
+    recovery_allowed_for_goal,
+)
 from .paths import default_log_path
 from .recovery import (
     DEFAULT_RESUME_PROMPT,
@@ -144,8 +148,8 @@ def _guardian_update_restart_needed(
     )
 
 
-def _recovery_reason_on_screen(session: str) -> str | None:
-    result = subprocess.run(
+def _recovery_reason_on_screen(session: str, *, runner=subprocess.run) -> str | None:
+    result = runner(
         ["tmux", "capture-pane", "-p", "-t", session],
         capture_output=True,
         text=True,
@@ -153,7 +157,10 @@ def _recovery_reason_on_screen(session: str) -> str | None:
     )
     if result.returncode != 0:
         return None
-    return classify_recovery_reason(normalize_terminal_text(result.stdout))
+    screen = normalize_terminal_text(result.stdout)
+    if not recovery_allowed_for_goal(screen):
+        return None
+    return classify_recovery_reason(screen)
 
 
 def _recovery_config(

@@ -7,6 +7,14 @@ import subprocess
 
 
 DANGEROUS_BYPASS_ARG = "--dangerously-bypass-approvals-and-sandbox"
+ISOLATED_SHELL_COMMAND = (
+    "env",
+    "HISTFILE=/dev/null",
+    "HISTSIZE=0",
+    "HISTFILESIZE=0",
+    "bash",
+    "--norc",
+)
 
 
 def normalize_codex_args(codex_args: list[str], *, safe_mode: bool) -> list[str]:
@@ -50,13 +58,14 @@ def build_codex_command(
 
 
 def tmux_new_session_command(session: str, codex_command: list[str]) -> list[str]:
+    isolated_shell = shlex.join(ISOLATED_SHELL_COMMAND)
     return [
         "tmux",
         "new-session",
         "-d",
         "-s",
         session,
-        f"{shlex.join(codex_command)}; exec bash",
+        f"{shlex.join(codex_command)}; exec {isolated_shell}",
     ]
 
 

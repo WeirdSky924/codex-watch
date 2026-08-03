@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.11] - 2026-08-03
+
+### Fixed
+
+- Run the tmux fallback shell with command history disabled and `HISTFILE`
+  isolated to `/dev/null`, preventing watchdog recovery commands from being
+  written to the host user's shell history.
+- Skip Bash startup files for the fallback shell so host configuration cannot
+  silently restore the shared history file.
+
 ## [0.1.10] - 2026-07-30
 
 ### Fixed

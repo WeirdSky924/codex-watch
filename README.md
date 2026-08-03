@@ -472,6 +472,8 @@ codex-watch --safe --no-attach
 5. 挂载输出 monitor。
 6. 默认自动进入 tmux 界面。
 
+从 `0.1.11` 开始，Codex 退出后供 watchdog 恢复使用的内部 Bash 会禁用命令历史，并将 `HISTFILE` 隔离到 `/dev/null`。自动注入的 `/quit`、`codex ... resume ...` 等命令不会写入宿主用户的 `~/.bash_history`；watchdog 不会修改或清理已有历史记录。
+
 ### 第三步：创建并运行 Goal
 
 进入 Codex 后，按正常 Codex CLI 流程创建 Goal。watchdog 不负责生成 Goal 内容，只负责在 fatal error 后恢复当前固定 thread。

@@ -127,7 +127,11 @@ class LauncherTests(unittest.TestCase):
                 "-d",
                 "-s",
                 "codex-goal",
-                "codex --no-alt-screen -m gpt-5.6-sol; exec bash",
+                (
+                    "codex --no-alt-screen -m gpt-5.6-sol; "
+                    "exec env HISTFILE=/dev/null HISTSIZE=0 HISTFILESIZE=0 "
+                    "bash --norc"
+                ),
             ],
             command,
         )

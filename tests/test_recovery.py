@@ -337,6 +337,24 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertTrue(any("gpt-5.6-sol" in value for value in values))
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
 
+    def test_blocked_goal_recovery_restarts_process_but_leaves_goal_paused(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            primary_model="gpt-5.6-sol",
+            resume_prompt="继续中断的 goal。",
+        )
+
+        steps = build_recovery_steps(
+            config,
+            reason="retryable_http_503",
+            resume_goal=False,
+        )
+        values = [step.value for step in steps]
+
+        self.assertTrue(any("gpt-5.6-sol" in value for value in values))
+        self.assertNotIn("/goal resume", values)
+        self.assertEqual("leave_goal_paused", steps[-1].kind)
+
     def test_payment_required_waits_five_minutes_then_restarts_sol(self):
         config = RecoveryConfig(
             thread_id="550e8400-e29b-41d4-a716-446655440000",

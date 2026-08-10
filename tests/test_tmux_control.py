@@ -266,38 +266,121 @@ class TmuxControlTests(unittest.TestCase):
             calls,
         )
 
-    def test_handle_goal_prompt_resumes_paused_or_blocked_goal(self):
-        for status in ("Goal paused (/goal resume)", "Goal blocked (/goal resume)"):
-            with self.subTest(status=status):
-                calls = []
-                sleeps = []
+    def test_handle_goal_prompt_uses_latest_goal_state_from_screen_history(self):
+        calls = []
+        sleeps = []
 
-                def runner(command, **kwargs):
-                    calls.append(command)
+        def runner(command, **kwargs):
+            calls.append(command)
 
-                    class Result:
-                        stdout = status
-
-                    return Result()
-
-                handled = handle_goal_prompt(
-                    "codex-goal",
-                    action="resume",
-                    prompt="继续 goal",
-                    runner=runner,
-                    sleeper=sleeps.append,
+            class Result:
+                stdout = (
+                    "Goal blocked (/goal resume)\n"
+                    "Goal paused (/goal resume)\n"
                 )
 
-                self.assertTrue(handled)
-                self.assertEqual([0.5], sleeps)
-                self.assertEqual(
-                    [
-                        ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
-                        ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
-                        ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
-                    ],
-                    calls,
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="继续 goal",
+            runner=runner,
+            sleeper=sleeps.append,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual([0.5], sleeps)
+        self.assertEqual(
+            [
+                ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
+                ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
+                ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
+            ],
+            calls,
+        )
+
+    def test_handle_goal_prompt_resumes_paused_goal(self):
+        calls = []
+        sleeps = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = "Goal paused (/goal resume)"
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="继续 goal",
+            runner=runner,
+            sleeper=sleeps.append,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual([0.5], sleeps)
+        self.assertEqual(
+            [
+                ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
+                ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
+                ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
+            ],
+            calls,
+        )
+
+    def test_handle_goal_prompt_leaves_blocked_goal_for_manual_review(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = "Goal blocked (/goal resume)"
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="继续 goal",
+            runner=runner,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [["tmux", "capture-pane", "-p", "-t", "codex-goal"]],
+            calls,
+        )
+
+    def test_handle_goal_prompt_does_not_accept_picker_for_blocked_goal(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = (
+                    "Goal blocked (/goal resume)\n"
+                    "Resume paused goal?\n1. Resume goal\n2. Leave paused\n"
                 )
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="继续 goal",
+            runner=runner,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [["tmux", "capture-pane", "-p", "-t", "codex-goal"]],
+            calls,
+        )
 
     def test_wait_for_pane_state_waits_until_shell_is_ready(self):
         process_outputs = iter(

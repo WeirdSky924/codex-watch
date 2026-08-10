@@ -5,6 +5,7 @@ from codex_goal_watchdog.guardian import (
     _next_recovery_attempt,
     _recovery_config,
     _recovery_reason_on_screen,
+    recovery_goal_state_on_screen,
     _unhandled_recovery_incident_on_screen,
     _update_completed_on_shell,
     guard_once,
@@ -193,6 +194,23 @@ class GuardianTests(unittest.TestCase):
         self.assertEqual(
             "retryable_http_503",
             _recovery_reason_on_screen("codex-goal", runner=runner),
+        )
+
+    def test_guardian_reads_blocked_state_before_recovery(self):
+        def runner(command, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = (
+                    "Pursuing goal\n"
+                    "Goal blocked (/goal resume)\n"
+                    "■ unexpected status 503 Service Unavailable: upstream failed\n"
+                )
+
+            return Result()
+
+        self.assertEqual(
+            "blocked",
+            recovery_goal_state_on_screen("codex-goal", runner=runner),
         )
 
     def test_guardian_ignores_already_handled_visible_failure(self):

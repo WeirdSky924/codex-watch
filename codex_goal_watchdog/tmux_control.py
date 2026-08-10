@@ -19,6 +19,15 @@ PAUSED_GOAL_PICKER_MARKERS = (
     "Resume goal",
     "Leave paused",
 )
+GOAL_STATE_MARKERS = (
+    ("pursuing", "Pursuing goal"),
+    ("blocked", "Goal blocked (/goal resume)"),
+    ("paused", "Goal paused (/goal resume)"),
+    ("usage_limited", "Goal hit usage limits (/goal resume)"),
+    ("achieved", "Goal achieved"),
+    ("achieved", "Goal complete"),
+    ("achieved", "Goal completed"),
+)
 UPDATE_PROMPT_RE = re.compile(
     r"Update available!\s+v?(?P<current>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
     r"\s*->\s*v?(?P<latest>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
@@ -31,6 +40,17 @@ TEXT_SUBMIT_SETTLE_SECONDS = 0.5
 
 def paused_goal_picker_visible(text: str) -> bool:
     return all(marker in text for marker in PAUSED_GOAL_PICKER_MARKERS)
+
+
+def goal_state_from_text(text: str) -> str | None:
+    latest_state: str | None = None
+    latest_index = -1
+    for state, marker in GOAL_STATE_MARKERS:
+        index = text.rfind(marker)
+        if index > latest_index:
+            latest_index = index
+            latest_state = state
+    return latest_state
 
 
 def update_prompt_version(text: str) -> str | None:
@@ -257,6 +277,14 @@ def handle_goal_prompt(
             text=True,
             check=True,
         )
+        goal_state = goal_state_from_text(result.stdout)
+        if goal_state == "blocked":
+            print(
+                "[codex-goal-watchdog] goal blocked; "
+                "waiting for manual /goal resume",
+                flush=True,
+            )
+            return True
         picker_visible = paused_goal_picker_visible(result.stdout)
         if picker_visible:
             keys = ["Down", "Enter"] if action == "leave_paused" else ["Enter"]
@@ -264,14 +292,7 @@ def handle_goal_prompt(
                 runner(["tmux", "send-keys", "-t", target, key], check=True)
             return True
 
-        goal_resume_required = any(
-            status in result.stdout
-            for status in (
-                "Goal paused (/goal resume)",
-                "Goal blocked (/goal resume)",
-                "Goal hit usage limits (/goal resume)",
-            )
-        )
+        goal_resume_required = goal_state in {"paused", "usage_limited"}
         if goal_resume_required:
             if action == "resume":
                 _submit_text(
@@ -282,7 +303,7 @@ def handle_goal_prompt(
                 )
             return True
 
-        if action == "resume" and "Pursuing goal" in result.stdout:
+        if action == "resume" and goal_state == "pursuing":
             return True
         if now() >= deadline:
             break

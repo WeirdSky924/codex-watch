@@ -187,7 +187,10 @@ def build_startup_update_steps(
 
 
 def build_codex_update_completion_steps(
-    config: RecoveryConfig, expected_version: str
+    config: RecoveryConfig,
+    expected_version: str,
+    *,
+    resume_goal: bool = True,
 ) -> list[RecoveryStep]:
     """Verify an updater result, then restore the pinned Codex thread."""
     if not config.thread_id:
@@ -206,21 +209,30 @@ def build_codex_update_completion_steps(
         RecoveryStep("text", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
-        RecoveryStep("resume_goal_or_prompt", config.resume_prompt),
+        _goal_recovery_step(config, resume_goal=resume_goal),
     ]
 
 
 def build_codex_update_steps(
-    config: RecoveryConfig, expected_version: str
+    config: RecoveryConfig,
+    expected_version: str,
+    *,
+    resume_goal: bool = True,
 ) -> list[RecoveryStep]:
     """Accept the official updater and restore only after version verification."""
     return [
         RecoveryStep("key", "1"),
-        *build_codex_update_completion_steps(config, expected_version),
+        *build_codex_update_completion_steps(
+            config,
+            expected_version,
+            resume_goal=resume_goal,
+        ),
     ]
 
 
-def build_post_update_restart_steps(config: RecoveryConfig) -> list[RecoveryStep]:
+def build_post_update_restart_steps(
+    config: RecoveryConfig, *, resume_goal: bool = True
+) -> list[RecoveryStep]:
     """Restart the pinned thread after the Codex updater returns to the shell."""
     if not config.thread_id:
         raise ValueError("post-update restart requires a pinned Codex thread ID")
@@ -237,8 +249,16 @@ def build_post_update_restart_steps(config: RecoveryConfig) -> list[RecoveryStep
         RecoveryStep("text", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
-        RecoveryStep("resume_goal_or_prompt", config.resume_prompt),
+        _goal_recovery_step(config, resume_goal=resume_goal),
     ]
+
+
+def _goal_recovery_step(
+    config: RecoveryConfig, *, resume_goal: bool
+) -> RecoveryStep:
+    if resume_goal:
+        return RecoveryStep("resume_goal_or_prompt", config.resume_prompt)
+    return RecoveryStep("leave_goal_paused", "")
 
 
 def build_recovery_steps(
@@ -246,6 +266,7 @@ def build_recovery_steps(
     *,
     reason: str = "codex_upstream_stalled",
     recovery_attempt: int = 1,
+    resume_goal: bool = True,
 ) -> list[RecoveryStep]:
     """Build tmux actions for model fallback, compaction, and resume."""
     if not config.thread_id:
@@ -277,7 +298,7 @@ def build_recovery_steps(
             RecoveryStep("text", primary_command),
             RecoveryStep("wait_codex", "30"),
             RecoveryStep("sleep", str(config.startup_wait_seconds)),
-            RecoveryStep("resume_goal_or_prompt", config.resume_prompt),
+            _goal_recovery_step(config, resume_goal=resume_goal),
         ]
     return [
         RecoveryStep("key", "C-c"),
@@ -302,5 +323,5 @@ def build_recovery_steps(
         RecoveryStep("text", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
-        RecoveryStep("resume_goal_or_prompt", config.resume_prompt),
+        _goal_recovery_step(config, resume_goal=resume_goal),
     ]

@@ -16,6 +16,7 @@ from .monitor import (
     normalize_terminal_text,
     recovery_incident_for_thread,
     recovery_allowed_for_goal,
+    recovery_goal_state_on_screen,
 )
 from .paths import default_log_path
 from .recovery import (
@@ -273,6 +274,7 @@ def run_guardian(
                 if pending_incident is None:
                     return
                 incident_id, reason = pending_incident
+                goal_state = recovery_goal_state_on_screen(session)
                 _save_tmux_recovery_incident_id(session, incident_id)
                 recovery_attempt = _next_recovery_attempt(session)
                 _append_log(
@@ -286,18 +288,23 @@ def run_guardian(
                         config,
                         reason=reason,
                         recovery_attempt=recovery_attempt,
+                        resume_goal=goal_state != "blocked",
                     ),
                 )
 
             def restart_after_update() -> None:
                 assert config is not None
+                goal_state = recovery_goal_state_on_screen(session)
                 _append_log(
                     log_path,
                     "Codex update completed; restarting pinned thread",
                 )
                 execute_steps(
                     session,
-                    build_post_update_restart_steps(config),
+                    build_post_update_restart_steps(
+                        config,
+                        resume_goal=goal_state != "blocked",
+                    ),
                 )
 
             def attach_monitor() -> None:

@@ -25,6 +25,7 @@ from .sessions import find_active_cli_thread_id, find_latest_task_failure
 from .tmux_control import (
     capture_update_prompt_version,
     execute_steps,
+    goal_state_from_text,
     handle_goal_prompt,
     paused_goal_picker_visible,
     update_prompt_version,
@@ -37,22 +38,12 @@ ANSI_ESCAPE_RE = re.compile(
 ROLLING_BUFFER_SIZE = 8192
 GOAL_RESUME_STATUS_MARKERS = (
     "Goal paused (/goal resume)",
-    "Goal blocked (/goal resume)",
     "Goal hit usage limits (/goal resume)",
 )
 GOAL_RESUME_RETRY_SECONDS = 10
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
 LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
 RECOVERABLE_GOAL_STATES = {"pursuing", "blocked"}
-GOAL_STATE_MARKERS = (
-    ("pursuing", "Pursuing goal"),
-    ("blocked", "Goal blocked (/goal resume)"),
-    ("paused", "Goal paused (/goal resume)"),
-    ("usage_limited", "Goal hit usage limits (/goal resume)"),
-    ("achieved", "Goal achieved"),
-    ("achieved", "Goal complete"),
-    ("achieved", "Goal completed"),
-)
 
 
 def normalize_terminal_text(value: str) -> str:
@@ -60,23 +51,12 @@ def normalize_terminal_text(value: str) -> str:
     return " ".join(ANSI_ESCAPE_RE.sub("", value).split())
 
 
-def recovery_goal_state(value: str) -> str | None:
-    latest_state: str | None = None
-    latest_index = -1
-    for state, marker in GOAL_STATE_MARKERS:
-        index = value.rfind(marker)
-        if index > latest_index:
-            latest_index = index
-            latest_state = state
-    return latest_state
-
-
 def recovery_allowed_for_goal_state(state: str | None) -> bool:
     return state in RECOVERABLE_GOAL_STATES
 
 
 def recovery_allowed_for_goal(value: str) -> bool:
-    return recovery_allowed_for_goal_state(recovery_goal_state(value))
+    return recovery_allowed_for_goal_state(goal_state_from_text(value))
 
 
 def recovery_incident_for_thread(thread_id: str) -> tuple[str, str] | None:
@@ -148,7 +128,12 @@ def run_monitor(
         visible_version = capture_update_prompt_version(tmux_target)
         if visible_version is None:
             return
-        _run_codex_update(tmux_target, config, visible_version)
+        _run_codex_update(
+            tmux_target,
+            config,
+            visible_version,
+            resume_goal=latest_goal_state != "blocked",
+        )
 
     run_execute = execute or default_execute
     run_resume_goal = resume_goal or default_resume_goal
@@ -175,9 +160,15 @@ def run_monitor(
                 f"{resolved_thread_id}"
             )
         normalized_line = normalize_terminal_text(line)
-        line_goal_state = recovery_goal_state(normalized_line)
+        line_goal_state = goal_state_from_text(normalized_line)
         if line_goal_state is not None:
+            previous_goal_state = latest_goal_state
             latest_goal_state = line_goal_state
+            if line_goal_state == "blocked" and previous_goal_state != "blocked":
+                emit(
+                    "[codex-goal-watchdog] goal blocked; "
+                    "waiting for manual /goal resume"
+                )
         rolling_output = normalize_terminal_text(f"{rolling_output} {normalized_line}")
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
         observed_at = now()
@@ -202,7 +193,7 @@ def run_monitor(
             last_recovery_incident_id = incident_id
             if save_recovery_incident_id is not None:
                 save_recovery_incident_id(incident_id)
-        rolling_goal_state = recovery_goal_state(rolling_output)
+        rolling_goal_state = goal_state_from_text(rolling_output)
         effective_goal_state = rolling_goal_state or latest_goal_state
         if recovery_reason is not None and not recovery_allowed_for_goal_state(
             effective_goal_state
@@ -228,6 +219,7 @@ def run_monitor(
                     config,
                     reason=event.reason,
                     recovery_attempt=controller.recovery_count,
+                    resume_goal=effective_goal_state != "blocked",
                 ),
             )
             continue
@@ -242,8 +234,9 @@ def run_monitor(
             rolling_output = ""
             continue
 
-        goal_resume_visible = paused_goal_picker_visible(rolling_output) or any(
-            marker in rolling_output for marker in GOAL_RESUME_STATUS_MARKERS
+        goal_resume_visible = effective_goal_state != "blocked" and (
+            paused_goal_picker_visible(rolling_output)
+            or any(marker in rolling_output for marker in GOAL_RESUME_STATUS_MARKERS)
         )
         retry_ready = (
             last_goal_resume_at is None
@@ -376,13 +369,23 @@ def _run_codex_update(
     target: str,
     config: RecoveryConfig,
     expected_version: str,
+    *,
+    resume_goal: bool = True,
 ) -> None:
     _set_pending_update_version(target, expected_version)
-    execute_steps(target, build_codex_update_steps(config, expected_version))
+    execute_steps(
+        target,
+        build_codex_update_steps(
+            config,
+            expected_version,
+            resume_goal=resume_goal,
+        ),
+    )
     _clear_pending_update_version(target)
 
 
 def _resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
+    current_goal_state = recovery_goal_state_on_screen(target)
     visible_version = capture_update_prompt_version(target)
     if visible_version is not None:
         print(
@@ -390,7 +393,12 @@ def _resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
             f"target={visible_version}",
             flush=True,
         )
-        _run_codex_update(target, config, visible_version)
+        _run_codex_update(
+            target,
+            config,
+            visible_version,
+            resume_goal=current_goal_state != "blocked",
+        )
         return
 
     pending_version = _pending_update_version(target)
@@ -403,9 +411,27 @@ def _resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
     )
     execute_steps(
         target,
-        build_codex_update_completion_steps(config, pending_version),
+        build_codex_update_completion_steps(
+            config,
+            pending_version,
+            resume_goal=current_goal_state != "blocked",
+        ),
     )
     _clear_pending_update_version(target)
+
+
+def recovery_goal_state_on_screen(
+    target: str, *, runner=subprocess.run
+) -> str | None:
+    result = runner(
+        ["tmux", "capture-pane", "-p", "-t", target],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return goal_state_from_text(normalize_terminal_text(result.stdout))
 
 
 def monitor_stdin(target: str, config: RecoveryConfig) -> None:

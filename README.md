@@ -615,11 +615,15 @@ cd "$PROJECT_DIR"
 my-codex-watch
 ```
 
-如果恢复界面后 Goal 处于暂停状态且没有自动继续，在 Codex 中执行：
+如果恢复界面后普通 paused Goal 没有自动继续，在 Codex 中执行：
 
 ```text
 /goal resume
 ```
+
+`Goal blocked (/goal resume)` 与普通 paused Goal 不同。watchdog 会把 blocked
+视为需要审核或人工批准的状态并保持暂停；确认阻塞原因已经解决后，由用户手工执行
+`/goal resume`。blocked 状态本身不会触发重启或进入冷静期。
 
 ### 情况 D：恢复指定 thread
 
@@ -727,7 +731,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 
 所有识别到的 fatal error 都进入同一个串行恢复状态机：第一次立即恢复固定 thread 并处理 Goal 状态；如果恢复失败并再次出现 fatal，则退出失败进程、等待默认 300 秒，再执行同一恢复流程。后续失败继续每次等待 300 秒，默认次数无限。
 
-从 `0.1.9` 开始，fatal recovery 还要求最近一次可见 Goal 状态是 `Pursuing goal` 或 `Goal blocked (/goal resume)`。如果 Goal 已经 achieved、没有 Goal、处于 paused 或 usage-limited 状态，watchdog 不会因为 fatal 行重启 Codex，也不会发送 fatal-recovery 续接提示；启动和历史回放阶段的 paused Goal 自动恢复逻辑不变。这样可以避免任务完成后的旧错误触发无限重启。
+从 `0.1.9` 开始，fatal recovery 还要求最近一次可见 Goal 状态是 `Pursuing goal` 或 `Goal blocked (/goal resume)`。如果 Goal 已经 achieved、没有 Goal、处于 paused 或 usage-limited 状态，watchdog 不会因为 fatal 行重启 Codex，也不会发送 fatal-recovery 续接提示；启动和历史回放阶段的普通 paused Goal 自动恢复逻辑不变。这样可以避免任务完成后的旧错误触发无限重启。blocked 状态本身不是 fatal，不会触发恢复或冷静期；如果 blocked 期间另有新的 fatal error，watchdog 仍会恢复 Codex 进程和固定 thread，但会让 Goal 继续保持 blocked，等待人工处理。
 
 从 `0.1.10` 开始，可见 fatal 行还必须与当前固定 thread 的新 rollout `task_complete` 事件一致。watchdog 会在发送任何 `Ctrl-C` 前持久化该事件的 `turn_id`；inline TUI 后续重绘同一条 503、容量或其他 fatal 行时只会忽略，不会打断新恢复的 turn。同类错误如果发生在新的 turn 中会得到新的 `turn_id`，仍按原冷静期和无限重试配置恢复。
 
@@ -741,7 +745,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
 | Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread |
 
-恢复 paused、blocked 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。没有可识别 Goal 状态时才发送文本续接提示。
+恢复普通 paused 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。`Goal blocked` 不会自动执行 `/goal resume`，也不会发送文本续接提示；用户完成审核、批准或外部条件处理后再手工恢复。Codex 当前没有向 watchdog 暴露稳定的 blocked 原因分类，因此本工具保守地将所有 blocked 状态都按人工审核处理。
 
 从 `0.1.1` 开始，大型会话恢复时会最多等待 10 分钟，持续检查 `Resume paused goal?` 选择页；出现后自动选择 `Resume goal`。如果已经显示 `Pursuing goal`，不会再注入多余文本。
 
@@ -764,6 +768,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 从 `0.1.9` 开始，fatal recovery 只在最近 Goal 状态为 `Pursuing goal` 或 `Goal blocked (/goal resume)` 时运行。Goal 完成后即使屏幕上残留 `503`、`upstream_error` 或其他 fatal 行，也不会再触发恢复链。
 
 从 `0.1.10` 开始，monitor 与 guardian 使用 rollout `task_complete` 的 `turn_id` 对 fatal 事件去重。恢复后残留在 tmux 历史中的旧错误不会再次触发 `Ctrl-C`；真正的新失败仍会自动恢复。
+
+从 `0.1.12` 开始，`Goal blocked (/goal resume)` 统一保持暂停。手工启动、历史回放、fatal recovery、guardian 接管和 Codex 更新重启都不会自动越过 blocked；fatal 进程恢复完成后仍等待用户手工 `/goal resume`。
 
 ## 10. 多项目配置示例
 

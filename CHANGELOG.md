@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.12] - 2026-08-10
+
+### Fixed
+
+- Keep `Goal blocked (/goal resume)` paused for human review instead of
+  automatically sending `/goal resume` or a fallback continuation prompt.
+- Preserve fatal process recovery for blocked Goals while restoring the pinned
+  thread into a paused state. A blocked status by itself does not trigger a
+  recovery attempt or cooldown.
+- Apply the blocked-Goal policy consistently during manual startup, delayed
+  history replay, monitor recovery, guardian takeover, and Codex update restart.
+
 ## [0.1.11] - 2026-08-03
 
 ### Fixed

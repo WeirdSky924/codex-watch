@@ -106,6 +106,29 @@ class MonitorTests(unittest.TestCase):
         )
 
         self.assertEqual(1, len(calls))
+        self.assertEqual("leave_goal_paused", calls[0][1][-1].kind)
+
+    def test_run_monitor_leaves_blocked_goal_for_manual_review(self):
+        recoveries = []
+        resumed_targets = []
+        messages = []
+
+        run_monitor(
+            lines=[
+                "Goal blocked (/goal resume)\n",
+                "Resume paused goal?\n1. Resume goal\n2. Leave paused\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            now=iter([100.0, 101.0]).__next__,
+            execute=lambda target, steps: recoveries.append((target, steps)),
+            resume_goal=resumed_targets.append,
+            log=messages.append,
+        )
+
+        self.assertEqual([], recoveries)
+        self.assertEqual([], resumed_targets)
+        self.assertTrue(any("manual" in message for message in messages))
 
     def test_run_monitor_ignores_redraw_of_same_rollout_failure(self):
         calls = []

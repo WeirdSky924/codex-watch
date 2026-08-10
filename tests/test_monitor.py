@@ -305,6 +305,26 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn("/compact", [step.value for step in calls[0][1]])
         self.assertEqual("0", calls[0][1][4].value)
 
+    def test_run_monitor_recovers_server_overload_without_compaction(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ stream disconnected before completion: Our servers are "
+                "currently overloaded. Please try again later.\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertNotIn("/compact", [step.value for step in calls[0][1]])
+        self.assertEqual("0", calls[0][1][4].value)
+
     def test_run_monitor_retries_payment_required_without_attempt_limit(self):
         calls = []
 

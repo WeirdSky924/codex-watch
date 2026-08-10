@@ -20,6 +20,9 @@ CONTEXT_WINDOW_EXHAUSTED_PATTERN = (
 MODEL_AT_CAPACITY_PATTERN = (
     "Selected model is at capacity. Please try a different model"
 )
+SERVERS_OVERLOADED_PATTERN = (
+    "Our servers are currently overloaded. Please try again later."
+)
 COMPACTION_RECOVERY_REASONS = {
     "codex_upstream_stalled",
     "context_window_exhausted",
@@ -71,6 +74,8 @@ def classify_recovery_message(message: str) -> str | None:
     """Classify one structured task failure without terminal row markers."""
     if MODEL_AT_CAPACITY_PATTERN in message:
         return "model_at_capacity"
+    if SERVERS_OVERLOADED_PATTERN in message:
+        return "servers_overloaded"
     if DEFAULT_STALL_PATTERN in message:
         return "codex_upstream_stalled"
     if CONTEXT_WINDOW_EXHAUSTED_PATTERN in message:

@@ -743,6 +743,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
 | `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
+| `Our servers are currently overloaded` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试，不执行 compact |
 | Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread |
 
 恢复普通 paused 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。`Goal blocked` 不会自动执行 `/goal resume`，也不会发送文本续接提示；用户完成审核、批准或外部条件处理后再手工恢复。Codex 当前没有向 watchdog 暴露稳定的 blocked 原因分类，因此本工具保守地将所有 blocked 状态都按人工审核处理。
@@ -770,6 +771,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 从 `0.1.10` 开始，monitor 与 guardian 使用 rollout `task_complete` 的 `turn_id` 对 fatal 事件去重。恢复后残留在 tmux 历史中的旧错误不会再次触发 `Ctrl-C`；真正的新失败仍会自动恢复。
 
 从 `0.1.12` 开始，`Goal blocked (/goal resume)` 统一保持暂停。手工启动、历史回放、fatal recovery、guardian 接管和 Codex 更新重启都不会自动越过 blocked；fatal 进程恢复完成后仍等待用户手工 `/goal resume`。
+
+从 `0.1.13` 开始，`stream disconnected before completion: Our servers are currently overloaded. Please try again later.` 进入统一 fatal recovery；它使用 primary model 重启固定 thread，不执行 Luna compact，后续失败按配置冷静期重试，默认次数无限。
 
 ## 10. 多项目配置示例
 

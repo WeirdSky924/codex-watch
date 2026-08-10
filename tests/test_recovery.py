@@ -171,6 +171,21 @@ class RecoveryControllerTests(unittest.TestCase):
             ),
         )
 
+    def test_classifies_server_overload_rollout_failure_message(self):
+        message = (
+            "stream disconnected before completion: Our servers are currently "
+            "overloaded. Please try again later."
+        )
+
+        self.assertEqual(
+            "servers_overloaded",
+            classify_recovery_message(message),
+        )
+        self.assertEqual(
+            "servers_overloaded",
+            classify_recovery_reason(f"■ {message}"),
+        )
+
     def test_ignores_model_capacity_message_without_terminal_warning_marker(self):
         self.assertIsNone(
             classify_recovery_reason(
@@ -398,6 +413,7 @@ class RecoveryStepTests(unittest.TestCase):
             "retryable_network",
             "retryable_upstream_error",
             "model_at_capacity",
+            "servers_overloaded",
         ):
             with self.subTest(reason=reason):
                 first_steps = build_recovery_steps(

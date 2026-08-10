@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.13] - 2026-08-10
+
+### Fixed
+
+- Treat `stream disconnected before completion: Our servers are currently
+  overloaded. Please try again later.` as a fatal upstream error and recover
+  the pinned thread through the standard primary-model retry flow.
+- Keep the overload recovery out of the Luna compaction path.
+
 ## [0.1.12] - 2026-08-10
 
 ### Fixed

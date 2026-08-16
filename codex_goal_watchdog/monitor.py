@@ -43,7 +43,7 @@ GOAL_RESUME_STATUS_MARKERS = (
 GOAL_RESUME_RETRY_SECONDS = 10
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
 LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
-RECOVERABLE_GOAL_STATES = {"pursuing", "blocked"}
+RECOVERABLE_GOAL_STATES = {"pursuing", "blocked", "stalled"}
 
 
 def normalize_terminal_text(value: str) -> str:
@@ -132,7 +132,7 @@ def run_monitor(
             tmux_target,
             config,
             visible_version,
-            resume_goal=latest_goal_state != "blocked",
+            resume_goal=latest_goal_state not in {"blocked", "stalled"},
         )
 
     run_execute = execute or default_execute
@@ -200,7 +200,7 @@ def run_monitor(
         ):
             emit(
                 "[codex-goal-watchdog] suppressed recovery outside active "
-                f"or blocked goal: {recovery_reason}"
+                f"or stalled/blocked goal: {recovery_reason}"
             )
             rolling_output = ""
             continue
@@ -220,6 +220,7 @@ def run_monitor(
                     reason=event.reason,
                     recovery_attempt=controller.recovery_count,
                     resume_goal=effective_goal_state != "blocked",
+                    resume_stalled_goal=effective_goal_state == "stalled",
                 ),
             )
             continue
@@ -234,9 +235,14 @@ def run_monitor(
             rolling_output = ""
             continue
 
-        goal_resume_visible = effective_goal_state != "blocked" and (
-            paused_goal_picker_visible(rolling_output)
-            or any(marker in rolling_output for marker in GOAL_RESUME_STATUS_MARKERS)
+        goal_resume_visible = (
+            effective_goal_state not in {"blocked", "stalled"}
+            and (
+                paused_goal_picker_visible(rolling_output)
+                or any(
+                    marker in rolling_output for marker in GOAL_RESUME_STATUS_MARKERS
+                )
+            )
         )
         retry_ready = (
             last_goal_resume_at is None
@@ -397,7 +403,7 @@ def _resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
             target,
             config,
             visible_version,
-            resume_goal=current_goal_state != "blocked",
+            resume_goal=current_goal_state not in {"blocked", "stalled"},
         )
         return
 
@@ -414,7 +420,7 @@ def _resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
         build_codex_update_completion_steps(
             config,
             pending_version,
-            resume_goal=current_goal_state != "blocked",
+            resume_goal=current_goal_state not in {"blocked", "stalled"},
         ),
     )
     _clear_pending_update_version(target)

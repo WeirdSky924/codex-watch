@@ -289,6 +289,7 @@ def run_guardian(
                         reason=reason,
                         recovery_attempt=recovery_attempt,
                         resume_goal=goal_state != "blocked",
+                        resume_stalled_goal=goal_state == "stalled",
                     ),
                 )
 
@@ -303,7 +304,7 @@ def run_guardian(
                     session,
                     build_post_update_restart_steps(
                         config,
-                        resume_goal=goal_state != "blocked",
+                        resume_goal=goal_state not in {"blocked", "stalled"},
                     ),
                 )
 

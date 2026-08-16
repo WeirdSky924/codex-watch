@@ -196,6 +196,22 @@ class GuardianTests(unittest.TestCase):
             _recovery_reason_on_screen("codex-goal", runner=runner),
         )
 
+    def test_visible_recovery_allows_stalled_goal_with_fatal_error(self):
+        def runner(command, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = (
+                    "Goal stalled (/goal resume)\n"
+                    "■ unexpected status 503 Service Unavailable: upstream failed\n"
+                )
+
+            return Result()
+
+        self.assertEqual(
+            "retryable_http_503",
+            _recovery_reason_on_screen("codex-goal", runner=runner),
+        )
+
     def test_guardian_reads_blocked_state_before_recovery(self):
         def runner(command, **kwargs):
             class Result:

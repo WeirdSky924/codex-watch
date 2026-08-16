@@ -130,6 +130,70 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([], resumed_targets)
         self.assertTrue(any("manual" in message for message in messages))
 
+    def test_run_monitor_leaves_stalled_goal_without_fatal_error(self):
+        recoveries = []
+        resumed_targets = []
+
+        run_monitor(
+            lines=[
+                "Goal stalled (/goal resume)\n",
+                "Resume paused goal?\n1. Resume goal\n2. Leave paused\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            now=iter([100.0, 101.0]).__next__,
+            execute=lambda target, steps: recoveries.append((target, steps)),
+            resume_goal=resumed_targets.append,
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], recoveries)
+        self.assertEqual([], resumed_targets)
+
+    def test_run_monitor_recovers_new_fatal_error_while_goal_stalled(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "Goal stalled (/goal resume)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=iter([100.0, 101.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            resolve_recovery_incident=lambda thread_id: (
+                "turn-stalled-503",
+                "retryable_http_503",
+            ),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("resume_stalled_goal_or_prompt", calls[0][1][-1].kind)
+
+    def test_run_monitor_keeps_manual_stall_for_redrawn_fatal_incident(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "Goal stalled (/goal resume)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=iter([100.0, 101.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            resolve_recovery_incident=lambda thread_id: (
+                "turn-stalled-503",
+                "retryable_http_503",
+            ),
+            initial_recovery_incident_id="turn-stalled-503",
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], calls)
+
     def test_run_monitor_ignores_redraw_of_same_rollout_failure(self):
         calls = []
         persisted_incidents = []

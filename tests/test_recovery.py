@@ -370,6 +370,22 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertNotIn("/goal resume", values)
         self.assertEqual("leave_goal_paused", steps[-1].kind)
 
+    def test_stalled_goal_fatal_recovery_resumes_only_after_process_restart(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            primary_model="gpt-5.6-sol",
+            resume_prompt="继续中断的 goal。",
+        )
+
+        steps = build_recovery_steps(
+            config,
+            reason="retryable_http_503",
+            resume_stalled_goal=True,
+        )
+
+        self.assertEqual("key", steps[0].kind)
+        self.assertEqual("resume_stalled_goal_or_prompt", steps[-1].kind)
+
     def test_payment_required_waits_five_minutes_then_restarts_sol(self):
         config = RecoveryConfig(
             thread_id="550e8400-e29b-41d4-a716-446655440000",

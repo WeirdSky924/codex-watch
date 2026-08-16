@@ -259,11 +259,16 @@ def build_post_update_restart_steps(
 
 
 def _goal_recovery_step(
-    config: RecoveryConfig, *, resume_goal: bool
+    config: RecoveryConfig,
+    *,
+    resume_goal: bool,
+    resume_stalled_goal: bool = False,
 ) -> RecoveryStep:
-    if resume_goal:
-        return RecoveryStep("resume_goal_or_prompt", config.resume_prompt)
-    return RecoveryStep("leave_goal_paused", "")
+    if not resume_goal:
+        return RecoveryStep("leave_goal_paused", "")
+    if resume_stalled_goal:
+        return RecoveryStep("resume_stalled_goal_or_prompt", config.resume_prompt)
+    return RecoveryStep("resume_goal_or_prompt", config.resume_prompt)
 
 
 def build_recovery_steps(
@@ -272,6 +277,7 @@ def build_recovery_steps(
     reason: str = "codex_upstream_stalled",
     recovery_attempt: int = 1,
     resume_goal: bool = True,
+    resume_stalled_goal: bool = False,
 ) -> list[RecoveryStep]:
     """Build tmux actions for model fallback, compaction, and resume."""
     if not config.thread_id:
@@ -303,7 +309,11 @@ def build_recovery_steps(
             RecoveryStep("text", primary_command),
             RecoveryStep("wait_codex", "30"),
             RecoveryStep("sleep", str(config.startup_wait_seconds)),
-            _goal_recovery_step(config, resume_goal=resume_goal),
+            _goal_recovery_step(
+                config,
+                resume_goal=resume_goal,
+                resume_stalled_goal=resume_stalled_goal,
+            ),
         ]
     return [
         RecoveryStep("key", "C-c"),
@@ -328,5 +338,9 @@ def build_recovery_steps(
         RecoveryStep("text", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
-        _goal_recovery_step(config, resume_goal=resume_goal),
+        _goal_recovery_step(
+            config,
+            resume_goal=resume_goal,
+            resume_stalled_goal=resume_stalled_goal,
+        ),
     ]

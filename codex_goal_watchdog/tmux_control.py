@@ -22,6 +22,7 @@ PAUSED_GOAL_PICKER_MARKERS = (
 GOAL_STATE_MARKERS = (
     ("pursuing", "Pursuing goal"),
     ("blocked", "Goal blocked (/goal resume)"),
+    ("stalled", "Goal stalled (/goal resume)"),
     ("paused", "Goal paused (/goal resume)"),
     ("usage_limited", "Goal hit usage limits (/goal resume)"),
     ("achieved", "Goal achieved"),
@@ -266,7 +267,7 @@ def handle_goal_prompt(
     sleeper=time.sleep,
     now=time.monotonic,
 ) -> bool:
-    if action not in {"leave_paused", "resume"}:
+    if action not in {"leave_paused", "resume", "resume_stalled"}:
         raise ValueError(f"unsupported goal prompt action: {action}")
 
     deadline = now() + max(0, timeout_seconds)
@@ -285,6 +286,15 @@ def handle_goal_prompt(
                 flush=True,
             )
             return True
+        if goal_state == "stalled":
+            if action == "resume_stalled":
+                _submit_text(
+                    target,
+                    "/goal resume",
+                    runner=runner,
+                    sleeper=sleeper,
+                )
+            return True
         picker_visible = paused_goal_picker_visible(result.stdout)
         if picker_visible:
             keys = ["Down", "Enter"] if action == "leave_paused" else ["Enter"]
@@ -294,7 +304,7 @@ def handle_goal_prompt(
 
         goal_resume_required = goal_state in {"paused", "usage_limited"}
         if goal_resume_required:
-            if action == "resume":
+            if action in {"resume", "resume_stalled"}:
                 _submit_text(
                     target,
                     "/goal resume",
@@ -303,13 +313,13 @@ def handle_goal_prompt(
                 )
             return True
 
-        if action == "resume" and goal_state == "pursuing":
+        if action in {"resume", "resume_stalled"} and goal_state == "pursuing":
             return True
         if now() >= deadline:
             break
         sleeper(poll_seconds)
 
-    if action == "resume" and send_fallback_prompt:
+    if action in {"resume", "resume_stalled"} and send_fallback_prompt:
         _submit_text(target, prompt, runner=runner, sleeper=sleeper)
     return False
 
@@ -384,8 +394,16 @@ def execute_steps(
                     )
                 sleeper(1)
             continue
-        if step.kind in {"leave_goal_paused", "resume_goal_or_prompt"}:
-            action = "leave_paused" if step.kind == "leave_goal_paused" else "resume"
+        if step.kind in {
+            "leave_goal_paused",
+            "resume_goal_or_prompt",
+            "resume_stalled_goal_or_prompt",
+        }:
+            action = {
+                "leave_goal_paused": "leave_paused",
+                "resume_goal_or_prompt": "resume",
+                "resume_stalled_goal_or_prompt": "resume_stalled",
+            }[step.kind]
             if dry_run:
                 print(f"DRY-RUN: handle goal prompt ({action})", flush=True)
                 continue

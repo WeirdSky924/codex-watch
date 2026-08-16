@@ -355,6 +355,61 @@ class TmuxControlTests(unittest.TestCase):
             calls,
         )
 
+    def test_handle_goal_prompt_leaves_stalled_goal_for_manual_resume(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = "Goal stalled (/goal resume)"
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="继续 goal",
+            runner=runner,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [["tmux", "capture-pane", "-p", "-t", "codex-goal"]],
+            calls,
+        )
+
+    def test_handle_goal_prompt_resumes_stalled_goal_after_fatal_recovery(self):
+        calls = []
+        sleeps = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = "Goal stalled (/goal resume)"
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume_stalled",
+            prompt="继续 goal",
+            runner=runner,
+            sleeper=sleeps.append,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual([0.5], sleeps)
+        self.assertEqual(
+            [
+                ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
+                ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
+                ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
+            ],
+            calls,
+        )
+
     def test_handle_goal_prompt_does_not_accept_picker_for_blocked_goal(self):
         calls = []
 

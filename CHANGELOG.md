@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.14] - 2026-08-16
+
+### Fixed
+
+- Allow a new rollout-correlated fatal error to enter recovery while the Goal
+  is stalled, then resume that stalled Goal only after the process restart.
+- Keep manually stalled Goals paused during startup, history replay, Codex
+  updates, and redraws of already handled fatal incidents.
+
 ## [0.1.13] - 2026-08-10
 
 ### Fixed

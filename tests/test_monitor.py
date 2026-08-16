@@ -1,9 +1,11 @@
 import io
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from codex_goal_watchdog.monitor import (
+    _claim_tmux_recovery_incident_id,
     _save_tmux_thread_id,
     iter_decoded_chunks,
     run_monitor,
@@ -15,6 +17,33 @@ THREAD_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
 class MonitorTests(unittest.TestCase):
+    def test_recovery_incident_claim_persists_only_once(self):
+        current_incident = {"value": "old-turn"}
+
+        def save_incident(_target, incident_id):
+            current_incident["value"] = incident_id
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "incident.lock"
+            first_claim = _claim_tmux_recovery_incident_id(
+                "codex-goal",
+                "new-turn",
+                option_getter=lambda target: current_incident["value"],
+                option_saver=save_incident,
+                lock_path=lock_path,
+            )
+            second_claim = _claim_tmux_recovery_incident_id(
+                "codex-goal",
+                "new-turn",
+                option_getter=lambda target: current_incident["value"],
+                option_saver=save_incident,
+                lock_path=lock_path,
+            )
+
+        self.assertTrue(first_claim)
+        self.assertFalse(second_claim)
+        self.assertEqual("new-turn", current_incident["value"])
+
     def test_iter_decoded_chunks_yields_tui_output_without_newline(self):
         stream = io.BytesIO(
             b"stream disconnected: codex upstream stalled: "
@@ -221,6 +250,32 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(1, len(calls))
         self.assertEqual(["turn-503"], persisted_incidents)
+
+    def test_run_monitor_skips_incident_claimed_by_guardian(self):
+        calls = []
+        claims = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            now=iter([100.0, 101.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            resolve_recovery_incident=lambda thread_id: (
+                "turn-claimed-by-guardian",
+                "retryable_http_503",
+            ),
+            claim_recovery_incident_id=lambda incident_id: (
+                claims.append(incident_id) or False
+            ),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(["turn-claimed-by-guardian"], claims)
+        self.assertEqual([], calls)
 
     def test_run_monitor_recovers_same_error_for_a_new_turn(self):
         calls = []

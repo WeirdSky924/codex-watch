@@ -69,6 +69,35 @@ class GuardianTests(unittest.TestCase):
         self.assertEqual("healthy", status)
         self.assertEqual([], calls)
 
+    def test_guard_once_recovers_visible_stall_with_active_monitor(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            stalled_screen=lambda: True,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+        )
+
+        self.assertEqual("recovered", status)
+        self.assertEqual(["recover"], calls)
+
+    def test_guard_once_leaves_live_monitor_as_sole_owner_after_handoff(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            stalled_screen=lambda: calls.append("scan") or True,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+            inspect_active_screen=False,
+        )
+
+        self.assertEqual("healthy", status)
+        self.assertEqual([], calls)
+
     def test_guard_once_reattaches_missing_monitor(self):
         calls = []
 

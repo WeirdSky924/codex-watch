@@ -66,6 +66,23 @@ def _existing_session_without_thread_message(session: str) -> str:
     )
 
 
+def _guardian_unit_installed() -> bool:
+    return (
+        Path.home()
+        / ".config/systemd/user/codex-watch-guardian@.service"
+    ).is_file()
+
+
+def _guardian_enable_command(session: str) -> list[str]:
+    return [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        f"codex-watch-guardian@{session}.service",
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="codex-goal-watchdog",
@@ -292,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     run_command(tmux_pipe_pane_command(args.session, pipe_command))
+    if _guardian_unit_installed():
+        run_command(_guardian_enable_command(args.session))
     if not args.dry_run:
         handle_goal_prompt(
             args.session,

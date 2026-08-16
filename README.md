@@ -201,6 +201,11 @@ cd codex_goal_watchdog-*/
 
 4. 安装并尝试启用 guardian user service。
 
+安装过 guardian unit 后，每次运行 `codex-watch --session NAME` 都会自动执行
+`systemctl --user enable --now codex-watch-guardian@NAME.service`。因此 guardian
+被手工停止或禁用后，再次启动对应 watchdog session 就会重新启用它。使用
+`./install.sh --no-service` 且本机不存在该 unit 时，不会调用 systemd。
+
 安装器本身不需要 root。只有安装系统依赖和启用 lingering 时可能需要 `sudo`。
 
 ### 修复 `codex-watch: command not found`
@@ -666,6 +671,9 @@ guardian 的职责是监督 monitor，而不是替代 Codex 或 tmux：
 
 - monitor 丢失时重新挂载。
 - monitor 丢失但 fatal error 仍显示在画面上时接管恢复。
+- monitor 重新挂载前 fatal error 已经出现时，从当前画面和 rollout 记录补检并恢复。
+- 完成交接后由 monitor 独占实时 fatal；guardian 不会持续重扫 active pipe，双方通过
+  原子 incident claim 避免对同一个错误重复执行恢复。
 - Codex 自更新完成并退回 Shell 后，重新启动固定 thread。
 - tmux session 不存在时记录 `session_missing`，但不自行猜测项目并创建新会话。
 

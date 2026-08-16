@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.15] - 2026-08-17
+
+### Fixed
+
+- Re-enable and start the matching installed guardian service whenever
+  `codex-watch` starts a session, so a previously disabled guardian cannot
+  remain detached from the watchdog lifecycle.
+- Let guardian recover a new rollout-correlated fatal error that was already
+  visible before the monitor pipe attached, even when that pipe is currently
+  active.
+- Limit active-pipe inspection to the guardian handoff window and atomically
+  claim fatal incidents across monitor and guardian, preventing duplicate
+  recovery attempts and repeated scans of large rollout files.
+
 ## [0.1.14] - 2026-08-16
 
 ### Fixed

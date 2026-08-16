@@ -12,7 +12,7 @@ from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
 from .monitor import (
     LAST_RECOVERY_INCIDENT_OPTION,
     PENDING_UPDATE_OPTION,
-    _save_tmux_recovery_incident_id,
+    _claim_tmux_recovery_incident_id,
     normalize_terminal_text,
     recovery_incident_for_thread,
     recovery_allowed_for_goal,
@@ -42,6 +42,7 @@ def guard_once(
     attach_monitor: Callable[[], None],
     update_restart_needed: Callable[[], bool] | None = None,
     restart_after_update: Callable[[], None] | None = None,
+    inspect_active_screen: bool = True,
 ) -> str:
     if not session_exists():
         return "session_missing"
@@ -50,12 +51,17 @@ def guard_once(
             raise ValueError("update restart callback is required")
         restart_after_update()
         return "restarted_after_update"
-    if pipe_active():
+    monitor_is_active = pipe_active()
+    if monitor_is_active and not inspect_active_screen:
         return "healthy"
     if stalled_screen():
         recover()
+        if monitor_is_active:
+            return "recovered"
         attach_monitor()
         return "recovered_and_reattached"
+    if monitor_is_active:
+        return "healthy"
     attach_monitor()
     return "reattached"
 
@@ -248,6 +254,7 @@ def run_guardian(
     root = root_dir or Path(__file__).resolve().parents[1]
     log_path = default_log_path()
     last_status = ""
+    active_screen_check_pending = True
     _append_log(log_path, f"guardian started: session={session}")
 
     while True:
@@ -274,12 +281,18 @@ def run_guardian(
                 if pending_incident is None:
                     return
                 incident_id, reason = pending_incident
+                if not _claim_tmux_recovery_incident_id(session, incident_id):
+                    _append_log(
+                        log_path,
+                        "visible fatal incident already claimed by monitor: "
+                        f"{incident_id}",
+                    )
+                    return
                 goal_state = recovery_goal_state_on_screen(session)
-                _save_tmux_recovery_incident_id(session, incident_id)
                 recovery_attempt = _next_recovery_attempt(session)
                 _append_log(
                     log_path,
-                    "visible recoverable error found while monitor was down: "
+                    "visible recoverable error claimed during guardian handoff: "
                     f"{reason}; recovery #{recovery_attempt}",
                 )
                 execute_steps(
@@ -340,7 +353,12 @@ def run_guardian(
                     session
                 ),
                 restart_after_update=restart_after_update,
+                inspect_active_screen=active_screen_check_pending,
             )
+            active_screen_check_pending = status in {
+                "session_missing",
+                "restarted_after_update",
+            }
             if status != last_status or status not in {"healthy", "session_missing"}:
                 _append_log(log_path, f"status={status}")
                 last_status = status

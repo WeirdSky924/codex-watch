@@ -1,9 +1,10 @@
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from codex_goal_watchdog import __version__
 from codex_goal_watchdog.__main__ import guardian_main, main, start_main
@@ -90,6 +91,86 @@ class ConsoleEntrypointTests(unittest.TestCase):
             timeout_seconds=0,
             send_fallback_prompt=False,
         )
+
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.tmux_get_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440000",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    def test_start_reenables_installed_guardian_for_session(
+        self,
+        _session_exists_mock,
+        _get_thread_id_mock,
+        run_mock,
+        _handle_goal_prompt_mock,
+        _save_binding_mock,
+    ):
+        with tempfile.TemporaryDirectory() as home:
+            unit_path = (
+                Path(home)
+                / ".config/systemd/user/codex-watch-guardian@.service"
+            )
+            unit_path.parent.mkdir(parents=True)
+            unit_path.touch()
+
+            with patch(
+                "codex_goal_watchdog.__main__.Path.home",
+                return_value=Path(home),
+            ):
+                result = main(
+                    ["start", "--session", "project-a", "--no-attach"]
+                )
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            call(
+                [
+                    "systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                    "codex-watch-guardian@project-a.service",
+                ],
+                check=True,
+            ),
+            run_mock.call_args_list,
+        )
+
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.tmux_get_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440000",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    def test_start_skips_guardian_when_service_was_not_installed(
+        self,
+        _session_exists_mock,
+        _get_thread_id_mock,
+        run_mock,
+        _handle_goal_prompt_mock,
+        _save_binding_mock,
+    ):
+        with tempfile.TemporaryDirectory() as home:
+            with patch(
+                "codex_goal_watchdog.__main__.Path.home",
+                return_value=Path(home),
+            ):
+                result = main(
+                    ["start", "--session", "project-a", "--no-attach"]
+                )
+
+        self.assertEqual(0, result)
+        systemctl_calls = [
+            call
+            for call in run_mock.call_args_list
+            if call.args[0][0] == "systemctl"
+        ]
+        self.assertEqual([], systemctl_calls)
 
     @patch("codex_goal_watchdog.__main__.save_session_binding")
     @patch(

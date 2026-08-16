@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import codecs
+import fcntl
+import hashlib
 import re
 import subprocess
 import sys
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .bindings import save_session_binding
+from .paths import state_dir
 from .recovery import (
     RecoveryConfig,
     build_codex_update_completion_steps,
@@ -103,6 +106,7 @@ def run_monitor(
     ) = None,
     initial_recovery_incident_id: str = "",
     save_recovery_incident_id: Callable[[str], None] | None = None,
+    claim_recovery_incident_id: Callable[[str], bool] | None = None,
 ) -> None:
     from .recovery import RecoveryController
 
@@ -191,7 +195,20 @@ def run_monitor(
                 rolling_output = ""
                 continue
             last_recovery_incident_id = incident_id
-            if save_recovery_incident_id is not None:
+            if (
+                claim_recovery_incident_id is not None
+                and not claim_recovery_incident_id(incident_id)
+            ):
+                emit(
+                    "[codex-goal-watchdog] ignored fatal incident claimed by "
+                    f"another recovery owner: {incident_id}"
+                )
+                rolling_output = ""
+                continue
+            if (
+                claim_recovery_incident_id is None
+                and save_recovery_incident_id is not None
+            ):
                 save_recovery_incident_id(incident_id)
         rolling_goal_state = goal_state_from_text(rolling_output)
         effective_goal_state = rolling_goal_state or latest_goal_state
@@ -304,6 +321,28 @@ def _save_tmux_recovery_incident_id(target: str, incident_id: str) -> None:
         ],
         check=True,
     )
+
+
+def _claim_tmux_recovery_incident_id(
+    target: str,
+    incident_id: str,
+    *,
+    option_getter: Callable[[str], str] = _tmux_recovery_incident_id,
+    option_saver: Callable[[str, str], None] = _save_tmux_recovery_incident_id,
+    lock_path: Path | None = None,
+) -> bool:
+    if lock_path is None:
+        lock_root = state_dir()
+        lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_root.chmod(0o700)
+        session_key = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+        lock_path = lock_root / f"recovery-incident-{session_key}.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        if option_getter(target) == incident_id:
+            return False
+        option_saver(target, incident_id)
+        return True
 
 
 def _save_tmux_thread_id(target: str, thread_id: str) -> None:
@@ -465,7 +504,7 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         current_incident = recovery_incident_for_thread(config.thread_id)
         if current_incident is not None:
             initial_incident_id = current_incident[0]
-            _save_tmux_recovery_incident_id(target, initial_incident_id)
+            _claim_tmux_recovery_incident_id(target, initial_incident_id)
     run_monitor(
         lines=iter_decoded_chunks(sys.stdin.buffer),
         target=target,
@@ -476,7 +515,7 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         save_thread_id=lambda thread_id: _save_tmux_thread_id(target, thread_id),
         resolve_recovery_incident=recovery_incident_for_thread,
         initial_recovery_incident_id=initial_incident_id,
-        save_recovery_incident_id=lambda incident_id: (
-            _save_tmux_recovery_incident_id(target, incident_id)
+        claim_recovery_incident_id=lambda incident_id: (
+            _claim_tmux_recovery_incident_id(target, incident_id)
         ),
     )

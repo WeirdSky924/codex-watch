@@ -496,6 +496,54 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([2], persisted_counts)
         self.assertEqual("300", calls[0][1][4].value)
 
+    def test_access_denied_rotation_rebinds_and_preserves_retry_cooldown(self):
+        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        calls = []
+        rebound_ids = []
+        persisted_counts = []
+        marked_rotation_counts = []
+        thread_ids = iter([THREAD_ID, THREAD_ID, new_thread_id, new_thread_id])
+        incidents = iter(
+            [
+                ("turn-ban-old", "upstream_access_denied"),
+                ("turn-ban-new", "upstream_access_denied"),
+            ]
+        )
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 502 Bad Gateway: Upstream access denied\n",
+                "Pursuing goal (1m)\n",
+                "■ unexpected status 502 Bad Gateway: Upstream access denied\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                cooldown_seconds=300,
+                max_recoveries=0,
+            ),
+            initial_recovery_count=2,
+            resolve_thread_id=lambda target: next(thread_ids),
+            save_thread_id=rebound_ids.append,
+            save_recovery_count=persisted_counts.append,
+            resolve_recovery_incident=lambda thread_id: next(incidents),
+            resolve_goal_objective=lambda thread_id: "Goal ID: FE-CREATOR-8",
+            mark_thread_rotation=marked_rotation_counts.append,
+            claim_recovery_incident_id=lambda incident_id: True,
+            now=iter([100.0, 101.0, 102.0, 103.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([new_thread_id], rebound_ids)
+        self.assertEqual([3, 3, 4], persisted_counts)
+        self.assertEqual([3, 4], marked_rotation_counts)
+        self.assertEqual(2, len(calls))
+        self.assertNotIn(THREAD_ID, calls[0][1][5].value)
+        self.assertIn("Goal ID: FE-CREATOR-8", calls[0][1][-1].value)
+        self.assertEqual("300", calls[1][1][4].value)
+
     def test_run_monitor_rebinds_after_clear_before_recovery(self):
         new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
         calls = []
@@ -551,6 +599,34 @@ class MonitorTests(unittest.TestCase):
             thread_id=new_thread_id,
             cwd=Path("/workspace/project-a"),
         )
+
+    @patch("codex_goal_watchdog.monitor._clear_pending_thread_rotation")
+    @patch(
+        "codex_goal_watchdog.monitor._pending_thread_rotation_count",
+        return_value=3,
+    )
+    @patch("codex_goal_watchdog.monitor._save_tmux_recovery_count")
+    @patch("codex_goal_watchdog.monitor.save_session_binding")
+    @patch(
+        "codex_goal_watchdog.monitor._tmux_pane_identity",
+        return_value=(123, Path("/workspace/project-a")),
+    )
+    @patch("codex_goal_watchdog.monitor.subprocess.run")
+    def test_rotation_rebind_preserves_pending_recovery_count(
+        self,
+        _run_mock,
+        _pane_identity_mock,
+        _save_binding_mock,
+        save_count_mock,
+        _pending_count_mock,
+        clear_pending_mock,
+    ):
+        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+
+        _save_tmux_thread_id("project-a", new_thread_id)
+
+        save_count_mock.assert_called_once_with("project-a", 3)
+        clear_pending_mock.assert_called_once_with("project-a")
 
 
 if __name__ == "__main__":

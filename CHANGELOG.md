@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.16] - 2026-08-17
+
+### Added
+
+- Treat `502 Bad Gateway: Upstream access denied` as a banned-thread failure:
+  start a fresh Codex thread instead of resuming the rejected thread, extract
+  the previous Goal Objective from its rollout, and instruct the new thread to
+  recreate that Goal after reconciling the worktree, ACTIVE plan, canonical
+  project records, and potentially stale handoff state.
+- Rebind tmux and the persistent watchdog session to the rotated thread while
+  preserving the recovery count and cooldown across repeated automatic
+  rotations.
+- Preserve the manual-review boundary when the banned thread's Goal was
+  blocked instead of using rotation to resume product execution.
+
+### Fixed
+
+- Prefer the latest fatal row when guardian inspects a screen containing
+  several historical errors.
+- Recognize `Goal active Objective:` after Codex exits to the shell, allowing
+  guardian takeover to retain the active-Goal recovery gate.
+
 ## [0.1.15] - 2026-08-17
 
 ### Fixed

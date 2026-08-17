@@ -6,6 +6,7 @@ from codex_goal_watchdog.tmux_control import (
     commands_for_step,
     ensure_codex_version,
     execute_steps,
+    goal_state_from_text,
     handle_goal_prompt,
     monitor_pipe_command,
     update_prompt_version,
@@ -14,6 +15,15 @@ from codex_goal_watchdog.tmux_control import (
 
 
 class TmuxControlTests(unittest.TestCase):
+    def test_goal_active_objective_survives_fatal_shell_exit(self):
+        screen = (
+            "■ unexpected status 502 Bad Gateway: Upstream access denied\n"
+            "• Goal active Objective: Goal ID: FE-CREATOR-8\n"
+            "To continue this session, run codex resume old-thread\n"
+        )
+
+        self.assertEqual("pursuing", goal_state_from_text(screen))
+
     def test_update_prompt_version_requires_complete_update_picker(self):
         screen = (
             "Update available! 0.144.6 -> 0.145.0\n"

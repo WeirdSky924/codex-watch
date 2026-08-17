@@ -23,6 +23,7 @@ MODEL_AT_CAPACITY_PATTERN = (
 SERVERS_OVERLOADED_PATTERN = (
     "Our servers are currently overloaded. Please try again later."
 )
+UPSTREAM_ACCESS_DENIED_PATTERN = "Upstream access denied"
 COMPACTION_RECOVERY_REASONS = {
     "codex_upstream_stalled",
     "context_window_exhausted",
@@ -31,6 +32,35 @@ DEFAULT_RESUME_PROMPT = (
     "继续刚才被 5m0s 中断的 goal。从当前仓库状态和最近上下文继续，"
     "不要重复已经完成的操作；先检查现状，再推进未完成步骤。"
 )
+
+
+def build_thread_rotation_prompt(
+    goal_objective: str | None,
+    *,
+    resume_goal: bool,
+) -> str:
+    objective = goal_objective or (
+        "未能从旧 thread 的 rollout 提取 Goal Objective。请从最新工作树、"
+        "唯一 ACTIVE Plan 和项目 canonical 恢复文档识别仍在进行的目标。"
+    )
+    state_instruction = (
+        "上一 Goal 处于 blocked 人工审核态。重新创建 Goal 只用于保留目标与恢复"
+        "上下文，不得继续产品执行或绕过审核；保持 blocked 边界并等待用户明确处理。"
+        if not resume_goal
+        else "上一 Goal 可继续执行；完成状态校准后从最新可执行入口接力推进。"
+    )
+    encoded_objective = json.dumps(objective, ensure_ascii=False)
+    return (
+        "上一 Codex thread 因 upstream access denied 被上游隔离，禁止恢复或重试"
+        "旧 thread。请创建一个不设置 token budget 的新 Goal，并持续接力执行。"
+        "上一 Goal Objective 原文采用 JSON 字符串无损编码，解码后原样使用："
+        f"{encoded_objective}。"
+        "恢复前必须重新核对状态，优先级为：最新用户要求 > 当前工作树 > 唯一 "
+        "ACTIVE Plan State 及 current executable entry > canonical 规则/规范 > "
+        "handoff 缓存。计划或 handoff 可能滞后；发生冲突时使用更高优先级证据，"
+        "不得恢复历史授权、旧 checkpoint 或重复已完成操作。先检查现状，再用上述"
+        f" Objective 原文创建 Goal。{state_instruction}"
+    )
 RETRYABLE_HTTP_CODES = (
     401,
     402,
@@ -80,6 +110,8 @@ def classify_recovery_message(message: str) -> str | None:
         return "codex_upstream_stalled"
     if CONTEXT_WINDOW_EXHAUSTED_PATTERN in message:
         return "context_window_exhausted"
+    if UPSTREAM_ACCESS_DENIED_PATTERN.lower() in message.lower():
+        return "upstream_access_denied"
     if _is_retryable_upstream_error(message):
         return "retryable_upstream_error"
     status = RETRYABLE_HTTP_RE.search(message)
@@ -99,16 +131,13 @@ def classify_recovery_message(message: str) -> str | None:
 
 def classify_recovery_reason(text: str) -> str | None:
     """Classify Codex TUI terminal errors, not ordinary transcript text."""
-    for segment in text.split("⚠")[1:]:
-        warning_text = segment.lstrip()[:1200]
-        reason = classify_recovery_message(warning_text)
-        if reason == "model_at_capacity":
-            return reason
-    if "■" not in text:
-        return None
-    for segment in text.split("■")[1:]:
-        error_text = segment[:1200]
-        reason = classify_recovery_message(error_text)
+    markers = list(re.finditer(r"[⚠■]", text))
+    for index in range(len(markers) - 1, -1, -1):
+        marker = markers[index]
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        reason = classify_recovery_message(text[marker.end() : end].lstrip()[:1200])
+        if marker.group() == "⚠" and reason != "model_at_capacity":
+            continue
         if reason is not None:
             return reason
     return None
@@ -278,6 +307,7 @@ def build_recovery_steps(
     recovery_attempt: int = 1,
     resume_goal: bool = True,
     resume_stalled_goal: bool = False,
+    goal_objective: str | None = None,
 ) -> list[RecoveryStep]:
     """Build tmux actions for model fallback, compaction, and resume."""
     if not config.thread_id:
@@ -299,6 +329,31 @@ def build_recovery_steps(
             resume_thread_id=config.thread_id,
         )
     )
+    if reason == "upstream_access_denied":
+        fresh_command = shlex.join(
+            build_codex_command(
+                model=config.primary_model,
+                reasoning_effort=config.primary_reasoning_effort,
+                codex_args=config.codex_args,
+            )
+        )
+        return [
+            RecoveryStep("key", "C-c"),
+            RecoveryStep("sleep", str(config.abort_delay_seconds)),
+            RecoveryStep("text", "/quit"),
+            RecoveryStep("wait_shell", "30"),
+            RecoveryStep("sleep", str(max(0, restart_delay))),
+            RecoveryStep("text", fresh_command),
+            RecoveryStep("wait_codex", "30"),
+            RecoveryStep("sleep", str(config.startup_wait_seconds)),
+            RecoveryStep(
+                "text",
+                build_thread_rotation_prompt(
+                    goal_objective,
+                    resume_goal=resume_goal,
+                ),
+            ),
+        ]
     if reason not in COMPACTION_RECOVERY_REASONS:
         return [
             RecoveryStep("key", "C-c"),

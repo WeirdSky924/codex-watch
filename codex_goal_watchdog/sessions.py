@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -273,6 +274,53 @@ def find_latest_task_failure(
                         error_info if isinstance(error_info, str) else None
                     ),
                 )
+    except OSError:
+        return None
+    return latest
+
+
+def find_latest_goal_objective(
+    *, thread_id: str, sessions_root: Path = DEFAULT_SESSIONS_ROOT
+) -> str | None:
+    path = find_thread_rollout_path(
+        thread_id=thread_id,
+        sessions_root=sessions_root,
+    )
+    if path is None:
+        return None
+    latest: str | None = None
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = event.get("payload", {})
+                if (
+                    event.get("type") != "response_item"
+                    or payload.get("type") != "message"
+                    or payload.get("role") != "user"
+                ):
+                    continue
+                for item in payload.get("content", []):
+                    if not isinstance(item, dict) or item.get("type") != "input_text":
+                        continue
+                    text = item.get("text")
+                    if not isinstance(text, str) or "<objective>" not in text:
+                        continue
+                    try:
+                        context = ET.fromstring(text.strip())
+                    except ET.ParseError:
+                        continue
+                    if (
+                        context.tag != "codex_internal_context"
+                        or context.get("source") != "goal"
+                    ):
+                        continue
+                    objective = context.findtext("objective")
+                    if objective and objective.strip():
+                        latest = objective.strip()
     except OSError:
         return None
     return latest

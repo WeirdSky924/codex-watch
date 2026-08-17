@@ -481,7 +481,10 @@ codex-watch --safe --no-attach
 
 ### 第三步：创建并运行 Goal
 
-进入 Codex 后，按正常 Codex CLI 流程创建 Goal。watchdog 不负责生成 Goal 内容，只负责在 fatal error 后恢复当前固定 thread。
+进入 Codex 后，按正常 Codex CLI 流程创建 Goal。通常 watchdog 只负责在 fatal
+error 后恢复当前固定 thread。唯一例外是 `Upstream access denied`：旧 thread
+已无法恢复时，watchdog 会从其 rollout 提取上一 Goal Objective，在全新 thread
+中要求 Codex 重新创建该 Goal 并接力。
 
 ## 6. tmux 日常操作
 
@@ -737,7 +740,10 @@ Linger=yes
 
 Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model is at capacity. Please try a different model` 容量告警也按 fatal error 处理。源码、测试、工具输出或普通 Agent 消息中出现没有对应终端标记的相同文本，不会触发重启。
 
-所有识别到的 fatal error 都进入同一个串行恢复状态机：第一次立即恢复固定 thread 并处理 Goal 状态；如果恢复失败并再次出现 fatal，则退出失败进程、等待默认 300 秒，再执行同一恢复流程。后续失败继续每次等待 300 秒，默认次数无限。
+所有识别到的 fatal error 都进入同一个串行恢复状态机：第一次立即恢复并处理 Goal
+状态；如果恢复失败并再次出现 fatal，则退出失败进程、等待默认 300 秒，再执行同一
+恢复流程。后续失败继续每次等待 300 秒，默认次数无限。除 `Upstream access denied`
+会轮换到新 thread 外，其余错误恢复当前固定 thread。
 
 从 `0.1.9` 开始，fatal recovery 要求最近一次可见 Goal 状态是 `Pursuing goal`、`Goal stalled (/goal resume)` 或 `Goal blocked (/goal resume)`。如果 Goal 已经 achieved、没有 Goal、处于 paused 或 usage-limited 状态，watchdog 不会因为 fatal 行重启 Codex，也不会发送 fatal-recovery 续接提示；启动和历史回放阶段的普通 paused Goal 自动恢复逻辑不变。这样可以避免任务完成后的旧错误触发无限重启。blocked 状态本身不是 fatal，不会触发恢复或冷静期；如果 blocked 期间另有新的 fatal error，watchdog 仍会恢复 Codex 进程和固定 thread，但会让 Goal 继续保持 blocked，等待人工处理。单独的 stalled 状态同样不触发恢复；只有出现与 rollout 新 `task_complete` incident 对应的 fatal error 时才恢复进程，并在重启后恢复 stalled Goal。
 
@@ -747,6 +753,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | --- | --- |
 | `codex upstream stalled: no real data for 5m0s` | 切到 compact model，恢复固定 thread，执行 `/compact`，等待真实压缩事件，再切回 primary model 并继续 Goal |
 | Codex context window exhausted | 执行相同的 compact 流程 |
+| HTTP 502 且消息为 `Upstream access denied` | 不再恢复被拒绝的 thread；创建新 thread，提取并重建上一 Goal，再自动更新 tmux 与持久绑定 |
 | HTTP 401（包括 `API DISABLE`）、402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
@@ -783,6 +790,15 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 从 `0.1.13` 开始，`stream disconnected before completion: Our servers are currently overloaded. Please try again later.` 进入统一 fatal recovery；它使用 primary model 重启固定 thread，不执行 Luna compact，后续失败按配置冷静期重试，默认次数无限。
 
 从 `0.1.14` 开始，stalled Goal 中出现新的、与 rollout incident 对应的 fatal error 时也会进入统一恢复流程。用户主动进入 stalled、手工启动 watchdog、历史回放、Codex 更新或已处理 fatal 的重绘都不会自动恢复 stalled Goal；只有该次新 fatal 的进程恢复链会在重启后执行 `/goal resume`。
+
+从 `0.1.16` 开始，`502 Bad Gateway: Upstream access denied` 被视为旧 thread 已被
+上游拒绝。watchdog 会提取该 thread 最近一次 Goal Objective 原文，启动不含旧
+`resume <UUID>` 的全新 Codex thread，并要求它按“最新用户要求 > 当前工作树 >
+唯一 ACTIVE Plan > canonical 项目记录 > handoff 缓存”的顺序重新校准后创建同一
+Goal。handoff 或计划存在滞后时不得覆盖较新的工作树和 ACTIVE 状态。新 thread ID
+会覆盖 tmux 与持久 session 绑定；自动轮换保留恢复次数，因此连续封禁仍遵守首次
+立即、后续默认冷静 300 秒的策略。旧 Goal 若处于 blocked 人工审核态，新 thread
+只恢复 Objective 和上下文，不会借轮换越过审核继续产品执行。
 
 ## 10. 多项目配置示例
 

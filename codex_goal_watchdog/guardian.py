@@ -13,6 +13,7 @@ from .monitor import (
     LAST_RECOVERY_INCIDENT_OPTION,
     PENDING_UPDATE_OPTION,
     _claim_tmux_recovery_incident_id,
+    _set_pending_thread_rotation,
     normalize_terminal_text,
     recovery_incident_for_thread,
     recovery_allowed_for_goal,
@@ -26,6 +27,7 @@ from .recovery import (
     build_recovery_steps,
     classify_recovery_reason,
 )
+from .sessions import find_latest_goal_objective
 from .tmux_control import execute_steps, monitor_pipe_command
 
 
@@ -290,6 +292,8 @@ def run_guardian(
                     return
                 goal_state = recovery_goal_state_on_screen(session)
                 recovery_attempt = _next_recovery_attempt(session)
+                if reason == "upstream_access_denied":
+                    _set_pending_thread_rotation(session, recovery_attempt)
                 _append_log(
                     log_path,
                     "visible recoverable error claimed during guardian handoff: "
@@ -303,6 +307,11 @@ def run_guardian(
                         recovery_attempt=recovery_attempt,
                         resume_goal=goal_state != "blocked",
                         resume_stalled_goal=goal_state == "stalled",
+                        goal_objective=(
+                            find_latest_goal_objective(thread_id=config.thread_id)
+                            if reason == "upstream_access_denied"
+                            else None
+                        ),
                     ),
                 )
 

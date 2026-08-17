@@ -21,6 +21,7 @@ PAUSED_GOAL_PICKER_MARKERS = (
 )
 GOAL_STATE_MARKERS = (
     ("pursuing", "Pursuing goal"),
+    ("pursuing", "Goal active Objective:"),
     ("blocked", "Goal blocked (/goal resume)"),
     ("stalled", "Goal stalled (/goal resume)"),
     ("paused", "Goal paused (/goal resume)"),

@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from codex_goal_watchdog.recovery import (
@@ -88,6 +89,32 @@ class RecoveryControllerTests(unittest.TestCase):
                         f"■ unexpected status {status} Bad Gateway: upstream request failed"
                     ),
                 )
+
+    def test_classifies_upstream_access_denied_as_thread_ban(self):
+        message = (
+            "unexpected status 502 Bad Gateway: Upstream access denied, "
+            "url: http://localhost:54322/responses"
+        )
+
+        self.assertEqual(
+            "upstream_access_denied",
+            classify_recovery_message(message),
+        )
+        self.assertEqual(
+            "upstream_access_denied",
+            classify_recovery_reason(f"■ {message}"),
+        )
+
+    def test_latest_terminal_fatal_wins_for_guardian_screen_recovery(self):
+        screen = (
+            "■ unexpected status 503 Service Unavailable: upstream failed\n"
+            "■ unexpected status 502 Bad Gateway: Upstream access denied\n"
+        )
+
+        self.assertEqual(
+            "upstream_access_denied",
+            classify_recovery_reason(screen),
+        )
 
     def test_classifies_terminal_401_api_disabled(self):
         for message in (
@@ -352,6 +379,61 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertTrue(any("gpt-5.6-sol" in value for value in values))
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
 
+    def test_access_denied_starts_fresh_thread_and_rebuilds_goal(self):
+        old_thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        config = RecoveryConfig(
+            thread_id=old_thread_id,
+            primary_model="gpt-5.6-sol",
+            primary_reasoning_effort="max",
+            codex_args=("--dangerously-bypass-approvals-and-sandbox",),
+            cooldown_seconds=300,
+        )
+        objective = "Goal ID: FE-CREATOR-8\n关闭当前唯一 ACTIVE 计划。"
+
+        first_steps = build_recovery_steps(
+            config,
+            reason="upstream_access_denied",
+            recovery_attempt=1,
+            goal_objective=objective,
+        )
+        retry_steps = build_recovery_steps(
+            config,
+            reason="upstream_access_denied",
+            recovery_attempt=2,
+            goal_objective=objective,
+        )
+
+        self.assertEqual(RecoveryStep("sleep", "0"), first_steps[4])
+        self.assertEqual(RecoveryStep("sleep", "300"), retry_steps[4])
+        fresh_command = first_steps[5].value
+        self.assertIn("gpt-5.6-sol", fresh_command)
+        self.assertNotIn(" resume ", fresh_command)
+        self.assertNotIn(old_thread_id, fresh_command)
+        self.assertEqual("text", first_steps[-1].kind)
+        self.assertIn(
+            json.dumps(objective, ensure_ascii=False),
+            first_steps[-1].value,
+        )
+        self.assertNotIn("\n", first_steps[-1].value)
+        self.assertIn("当前工作树", first_steps[-1].value)
+        self.assertIn("唯一 ACTIVE Plan", first_steps[-1].value)
+        self.assertIn("handoff", first_steps[-1].value)
+
+    def test_access_denied_rotation_preserves_blocked_review_boundary(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+
+        steps = build_recovery_steps(
+            config,
+            reason="upstream_access_denied",
+            resume_goal=False,
+            goal_objective="审核后继续",
+        )
+
+        self.assertIn("blocked", steps[-1].value)
+        self.assertIn("等待用户", steps[-1].value)
+
     def test_blocked_goal_recovery_restarts_process_but_leaves_goal_paused(self):
         config = RecoveryConfig(
             thread_id="550e8400-e29b-41d4-a716-446655440000",
@@ -426,6 +508,7 @@ class RecoveryStepTests(unittest.TestCase):
             "context_window_exhausted",
             "retryable_http_402",
             "retryable_http_502",
+            "upstream_access_denied",
             "retryable_network",
             "retryable_upstream_error",
             "model_at_capacity",

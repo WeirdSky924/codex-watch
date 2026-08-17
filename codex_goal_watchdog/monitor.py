@@ -24,7 +24,11 @@ from .recovery import (
     classify_recovery_message,
     classify_recovery_reason,
 )
-from .sessions import find_active_cli_thread_id, find_latest_task_failure
+from .sessions import (
+    find_active_cli_thread_id,
+    find_latest_goal_objective,
+    find_latest_task_failure,
+)
 from .tmux_control import (
     capture_update_prompt_version,
     execute_steps,
@@ -46,6 +50,7 @@ GOAL_RESUME_STATUS_MARKERS = (
 GOAL_RESUME_RETRY_SECONDS = 10
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
 LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
+PENDING_THREAD_ROTATION_OPTION = "@codex_pending_thread_rotation_count"
 RECOVERABLE_GOAL_STATES = {"pursuing", "blocked", "stalled"}
 
 
@@ -107,6 +112,8 @@ def run_monitor(
     initial_recovery_incident_id: str = "",
     save_recovery_incident_id: Callable[[str], None] | None = None,
     claim_recovery_incident_id: Callable[[str], bool] | None = None,
+    resolve_goal_objective: Callable[[str], str | None] | None = None,
+    mark_thread_rotation: Callable[[int], None] | None = None,
 ) -> None:
     from .recovery import RecoveryController
 
@@ -146,21 +153,36 @@ def run_monitor(
     last_goal_resume_at: float | None = None
     latest_goal_state: str | None = None
     last_recovery_incident_id = initial_recovery_incident_id
+    preserve_recovery_count_on_rebind = False
     for line in lines:
         resolved_thread_id = (
             resolve_thread_id(target) if resolve_thread_id is not None else None
         )
         if resolved_thread_id and resolved_thread_id != config.thread_id:
+            rebind_recovery_count = (
+                controller.recovery_count
+                if preserve_recovery_count_on_rebind
+                else 0
+            )
             config = replace(config, thread_id=resolved_thread_id)
-            controller = RecoveryController(config, initial_recovery_count=0)
+            controller = RecoveryController(
+                config,
+                initial_recovery_count=rebind_recovery_count,
+            )
             rolling_output = ""
             last_goal_resume_at = None
             latest_goal_state = None
             last_recovery_incident_id = ""
             if save_thread_id is not None:
                 save_thread_id(resolved_thread_id)
+            if (
+                preserve_recovery_count_on_rebind
+                and save_recovery_count is not None
+            ):
+                save_recovery_count(rebind_recovery_count)
+            preserve_recovery_count_on_rebind = False
             emit(
-                "[codex-goal-watchdog] rebound thread after /clear: "
+                "[codex-goal-watchdog] rebound active thread: "
                 f"{resolved_thread_id}"
             )
         normalized_line = normalize_terminal_text(line)
@@ -230,6 +252,16 @@ def run_monitor(
             )
             if save_recovery_count is not None:
                 save_recovery_count(controller.recovery_count)
+            goal_objective = (
+                resolve_goal_objective(config.thread_id)
+                if event.reason == "upstream_access_denied"
+                and resolve_goal_objective is not None
+                else None
+            )
+            if event.reason == "upstream_access_denied":
+                preserve_recovery_count_on_rebind = True
+                if mark_thread_rotation is not None:
+                    mark_thread_rotation(controller.recovery_count)
             run_execute(
                 target,
                 build_recovery_steps(
@@ -238,6 +270,7 @@ def run_monitor(
                     recovery_attempt=controller.recovery_count,
                     resume_goal=effective_goal_state != "blocked",
                     resume_stalled_goal=effective_goal_state == "stalled",
+                    goal_objective=goal_objective,
                 ),
             )
             continue
@@ -299,6 +332,56 @@ def _save_tmux_recovery_count(target: str, count: int) -> None:
     )
 
 
+def _pending_thread_rotation_count(target: str) -> int | None:
+    result = subprocess.run(
+        [
+            "tmux",
+            "show-option",
+            "-v",
+            "-t",
+            target,
+            PENDING_THREAD_ROTATION_OPTION,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return max(0, int(result.stdout.strip()))
+    except ValueError:
+        return None
+
+
+def _set_pending_thread_rotation(target: str, count: int) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            PENDING_THREAD_ROTATION_OPTION,
+            str(max(0, count)),
+        ],
+        check=True,
+    )
+
+
+def _clear_pending_thread_rotation(target: str) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-u",
+            "-t",
+            target,
+            PENDING_THREAD_ROTATION_OPTION,
+        ],
+        check=True,
+    )
+
+
 def _tmux_recovery_incident_id(target: str) -> str:
     result = subprocess.run(
         ["tmux", "show-option", "-v", "-t", target, LAST_RECOVERY_INCIDENT_OPTION],
@@ -346,11 +429,16 @@ def _claim_tmux_recovery_incident_id(
 
 
 def _save_tmux_thread_id(target: str, thread_id: str) -> None:
+    pending_rotation_count = _pending_thread_rotation_count(target)
     subprocess.run(
         ["tmux", "set-option", "-t", target, "@codex_thread_id", thread_id],
         check=True,
     )
-    _save_tmux_recovery_count(target, 0)
+    if pending_rotation_count is None:
+        _save_tmux_recovery_count(target, 0)
+    else:
+        _save_tmux_recovery_count(target, pending_rotation_count)
+        _clear_pending_thread_rotation(target)
     pane_identity = _tmux_pane_identity(target)
     if pane_identity is not None:
         _, cwd = pane_identity
@@ -517,5 +605,12 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         initial_recovery_incident_id=initial_incident_id,
         claim_recovery_incident_id=lambda incident_id: (
             _claim_tmux_recovery_incident_id(target, incident_id)
+        ),
+        resolve_goal_objective=lambda thread_id: find_latest_goal_objective(
+            thread_id=thread_id
+        ),
+        mark_thread_rotation=lambda count: _set_pending_thread_rotation(
+            target,
+            count,
         ),
     )

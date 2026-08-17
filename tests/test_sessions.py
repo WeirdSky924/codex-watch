@@ -7,6 +7,7 @@ from pathlib import Path
 from codex_goal_watchdog.sessions import (
     compaction_event_exists_after,
     find_active_cli_thread_id,
+    find_latest_goal_objective,
     find_latest_task_failure,
     find_latest_thread_id,
     find_new_thread_id,
@@ -105,6 +106,49 @@ class SessionResolverTests(unittest.TestCase):
             "unexpected status 503 Service Unavailable",
             failure.message,
         )
+
+    def test_find_latest_goal_objective_reads_structured_goal_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 17, 8, tzinfo=timezone.utc),
+            )
+            contexts = [
+                "<codex_internal_context source=\"goal\">"
+                "<objective>Old goal</objective>"
+                "</codex_internal_context>",
+                "<codex_internal_context source=\"goal\">"
+                "<objective>Goal ID: FE-CREATOR-8\n继续最新计划</objective>"
+                "</codex_internal_context>",
+            ]
+            with path.open("a", encoding="utf-8") as stream:
+                for context in contexts:
+                    stream.write(
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "input_text", "text": context}
+                                    ],
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+
+            objective = find_latest_goal_objective(
+                thread_id=thread_id,
+                sessions_root=root,
+            )
+
+        self.assertEqual("Goal ID: FE-CREATOR-8\n继续最新计划", objective)
 
     def test_find_new_thread_id_uses_session_start_not_file_mtime(self):
         with tempfile.TemporaryDirectory() as temp_dir:

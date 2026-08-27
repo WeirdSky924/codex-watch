@@ -1,9 +1,11 @@
 import unittest
+from pathlib import Path
 
 from codex_goal_watchdog.launcher import (
     build_codex_command,
     normalize_codex_args,
     tmux_new_session_command,
+    tmux_pane_identity,
     tmux_pipe_pane_command,
 )
 
@@ -152,6 +154,19 @@ class LauncherTests(unittest.TestCase):
                 "python3 -m codex_goal_watchdog monitor",
             ],
             command,
+        )
+
+    def test_tmux_pane_identity_parses_pid_and_working_directory(self):
+        class Result:
+            returncode = 0
+            stdout = "1234\t/workspace/project\n"
+
+        self.assertEqual(
+            (1234, Path("/workspace/project")),
+            tmux_pane_identity(
+                "codex-goal",
+                runner=lambda *args, **kwargs: Result(),
+            ),
         )
 
 

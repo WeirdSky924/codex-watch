@@ -4,7 +4,9 @@ from pathlib import Path
 
 from codex_goal_watchdog.bindings import (
     load_session_binding,
+    save_binding_runtime_state,
     save_session_binding,
+    save_thread_handoff,
 )
 
 
@@ -63,6 +65,56 @@ class SessionBindingTests(unittest.TestCase):
                 "550e8400-e29b-41d4-a716-446655440001",
                 project_b.thread_id if project_b else None,
             )
+
+    def test_runtime_counters_survive_binding_rewrite(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            state_root = Path(temporary_dir)
+            save_session_binding(
+                session="project-a",
+                thread_id="550e8400-e29b-41d4-a716-446655440000",
+                cwd=Path("/workspace/project-a"),
+                state_root=state_root,
+                recovery_count=4,
+                successful_compactions=2,
+                verification_pending=True,
+                verification_baseline=9,
+            )
+
+            save_binding_runtime_state(
+                session="project-a",
+                recovery_count=5,
+                successful_compactions=3,
+                verification_pending=True,
+                verification_baseline=10,
+                state_root=state_root,
+            )
+            binding = load_session_binding("project-a", state_root=state_root)
+
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(5, binding.recovery_count)
+        self.assertEqual(3, binding.successful_compactions)
+        self.assertTrue(binding.verification_pending)
+        self.assertEqual(10, binding.verification_baseline)
+
+    def test_thread_handoff_is_bounded_and_private(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            state_root = Path(temporary_dir)
+            handoff = save_thread_handoff(
+                session="project-a",
+                thread_id="550e8400-e29b-41d4-a716-446655440000",
+                cwd=Path("/workspace/project-a"),
+                reason="compaction_timeout",
+                goal_objective="x" * 30_000,
+                telemetry={"rollout_bytes": 42},
+                state_root=state_root,
+            )
+            payload = handoff.read_text(encoding="utf-8")
+            mode = handoff.stat().st_mode & 0o777
+
+        self.assertLess(len(payload), 22_000)
+        self.assertEqual(0o600, mode)
+        self.assertIn("compaction_timeout", payload)
 
 
 if __name__ == "__main__":

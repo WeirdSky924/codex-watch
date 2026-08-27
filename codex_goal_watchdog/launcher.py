@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+from pathlib import Path
 
 
 DANGEROUS_BYPASS_ARG = "--dangerously-bypass-approvals-and-sandbox"
@@ -106,3 +107,30 @@ def tmux_session_exists(session: str, *, runner=subprocess.run) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+def tmux_pane_identity(
+    target: str, *, runner=subprocess.run
+) -> tuple[int, Path] | None:
+    result = runner(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_pid}\t#{pane_current_path}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    pid_text, separator, cwd_text = result.stdout.strip().partition("\t")
+    if not separator or not cwd_text:
+        return None
+    try:
+        return int(pid_text), Path(cwd_text).resolve()
+    except (OSError, ValueError):
+        return None

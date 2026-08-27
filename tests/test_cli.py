@@ -346,6 +346,58 @@ class ConsoleEntrypointTests(unittest.TestCase):
         )
         self.assertNotIn(" resume ", new_session_line)
 
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_start_preserves_persisted_runtime_counters(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        run_mock,
+        _handle_goal_prompt_mock,
+        _save_binding_mock,
+    ):
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            cwd=Path.cwd().resolve(),
+            recovery_count=4,
+            successful_compactions=2,
+        )
+
+        result = main(["start", "--session", "project-a", "--no-attach"])
+
+        self.assertEqual(0, result)
+        option_calls = [
+            call.args[0]
+            for call in run_mock.call_args_list
+            if call.args and call.args[0][:3] == ["tmux", "set-option", "-t"]
+        ]
+        self.assertIn(
+            [
+                "tmux",
+                "set-option",
+                "-t",
+                "project-a",
+                "@codex_recovery_count",
+                "4",
+            ],
+            option_calls,
+        )
+        self.assertIn(
+            [
+                "tmux",
+                "set-option",
+                "-t",
+                "project-a",
+                "@codex_successful_compactions",
+                "2",
+            ],
+            option_calls,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

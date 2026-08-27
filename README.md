@@ -304,7 +304,7 @@ codex-watch \
 
 ### 配置保存在哪里
 
-watchdog 会把模型、effort、恢复次数和续接提示保存在当前 tmux session 的 `@codex_*` 选项中。这些运行态选项会在 tmux 消失后一起消失。
+watchdog 会把模型、effort、阈值和续接提示保存在当前 tmux session 的 `@codex_*` 选项中。这些配置选项会在 tmux 消失后一起消失。恢复次数、成功 compact 次数和等待成功确认的状态另外写入持久 binding，因此 guardian/monitor 重连和 tmux 重启不会把恢复计数重置为 0。
 
 固定 thread ID 还会按 `--session` 名称持久保存到：
 
@@ -404,6 +404,52 @@ codex-watch --safe --compact-wait-seconds 600
 ```
 
 该数值是超时上限，不是固定睡眠时间。
+
+### 长会话健康阈值与自动轮换
+
+watchdog 会在本机 monitor 内部读取固定 thread 的 rollout 增量，不会让
+Codex 模型每隔 30 秒执行一次 `ps`、`tail` 或其他状态轮询。默认阈值为：
+
+```text
+thread max compactions:       3
+thread max rollout bytes:     134217728 (128 MiB)
+thread max context tokens:    850000
+thread no-progress tokens:    1000000
+thread no-event seconds:      1800 (30 分钟)
+thread health poll seconds:   30
+```
+
+阈值只对 `Pursuing`、`Goal stalled` 和 `Goal blocked` 生效；没有 Goal、普通
+paused Goal 或已完成 Goal 不会因为历史体积触发轮换。达到任一阈值时，watchdog
+会把最近的 Goal Objective 和有限遥测写入私有状态目录的 handoff 文件，然后
+退出旧 Codex、启动不带旧 thread ID 的新 Codex thread，并要求新 thread 先按
+当前工作树、ACTIVE Plan 和 canonical 记录校准，再创建同一 Goal。旧 thread
+不会被删除，rollout 也不会被修改。
+
+compact 等待超过 `--compact-wait-seconds` 时，流程会把它视为压缩失败，写入
+`compaction_timeout` handoff 并走同一套新 thread 轮换；不会无限等待，也不会
+反复让模型执行状态查询。
+
+恢复次数与成功 compact 次数保存在 watchdog session binding 中。guardian 接管、
+monitor 重挂或 tmux 重启都不会清零；只有检测到新的成功 `task_complete`、成功
+`context_compacted` 或新 thread 已完成可验证接力后才会清零。`--max-recoveries 0`
+仍表示无限恢复，长会话健康轮换不会改变这一设置。
+
+可按项目调整阈值：
+
+```bash
+codex-watch --safe \
+  --thread-max-compactions 3 \
+  --thread-max-rollout-bytes 134217728 \
+  --thread-max-context-tokens 850000 \
+  --thread-no-progress-tokens 1000000 \
+  --thread-no-event-seconds 1800 \
+  --thread-health-poll-seconds 30
+```
+
+将某个阈值设为 `0` 或负数可关闭该项检查。阈值检查是本地 watchdog 行为，
+不是 Codex 的上下文窗口配置；Codex 的 `model_context_window` 和自动 compact
+触发值仍由 Codex 自身配置决定。
 
 ### 自定义日志路径
 
@@ -1104,6 +1150,12 @@ sha256sum -c SHA256SUMS
 --cooldown-seconds N               首次恢复失败后再次重试前的等待秒数，默认 300
 --max-recoveries N                 最大恢复次数，0 表示无限
 --compact-wait-seconds N           等待真实压缩事件的超时
+--thread-max-compactions N         当前 thread 最大成功压缩次数，默认 3
+--thread-max-rollout-bytes N       rollout 最大字节数，默认 128 MiB
+--thread-max-context-tokens N      单次上下文 token 阈值，默认 850000
+--thread-no-progress-tokens N      无成功进展时允许增长的 token 数，默认 1000000
+--thread-no-event-seconds N        无 rollout 事件阈值，默认 1800
+--thread-health-poll-seconds N     本地健康检查间隔，默认 30
 --resume-prompt TEXT               没有 Goal 状态时使用的续接文本
 --log-path PATH                    覆盖默认日志文件
 --dry-run                          只打印将执行的 tmux/Codex 命令

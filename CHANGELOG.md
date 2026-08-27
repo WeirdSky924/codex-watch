@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.17] - 2026-08-27
+
+### Added
+
+- Persist recovery counters and successful compaction counts in the watchdog
+  session binding so monitor and guardian reconnects cannot reset retry state.
+- Track rollout size, context usage, compaction count, no-progress tokens, and
+  no-event duration locally without asking the Codex model to poll status.
+- Write a bounded private handoff and rotate to a fresh Codex thread when a
+  long-running thread crosses a health threshold or compaction waits time out.
+
+### Changed
+
+- Reset recovery counters only after a new verified successful task completion
+  or successful context compaction; `--max-recoveries 0` remains unlimited.
+- Aggregate repeated redraws of one rollout incident into one first log line
+  and one suppressed-count summary.
+
 ## [0.1.16] - 2026-08-17
 
 ### Added

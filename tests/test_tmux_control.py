@@ -594,6 +594,33 @@ class TmuxControlTests(unittest.TestCase):
         self.assertIn("--max-recoveries 0", command)
         self.assertIn(">> '/tmp/codex watchdog.log' 2>&1", command)
 
+    def test_monitor_pipe_command_includes_thread_health_thresholds(self):
+        command = monitor_pipe_command(
+            root_dir="/opt/codex-goal-watchdog",
+            session="codex-goal",
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            primary_model="gpt-5.6-sol",
+            primary_reasoning_effort="max",
+            compact_model="gpt-5.6-luna",
+            compact_reasoning_effort="xhigh",
+            codex_args=[],
+            resume_prompt="continue",
+            log_path="/tmp/watchdog.log",
+            thread_max_compactions=3,
+            thread_max_rollout_bytes=1234,
+            thread_max_context_tokens=5678,
+            thread_no_progress_tokens=9012,
+            thread_no_event_seconds=3456,
+            thread_health_poll_seconds=78,
+        )
+
+        self.assertIn("--thread-max-compactions 3", command)
+        self.assertIn("--thread-max-rollout-bytes 1234", command)
+        self.assertIn("--thread-max-context-tokens 5678", command)
+        self.assertIn("--thread-no-progress-tokens 9012", command)
+        self.assertIn("--thread-no-event-seconds 3456", command)
+        self.assertIn("--thread-health-poll-seconds 78", command)
+
 
 if __name__ == "__main__":
     unittest.main()

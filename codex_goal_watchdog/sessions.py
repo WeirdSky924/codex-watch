@@ -33,6 +33,26 @@ class TaskFailure:
     codex_error_info: str | None
 
 
+@dataclass(frozen=True)
+class ThreadTelemetry:
+    thread_id: str
+    rollout_path: Path
+    rollout_bytes: int
+    total_tokens: int
+    context_tokens: int
+    context_window: int
+    compaction_count: int
+    tokens_at_last_progress: int
+    last_event_at: float
+    last_progress_at: float
+    verified_event_count: int = 0
+    progress_event_count: int = 0
+    latest_failure: TaskFailure | None = None
+
+
+VERIFIED_GOAL_STATES = {"achieved", "complete", "completed"}
+
+
 def validate_thread_id(value: str) -> str:
     try:
         return str(UUID(value))
@@ -235,6 +255,179 @@ def find_thread_rollout_path(
         if record.thread_id == normalized:
             return record.path
     return None
+
+
+def _nonnegative_int(value: object) -> int:
+    return max(0, value) if type(value) is int else 0
+
+
+def _event_epoch(event: dict, *, fallback: float) -> float:
+    timestamp = event.get("timestamp")
+    if not isinstance(timestamp, str):
+        return fallback
+    try:
+        return _parse_timestamp(timestamp).timestamp()
+    except (TypeError, ValueError):
+        return fallback
+
+
+class ThreadTelemetryTracker:
+    """Incrementally summarize one rollout without rescanning it on every tick."""
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        sessions_root: Path = DEFAULT_SESSIONS_ROOT,
+    ) -> None:
+        self.thread_id = validate_thread_id(thread_id)
+        self.sessions_root = sessions_root
+        self._path: Path | None = None
+        self._offset = 0
+        self._partial_line_start: int | None = None
+        self._reset_metrics()
+
+    def _reset_metrics(self) -> None:
+        self.total_tokens = 0
+        self.context_tokens = 0
+        self.context_window = 0
+        self.compaction_count = 0
+        self.tokens_at_last_progress = 0
+        self.last_event_at = 0.0
+        self.last_progress_at = 0.0
+        self._progress_pending = False
+        self.verified_event_count = 0
+        self.progress_event_count = 0
+        self.latest_failure: TaskFailure | None = None
+
+    def _consume_event(self, event: dict, *, fallback_time: float) -> None:
+        observed_at = _event_epoch(event, fallback=fallback_time)
+        self.last_event_at = max(self.last_event_at, observed_at)
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        payload_type = payload.get("type")
+
+        compacted = event.get("type") == "compacted" or (
+            payload_type == "context_compacted"
+        )
+        if compacted:
+            self.compaction_count += 1
+
+        successful_task = payload_type == "task_complete" and not isinstance(
+            payload.get("error"), dict
+        )
+        is_progress = compacted or successful_task
+        goal = payload.get("goal")
+        goal = goal if isinstance(goal, dict) else {}
+        is_verified_state = is_progress or (
+            payload_type == "thread_goal_updated"
+            and goal.get("status") in VERIFIED_GOAL_STATES
+        )
+        if is_verified_state:
+            self.verified_event_count += 1
+        if is_progress:
+            self.progress_event_count += 1
+            self.last_progress_at = max(self.last_progress_at, observed_at)
+            self.tokens_at_last_progress = self.total_tokens
+            self._progress_pending = True
+
+        if payload_type == "task_complete":
+            error = payload.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                incident_id = payload.get("turn_id") or event.get("timestamp")
+                if isinstance(incident_id, str) and incident_id:
+                    error_info = error.get("codex_error_info")
+                    self.latest_failure = TaskFailure(
+                        incident_id=incident_id,
+                        message=error["message"],
+                        codex_error_info=(
+                            error_info if isinstance(error_info, str) else None
+                        ),
+                    )
+
+        if payload_type != "token_count":
+            return
+        info = payload.get("info")
+        info = info if isinstance(info, dict) else {}
+        total_usage = info.get("total_token_usage")
+        total_usage = total_usage if isinstance(total_usage, dict) else {}
+        last_usage = info.get("last_token_usage")
+        last_usage = last_usage if isinstance(last_usage, dict) else {}
+        self.total_tokens = _nonnegative_int(total_usage.get("total_tokens"))
+        self.context_tokens = _nonnegative_int(last_usage.get("total_tokens"))
+        self.context_window = _nonnegative_int(info.get("model_context_window"))
+        if self._progress_pending:
+            self.tokens_at_last_progress = self.total_tokens
+            self._progress_pending = False
+
+    def snapshot(self) -> ThreadTelemetry | None:
+        path = self._path
+        if path is None or not path.exists():
+            path = find_thread_rollout_path(
+                thread_id=self.thread_id,
+                sessions_root=self.sessions_root,
+            )
+            if path is None:
+                return None
+            self._path = path
+            self._offset = 0
+            self._reset_metrics()
+
+        try:
+            file_stat = path.stat()
+            if file_stat.st_size < self._offset:
+                self._offset = 0
+                self._partial_line_start = None
+                self._reset_metrics()
+            with path.open("r", encoding="utf-8") as stream:
+                stream.seek(self._offset)
+                while True:
+                    line_start = stream.tell()
+                    line = stream.readline()
+                    if not line:
+                        break
+                    if not line.endswith("\n"):
+                        self._partial_line_start = line_start
+                        break
+                    self._partial_line_start = None
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        self._consume_event(
+                            event,
+                            fallback_time=file_stat.st_mtime,
+                        )
+                self._offset = (
+                    self._partial_line_start
+                    if self._partial_line_start is not None
+                    else stream.tell()
+                )
+            file_stat = path.stat()
+        except OSError:
+            return None
+
+        if self.last_event_at == 0:
+            self.last_event_at = file_stat.st_mtime
+        if self.last_progress_at == 0:
+            self.last_progress_at = self.last_event_at
+            self.tokens_at_last_progress = self.total_tokens
+        return ThreadTelemetry(
+            thread_id=self.thread_id,
+            rollout_path=path,
+            rollout_bytes=file_stat.st_size,
+            total_tokens=self.total_tokens,
+            context_tokens=self.context_tokens,
+            context_window=self.context_window,
+            compaction_count=self.compaction_count,
+            tokens_at_last_progress=self.tokens_at_last_progress,
+            last_event_at=self.last_event_at,
+            last_progress_at=self.last_progress_at,
+            verified_event_count=self.verified_event_count,
+            progress_event_count=self.progress_event_count,
+            latest_failure=self.latest_failure,
+        )
 
 
 def find_latest_task_failure(

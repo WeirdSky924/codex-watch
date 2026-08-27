@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .launcher import build_codex_command
@@ -24,6 +25,11 @@ SERVERS_OVERLOADED_PATTERN = (
     "Our servers are currently overloaded. Please try again later."
 )
 UPSTREAM_ACCESS_DENIED_PATTERN = "Upstream access denied"
+THREAD_HEALTH_ROTATION_REASON = "thread_health_rotation"
+THREAD_ROTATION_RECOVERY_REASONS = {
+    "upstream_access_denied",
+    THREAD_HEALTH_ROTATION_REASON,
+}
 COMPACTION_RECOVERY_REASONS = {
     "codex_upstream_stalled",
     "context_window_exhausted",
@@ -38,6 +44,8 @@ def build_thread_rotation_prompt(
     goal_objective: str | None,
     *,
     resume_goal: bool,
+    rotation_reason: str = "upstream_access_denied",
+    handoff_path: str | None = None,
 ) -> str:
     objective = goal_objective or (
         "未能从旧 thread 的 rollout 提取 Goal Objective。请从最新工作树、"
@@ -50,9 +58,21 @@ def build_thread_rotation_prompt(
         else "上一 Goal 可继续执行；完成状态校准后从最新可执行入口接力推进。"
     )
     encoded_objective = json.dumps(objective, ensure_ascii=False)
+    reason_text = (
+        "upstream access denied 被上游隔离"
+        if rotation_reason == "upstream_access_denied"
+        else f"watchdog thread-health 阈值触发（{rotation_reason}）"
+    )
+    handoff_instruction = (
+        "watchdog 已生成主机本地 bounded handoff，必须先读取并与更高优先级证据"
+        f"核对：{json.dumps(handoff_path, ensure_ascii=False)}。"
+        if handoff_path
+        else ""
+    )
     return (
-        "上一 Codex thread 因 upstream access denied 被上游隔离，禁止恢复或重试"
+        f"上一 Codex thread 因 {reason_text}，禁止恢复或重试"
         "旧 thread。请创建一个不设置 token budget 的新 Goal，并持续接力执行。"
+        f"{handoff_instruction}"
         "上一 Goal Objective 原文采用 JSON 字符串无损编码，解码后原样使用："
         f"{encoded_objective}。"
         "恢复前必须重新核对状态，优先级为：最新用户要求 > 当前工作树 > 唯一 "
@@ -160,6 +180,12 @@ class RecoveryConfig:
     model_switch_delay_seconds: int = 2
     compact_wait_seconds: int = 600
     resume_prompt: str = DEFAULT_RESUME_PROMPT
+    thread_max_compactions: int = 3
+    thread_max_rollout_bytes: int = 128 * 1024 * 1024
+    thread_max_context_tokens: int = 850_000
+    thread_no_progress_tokens: int = 1_000_000
+    thread_no_event_seconds: int = 30 * 60
+    thread_health_poll_seconds: int = 30
 
 
 @dataclass(frozen=True)
@@ -174,6 +200,33 @@ class RecoveryStep:
     kind: str
     value: str
     timeout_seconds: float | None = None
+
+
+class IncidentLogAggregator:
+    """Emit the first duplicate incident and one bounded count summary."""
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self.emit = emit
+        self.key: str | None = None
+        self.summary = ""
+        self.count = 0
+
+    def record(self, *, key: str, first: str, summary: str) -> None:
+        if self.key != key:
+            self.flush()
+            self.key = key
+            self.summary = summary
+            self.count = 1
+            self.emit(first)
+            return
+        self.count += 1
+
+    def flush(self) -> None:
+        if self.key is not None and self.count > 1:
+            self.emit(f"{self.summary}; suppressed={self.count - 1}")
+        self.key = None
+        self.summary = ""
+        self.count = 0
 
 
 class RecoveryController:
@@ -194,6 +247,9 @@ class RecoveryController:
             reason = "codex_upstream_stalled"
         if reason is None:
             return None
+        return self.begin(reason=reason, now=now, line=line)
+
+    def begin(self, *, reason: str, now: float, line: str = "") -> RecoveryEvent | None:
         if (
             self.config.max_recoveries > 0
             and self.recovery_count >= self.config.max_recoveries
@@ -205,6 +261,52 @@ class RecoveryController:
             observed_at=now,
             line=line,
         )
+
+    def reset_after_verified_success(self) -> None:
+        self.recovery_count = 0
+
+
+def thread_rotation_reason(
+    config: RecoveryConfig,
+    *,
+    compaction_count: int,
+    rollout_bytes: int,
+    context_tokens: int,
+    total_tokens: int,
+    tokens_at_last_progress: int,
+    last_event_age_seconds: float,
+) -> str | None:
+    checks = (
+        (
+            config.thread_max_compactions,
+            compaction_count,
+            "max_compactions",
+        ),
+        (
+            config.thread_max_rollout_bytes,
+            rollout_bytes,
+            "max_rollout_bytes",
+        ),
+        (
+            config.thread_max_context_tokens,
+            context_tokens,
+            "max_context_tokens",
+        ),
+        (
+            config.thread_no_progress_tokens,
+            max(0, total_tokens - tokens_at_last_progress),
+            "no_progress_tokens",
+        ),
+        (
+            config.thread_no_event_seconds,
+            last_event_age_seconds,
+            "no_rollout_events",
+        ),
+    )
+    for threshold, actual, reason in checks:
+        if threshold > 0 and actual >= threshold:
+            return reason
+    return None
 
 
 def build_startup_update_steps(
@@ -308,6 +410,8 @@ def build_recovery_steps(
     resume_goal: bool = True,
     resume_stalled_goal: bool = False,
     goal_objective: str | None = None,
+    handoff_path: str | None = None,
+    rotation_detail: str | None = None,
 ) -> list[RecoveryStep]:
     """Build tmux actions for model fallback, compaction, and resume."""
     if not config.thread_id:
@@ -329,7 +433,7 @@ def build_recovery_steps(
             resume_thread_id=config.thread_id,
         )
     )
-    if reason == "upstream_access_denied":
+    if reason in THREAD_ROTATION_RECOVERY_REASONS:
         fresh_command = shlex.join(
             build_codex_command(
                 model=config.primary_model,
@@ -351,6 +455,10 @@ def build_recovery_steps(
                 build_thread_rotation_prompt(
                     goal_objective,
                     resume_goal=resume_goal,
+                    rotation_reason=(
+                        rotation_detail or reason
+                    ),
+                    handoff_path=handoff_path,
                 ),
             ),
         ]

@@ -11,6 +11,7 @@ from codex_goal_watchdog.recovery import (
     build_startup_update_steps,
     classify_recovery_message,
     classify_recovery_reason,
+    thread_rotation_reason,
 )
 
 
@@ -575,6 +576,60 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertEqual("wait_compaction", steps[11].kind)
         self.assertEqual(600, steps[11].timeout_seconds)
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
+
+    def test_thread_health_thresholds_request_rotation(self):
+        config = RecoveryConfig(
+            thread_max_compactions=3,
+            thread_max_rollout_bytes=1_000,
+            thread_max_context_tokens=800,
+            thread_no_progress_tokens=500,
+            thread_no_event_seconds=120,
+        )
+
+        cases = (
+            ({"compaction_count": 3}, "max_compactions"),
+            ({"rollout_bytes": 1_000}, "max_rollout_bytes"),
+            ({"context_tokens": 800}, "max_context_tokens"),
+            (
+                {"total_tokens": 1_500, "tokens_at_last_progress": 1_000},
+                "no_progress_tokens",
+            ),
+            ({"last_event_age_seconds": 120}, "no_rollout_events"),
+        )
+        defaults = {
+            "compaction_count": 0,
+            "rollout_bytes": 0,
+            "context_tokens": 0,
+            "total_tokens": 0,
+            "tokens_at_last_progress": 0,
+            "last_event_age_seconds": 0,
+        }
+
+        for values, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    expected,
+                    thread_rotation_reason(config, **(defaults | values)),
+                )
+
+    def test_thread_health_rotation_starts_fresh_thread_with_handoff(self):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        config = RecoveryConfig(thread_id=thread_id)
+
+        steps = build_recovery_steps(
+            config,
+            reason="thread_health_rotation",
+            goal_objective="Goal ID: FE-CREATOR-8",
+            handoff_path="/state/handoffs/codex-goal.json",
+            rotation_detail="max_rollout_bytes",
+        )
+        values = [step.value for step in steps]
+
+        self.assertFalse(any(f"resume {thread_id}" in value for value in values))
+        self.assertNotIn("/compact", values)
+        self.assertIn("/state/handoffs/codex-goal.json", values[-1])
+        self.assertIn("max_rollout_bytes", values[-1])
+        self.assertIn("Goal ID: FE-CREATOR-8", values[-1])
 
 
 if __name__ == "__main__":

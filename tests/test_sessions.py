@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from codex_goal_watchdog.sessions import (
+    ThreadTelemetryTracker,
     compaction_event_exists_after,
     find_active_cli_thread_id,
     find_latest_goal_objective,
@@ -311,6 +312,162 @@ class SessionResolverTests(unittest.TestCase):
 
         self.assertEqual("550e8400-e29b-41d4-a716-446655440000", thread_id)
         self.assertEqual([True], callback_calls)
+
+    def test_thread_telemetry_tracks_context_compaction_and_progress_tokens(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            events = [
+                {
+                    "timestamp": "2026-08-27T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"total_tokens": 100},
+                            "last_token_usage": {"total_tokens": 80},
+                            "model_context_window": 1_000,
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-08-27T08:02:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "item_completed"},
+                },
+                {
+                    "timestamp": "2026-08-27T08:02:01Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"total_tokens": 450},
+                            "last_token_usage": {"total_tokens": 300},
+                            "model_context_window": 1_000,
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-08-27T08:03:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "context_compacted"},
+                },
+                {
+                    "timestamp": "2026-08-27T08:03:01Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"total_tokens": 700},
+                            "last_token_usage": {"total_tokens": 220},
+                            "model_context_window": 1_000,
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-08-27T08:04:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"total_tokens": 950},
+                            "last_token_usage": {"total_tokens": 240},
+                            "model_context_window": 1_000,
+                        },
+                    },
+                },
+            ]
+            with path.open("a", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            ).snapshot()
+            rollout_bytes = path.stat().st_size
+
+        self.assertIsNotNone(telemetry)
+        assert telemetry is not None
+        self.assertEqual(950, telemetry.total_tokens)
+        self.assertEqual(240, telemetry.context_tokens)
+        self.assertEqual(1_000, telemetry.context_window)
+        self.assertEqual(1, telemetry.compaction_count)
+        self.assertEqual(700, telemetry.tokens_at_last_progress)
+        self.assertEqual(rollout_bytes, telemetry.rollout_bytes)
+
+    def test_thread_telemetry_retries_an_incomplete_final_json_line(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            tracker = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            )
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    '{"timestamp":"2026-08-27T08:01:00Z",'
+                    '"type":"event_msg","payload":{"type":"context_compacted"}}'
+                )
+            first = tracker.snapshot()
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write("\n")
+            second = tracker.snapshot()
+
+        assert first is not None
+        assert second is not None
+        self.assertEqual(0, first.compaction_count)
+        self.assertEqual(1, second.compaction_count)
+
+    def test_thread_telemetry_exposes_latest_failure_incrementally(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-08-27T08:01:00Z",
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "task_complete",
+                                "turn_id": "turn-503",
+                                "error": {
+                                    "message": "unexpected status 503 Service Unavailable",
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            ).snapshot()
+
+        assert telemetry is not None
+        assert telemetry.latest_failure is not None
+        self.assertEqual("turn-503", telemetry.latest_failure.incident_id)
+        self.assertIn("503", telemetry.latest_failure.message)
 
 
 if __name__ == "__main__":

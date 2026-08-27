@@ -33,14 +33,19 @@ class GuardianTests(unittest.TestCase):
 
     def test_next_recovery_attempt_persists_tmux_count(self):
         calls = []
+        persisted = []
 
         attempt = _next_recovery_attempt(
             "codex-goal",
             option_getter=lambda session, name, default="": "1",
             runner=lambda command, **kwargs: calls.append(command),
+            persist_count=lambda session, count: persisted.append(
+                (session, count)
+            ),
         )
 
         self.assertEqual(2, attempt)
+        self.assertEqual([("codex-goal", 2)], persisted)
         self.assertEqual(
             [
                 [
@@ -195,6 +200,29 @@ class GuardianTests(unittest.TestCase):
 
         self.assertEqual(45, config.cooldown_seconds)
         self.assertEqual(7, config.max_recoveries)
+
+    def test_recovery_config_restores_thread_health_policy(self):
+        options = {
+            "@codex_thread_id": "550e8400-e29b-41d4-a716-446655440000",
+            "@codex_thread_max_compactions": "4",
+            "@codex_thread_max_rollout_bytes": "1234",
+            "@codex_thread_max_context_tokens": "5678",
+            "@codex_thread_no_progress_tokens": "9012",
+            "@codex_thread_no_event_seconds": "3456",
+            "@codex_thread_health_poll_seconds": "78",
+        }
+
+        config = _recovery_config(
+            "codex-goal",
+            option_getter=lambda session, name, default="": options.get(name, default),
+        )
+
+        self.assertEqual(4, config.thread_max_compactions)
+        self.assertEqual(1234, config.thread_max_rollout_bytes)
+        self.assertEqual(5678, config.thread_max_context_tokens)
+        self.assertEqual(9012, config.thread_no_progress_tokens)
+        self.assertEqual(3456, config.thread_no_event_seconds)
+        self.assertEqual(78, config.thread_health_poll_seconds)
 
     def test_visible_recovery_requires_active_or_blocked_goal(self):
         def runner(command, **kwargs):

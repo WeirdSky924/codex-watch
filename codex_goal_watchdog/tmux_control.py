@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import fcntl
+import hashlib
 import re
 import shlex
 import subprocess
@@ -10,7 +12,14 @@ import sys
 import time
 from pathlib import Path
 
-from .recovery import RecoveryStep
+from .bindings import save_binding_runtime_state
+from .paths import state_dir
+from .recovery import (
+    RecoveryConfig,
+    RecoveryStep,
+    build_codex_update_completion_steps,
+    build_codex_update_steps,
+)
 from .sessions import compaction_event_exists_after, find_thread_rollout_path
 
 
@@ -38,6 +47,175 @@ CODEX_VERSION_RE = re.compile(
     r"\b(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b"
 )
 TEXT_SUBMIT_SETTLE_SECONDS = 0.5
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b\x07]*(?:\x07|\x1b\\)|[@-_])"
+)
+PENDING_UPDATE_OPTION = "@codex_pending_update_version"
+PENDING_THREAD_ROTATION_OPTION = "@codex_pending_thread_rotation_count"
+SUCCESSFUL_COMPACTIONS_OPTION = "@codex_successful_compactions"
+LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
+
+
+def normalize_terminal_text(value: str) -> str:
+    """Remove terminal control sequences and normalize visual line wrapping."""
+    return " ".join(ANSI_ESCAPE_RE.sub("", value).split())
+
+
+def tmux_recovery_count(target: str) -> int:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, "@codex_recovery_count"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        return max(0, int(result.stdout.strip())) if result.returncode == 0 else 0
+    except ValueError:
+        return 0
+
+
+def save_tmux_recovery_count(target: str, count: int) -> None:
+    normalized_count = max(0, count)
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            "@codex_recovery_count",
+            str(normalized_count),
+        ],
+        check=True,
+    )
+    save_binding_runtime_state(
+        session=target,
+        recovery_count=normalized_count,
+        successful_compactions=tmux_successful_compactions(target),
+    )
+
+
+def tmux_successful_compactions(target: str) -> int:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, SUCCESSFUL_COMPACTIONS_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        return max(0, int(result.stdout.strip())) if result.returncode == 0 else 0
+    except ValueError:
+        return 0
+
+
+def save_tmux_successful_compactions(target: str, count: int) -> None:
+    normalized_count = max(0, count)
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            SUCCESSFUL_COMPACTIONS_OPTION,
+            str(normalized_count),
+        ],
+        check=True,
+    )
+    save_binding_runtime_state(
+        session=target,
+        recovery_count=tmux_recovery_count(target),
+        successful_compactions=normalized_count,
+    )
+
+
+def pending_thread_rotation_count(target: str) -> int | None:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, PENDING_THREAD_ROTATION_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return max(0, int(result.stdout.strip()))
+    except ValueError:
+        return None
+
+
+def set_pending_thread_rotation(target: str, count: int) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            PENDING_THREAD_ROTATION_OPTION,
+            str(max(0, count)),
+        ],
+        check=True,
+    )
+
+
+def clear_pending_thread_rotation(target: str) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-u",
+            "-t",
+            target,
+            PENDING_THREAD_ROTATION_OPTION,
+        ],
+        check=True,
+    )
+
+
+def tmux_recovery_incident_id(target: str) -> str:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, LAST_RECOVERY_INCIDENT_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def save_tmux_recovery_incident_id(target: str, incident_id: str) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            LAST_RECOVERY_INCIDENT_OPTION,
+            incident_id,
+        ],
+        check=True,
+    )
+
+
+def claim_tmux_recovery_incident_id(
+    target: str,
+    incident_id: str,
+    *,
+    option_getter=None,
+    option_saver=None,
+    lock_path: Path | None = None,
+) -> bool:
+    option_getter = option_getter or tmux_recovery_incident_id
+    option_saver = option_saver or save_tmux_recovery_incident_id
+    if lock_path is None:
+        lock_root = state_dir()
+        lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_root.chmod(0o700)
+        session_key = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+        lock_path = lock_root / f"recovery-incident-{session_key}.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        if option_getter(target) == incident_id:
+            return False
+        option_saver(target, incident_id)
+        return True
 
 
 def paused_goal_picker_visible(text: str) -> bool:
@@ -256,6 +434,19 @@ def wait_for_pane_state(
         sleeper(0.25)
 
 
+def pane_codex_running(target: str, *, runner=subprocess.run) -> bool:
+    try:
+        wait_for_pane_state(
+            target,
+            state="codex",
+            timeout_seconds=0,
+            runner=runner,
+        )
+    except (OSError, RuntimeError, TimeoutError, ValueError):
+        return False
+    return True
+
+
 def handle_goal_prompt(
     target: str,
     *,
@@ -431,6 +622,99 @@ def execute_steps(
             runner(command, check=True)
 
 
+def pending_update_version(target: str) -> str:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, PENDING_UPDATE_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def set_pending_update_version(target: str, version: str) -> None:
+    subprocess.run(
+        ["tmux", "set-option", "-t", target, PENDING_UPDATE_OPTION, version],
+        check=True,
+    )
+
+
+def clear_pending_update_version(target: str) -> None:
+    subprocess.run(
+        ["tmux", "set-option", "-u", "-t", target, PENDING_UPDATE_OPTION],
+        check=True,
+    )
+
+
+def run_codex_update(
+    target: str,
+    config: RecoveryConfig,
+    expected_version: str,
+    *,
+    resume_goal: bool = True,
+) -> None:
+    set_pending_update_version(target, expected_version)
+    execute_steps(
+        target,
+        build_codex_update_steps(
+            config,
+            expected_version,
+            resume_goal=resume_goal,
+        ),
+    )
+    clear_pending_update_version(target)
+
+
+def resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
+    current_goal_state = recovery_goal_state_on_screen(target)
+    visible_version = capture_update_prompt_version(target)
+    if visible_version is not None:
+        print(
+            "[codex-goal-watchdog] installing visible Codex update: "
+            f"target={visible_version}",
+            flush=True,
+        )
+        run_codex_update(
+            target,
+            config,
+            visible_version,
+            resume_goal=current_goal_state not in {"blocked", "stalled"},
+        )
+        return
+
+    pending_version = pending_update_version(target)
+    if not pending_version:
+        return
+    print(
+        "[codex-goal-watchdog] completing interrupted Codex update: "
+        f"target={pending_version}",
+        flush=True,
+    )
+    execute_steps(
+        target,
+        build_codex_update_completion_steps(
+            config,
+            pending_version,
+            resume_goal=current_goal_state not in {"blocked", "stalled"},
+        ),
+    )
+    clear_pending_update_version(target)
+
+
+def recovery_goal_state_on_screen(
+    target: str, *, runner=subprocess.run
+) -> str | None:
+    result = runner(
+        ["tmux", "capture-pane", "-p", "-t", target],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return goal_state_from_text(normalize_terminal_text(result.stdout))
+
+
 def monitor_pipe_command(
     *,
     root_dir: str,
@@ -446,7 +730,13 @@ def monitor_pipe_command(
     log_path: str,
     cooldown_seconds: int = 300,
     max_recoveries: int = 0,
-    compact_wait_seconds: int = 120,
+    compact_wait_seconds: int = 600,
+    thread_max_compactions: int = 3,
+    thread_max_rollout_bytes: int = 128 * 1024 * 1024,
+    thread_max_context_tokens: int = 850_000,
+    thread_no_progress_tokens: int = 1_000_000,
+    thread_no_event_seconds: int = 30 * 60,
+    thread_health_poll_seconds: int = 30,
 ) -> str:
     root = str(Path(root_dir).resolve())
     parts = [
@@ -477,6 +767,18 @@ def monitor_pipe_command(
         str(max_recoveries),
         "--compact-wait-seconds",
         str(compact_wait_seconds),
+        "--thread-max-compactions",
+        str(thread_max_compactions),
+        "--thread-max-rollout-bytes",
+        str(thread_max_rollout_bytes),
+        "--thread-max-context-tokens",
+        str(thread_max_context_tokens),
+        "--thread-no-progress-tokens",
+        str(thread_no_progress_tokens),
+        "--thread-no-event-seconds",
+        str(thread_no_event_seconds),
+        "--thread-health-poll-seconds",
+        str(thread_health_poll_seconds),
     ]
     command = shlex.join(parts)
     return f"{command} >> {shlex.quote(log_path)} 2>&1"

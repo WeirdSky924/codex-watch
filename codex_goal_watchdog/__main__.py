@@ -103,6 +103,14 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--cooldown-seconds", type=int, default=300)
     start.add_argument("--max-recoveries", type=int, default=0)
     start.add_argument("--compact-wait-seconds", type=int, default=600)
+    start.add_argument("--thread-max-compactions", type=int, default=3)
+    start.add_argument(
+        "--thread-max-rollout-bytes", type=int, default=128 * 1024 * 1024
+    )
+    start.add_argument("--thread-max-context-tokens", type=int, default=850_000)
+    start.add_argument("--thread-no-progress-tokens", type=int, default=1_000_000)
+    start.add_argument("--thread-no-event-seconds", type=int, default=30 * 60)
+    start.add_argument("--thread-health-poll-seconds", type=int, default=30)
     start.add_argument("--log-path", default="")
     start_mode = start.add_mutually_exclusive_group()
     start_mode.add_argument("--resume", action="store_true")
@@ -133,6 +141,14 @@ def main(argv: list[str] | None = None) -> int:
     monitor.add_argument("--cooldown-seconds", type=int, default=300)
     monitor.add_argument("--max-recoveries", type=int, default=0)
     monitor.add_argument("--compact-wait-seconds", type=int, default=600)
+    monitor.add_argument("--thread-max-compactions", type=int, default=3)
+    monitor.add_argument(
+        "--thread-max-rollout-bytes", type=int, default=128 * 1024 * 1024
+    )
+    monitor.add_argument("--thread-max-context-tokens", type=int, default=850_000)
+    monitor.add_argument("--thread-no-progress-tokens", type=int, default=1_000_000)
+    monitor.add_argument("--thread-no-event-seconds", type=int, default=30 * 60)
+    monitor.add_argument("--thread-health-poll-seconds", type=int, default=30)
 
     guardian = subparsers.add_parser(
         "guardian", help="supervise and restore the tmux output monitor"
@@ -160,6 +176,12 @@ def main(argv: list[str] | None = None) -> int:
             cooldown_seconds=args.cooldown_seconds,
             max_recoveries=args.max_recoveries,
             compact_wait_seconds=args.compact_wait_seconds,
+            thread_max_compactions=args.thread_max_compactions,
+            thread_max_rollout_bytes=args.thread_max_rollout_bytes,
+            thread_max_context_tokens=args.thread_max_context_tokens,
+            thread_no_progress_tokens=args.thread_no_progress_tokens,
+            thread_no_event_seconds=args.thread_no_event_seconds,
+            thread_health_poll_seconds=args.thread_health_poll_seconds,
             resume_prompt=args.resume_prompt,
         )
         monitor_stdin(args.session, config)
@@ -175,7 +197,9 @@ def main(argv: list[str] | None = None) -> int:
     session_exists = tmux_session_exists(args.session)
     thread_id = validate_thread_id(args.thread_id) if args.thread_id else None
     should_resume = args.resume or thread_id is not None
-    session_binding = None
+    session_binding = (
+        None if args.new else load_session_binding(args.session)
+    )
     started_after = datetime.now(timezone.utc)
     unmanaged_existing_session = False
 
@@ -197,7 +221,6 @@ def main(argv: list[str] | None = None) -> int:
         if thread_id is None and not args.dry_run:
             raise SystemExit(f"no Codex thread found for {working_dir}")
     elif thread_id is None and not args.new:
-        session_binding = load_session_binding(args.session)
         if session_binding is not None:
             if session_binding.cwd != working_dir:
                 raise SystemExit(
@@ -270,6 +293,37 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
     assert thread_id is not None
+    initial_recovery_count = 0
+    initial_successful_compactions = 0
+    if session_exists:
+        tmux_values: dict[str, int] = {}
+        for name, destination in (
+            ("@codex_recovery_count", "recovery"),
+            ("@codex_successful_compactions", "compactions"),
+        ):
+            result = subprocess.run(
+                ["tmux", "show-option", "-v", "-t", args.session, name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            try:
+                value = max(0, int(result.stdout.strip()))
+            except (AttributeError, TypeError, ValueError):
+                value = -1
+            tmux_values[destination] = value
+            if destination == "recovery":
+                initial_recovery_count = max(0, value)
+            else:
+                initial_successful_compactions = max(0, value)
+        if session_binding is not None and session_binding.thread_id == thread_id:
+            if tmux_values.get("recovery", -1) < 0:
+                initial_recovery_count = session_binding.recovery_count
+            if tmux_values.get("compactions", -1) < 0:
+                initial_successful_compactions = session_binding.successful_compactions
+    elif session_binding is not None and session_binding.thread_id == thread_id:
+        initial_recovery_count = session_binding.recovery_count
+        initial_successful_compactions = session_binding.successful_compactions
     if not args.dry_run:
         run_command(tmux_set_thread_id_command(args.session, thread_id))
         save_session_binding(
@@ -285,8 +339,25 @@ def main(argv: list[str] | None = None) -> int:
             "@codex_args_json": json.dumps(codex_args),
             "@codex_cooldown_seconds": str(args.cooldown_seconds),
             "@codex_max_recoveries": str(args.max_recoveries),
-            "@codex_recovery_count": "0",
+            "@codex_recovery_count": str(initial_recovery_count),
+            "@codex_successful_compactions": str(
+                initial_successful_compactions
+            ),
             "@codex_compact_wait_seconds": str(args.compact_wait_seconds),
+            "@codex_thread_max_compactions": str(args.thread_max_compactions),
+            "@codex_thread_max_rollout_bytes": str(
+                args.thread_max_rollout_bytes
+            ),
+            "@codex_thread_max_context_tokens": str(
+                args.thread_max_context_tokens
+            ),
+            "@codex_thread_no_progress_tokens": str(
+                args.thread_no_progress_tokens
+            ),
+            "@codex_thread_no_event_seconds": str(args.thread_no_event_seconds),
+            "@codex_thread_health_poll_seconds": str(
+                args.thread_health_poll_seconds
+            ),
             "@codex_log_path": log_path,
             "@codex_resume_prompt": args.resume_prompt,
         }
@@ -306,6 +377,12 @@ def main(argv: list[str] | None = None) -> int:
         cooldown_seconds=args.cooldown_seconds,
         max_recoveries=args.max_recoveries,
         compact_wait_seconds=args.compact_wait_seconds,
+        thread_max_compactions=args.thread_max_compactions,
+        thread_max_rollout_bytes=args.thread_max_rollout_bytes,
+        thread_max_context_tokens=args.thread_max_context_tokens,
+        thread_no_progress_tokens=args.thread_no_progress_tokens,
+        thread_no_event_seconds=args.thread_no_event_seconds,
+        thread_health_poll_seconds=args.thread_health_poll_seconds,
     )
 
     run_command(tmux_pipe_pane_command(args.session, pipe_command))

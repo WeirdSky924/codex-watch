@@ -10,16 +10,16 @@ from pathlib import Path
 
 from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
 from .monitor import (
-    LAST_RECOVERY_INCIDENT_OPTION,
-    PENDING_UPDATE_OPTION,
     _claim_tmux_recovery_incident_id,
     _set_pending_thread_rotation,
+    _tmux_successful_compactions,
     normalize_terminal_text,
     recovery_incident_for_thread,
     recovery_allowed_for_goal,
     recovery_goal_state_on_screen,
 )
 from .paths import default_log_path
+from .bindings import save_binding_runtime_state
 from .recovery import (
     DEFAULT_RESUME_PROMPT,
     RecoveryConfig,
@@ -27,8 +27,13 @@ from .recovery import (
     build_recovery_steps,
     classify_recovery_reason,
 )
-from .sessions import find_latest_goal_objective
-from .tmux_control import execute_steps, monitor_pipe_command
+from .sessions import ThreadTelemetryTracker, find_latest_goal_objective
+from .tmux_control import (
+    LAST_RECOVERY_INCIDENT_OPTION,
+    PENDING_UPDATE_OPTION,
+    execute_steps,
+    monitor_pipe_command,
+)
 
 
 UPDATE_SUCCESS_MARKER = "Update ran successfully! Please restart Codex."
@@ -84,6 +89,7 @@ def _next_recovery_attempt(
     *,
     option_getter: Callable[[str, str, str], str] = _tmux_option,
     runner=subprocess.run,
+    persist_count: Callable[[str, int], object] | None = None,
 ) -> int:
     try:
         current = max(
@@ -104,7 +110,37 @@ def _next_recovery_attempt(
         ],
         check=True,
     )
+    if persist_count is None:
+        persist_count = lambda target, count: save_binding_runtime_state(
+            session=target,
+            recovery_count=count,
+            successful_compactions=_tmux_successful_compactions(target),
+        )
+    persist_count(session, attempt)
     return attempt
+
+
+def _mark_verification_pending(session: str, config: RecoveryConfig) -> None:
+    telemetry = ThreadTelemetryTracker(thread_id=config.thread_id).snapshot()
+    baseline = telemetry.verified_event_count if telemetry is not None else 0
+    compactions = telemetry.compaction_count if telemetry is not None else 0
+    save_binding_runtime_state(
+        session=session,
+        recovery_count=_tmux_option_int(session, "@codex_recovery_count", 0),
+        successful_compactions=max(
+            _tmux_successful_compactions(session),
+            compactions,
+        ),
+        verification_pending=True,
+        verification_baseline=baseline,
+    )
+
+
+def _tmux_option_int(session: str, name: str, default: int) -> int:
+    try:
+        return max(0, int(_tmux_option(session, name, str(default))))
+    except (TypeError, ValueError):
+        return max(0, default)
 
 
 def _pipe_active(session: str) -> bool:
@@ -234,6 +270,28 @@ def _recovery_config(
         compact_wait_seconds=int(
             option_getter(session, "@codex_compact_wait_seconds", "600")
         ),
+        thread_max_compactions=int(
+            option_getter(session, "@codex_thread_max_compactions", "3")
+        ),
+        thread_max_rollout_bytes=int(
+            option_getter(
+                session,
+                "@codex_thread_max_rollout_bytes",
+                str(128 * 1024 * 1024),
+            )
+        ),
+        thread_max_context_tokens=int(
+            option_getter(session, "@codex_thread_max_context_tokens", "850000")
+        ),
+        thread_no_progress_tokens=int(
+            option_getter(session, "@codex_thread_no_progress_tokens", "1000000")
+        ),
+        thread_no_event_seconds=int(
+            option_getter(session, "@codex_thread_no_event_seconds", "1800")
+        ),
+        thread_health_poll_seconds=int(
+            option_getter(session, "@codex_thread_health_poll_seconds", "30")
+        ),
         resume_prompt=option_getter(
             session, "@codex_resume_prompt", DEFAULT_RESUME_PROMPT
         ),
@@ -292,6 +350,7 @@ def run_guardian(
                     return
                 goal_state = recovery_goal_state_on_screen(session)
                 recovery_attempt = _next_recovery_attempt(session)
+                _mark_verification_pending(session, config)
                 if reason == "upstream_access_denied":
                     _set_pending_thread_rotation(session, recovery_attempt)
                 _append_log(
@@ -346,6 +405,12 @@ def run_guardian(
                     cooldown_seconds=config.cooldown_seconds,
                     max_recoveries=config.max_recoveries,
                     compact_wait_seconds=config.compact_wait_seconds,
+                    thread_max_compactions=config.thread_max_compactions,
+                    thread_max_rollout_bytes=config.thread_max_rollout_bytes,
+                    thread_max_context_tokens=config.thread_max_context_tokens,
+                    thread_no_progress_tokens=config.thread_no_progress_tokens,
+                    thread_no_event_seconds=config.thread_no_event_seconds,
+                    thread_health_poll_seconds=config.thread_health_poll_seconds,
                 )
                 subprocess.run(
                     ["tmux", "pipe-pane", "-o", "-t", session, pipe_command],

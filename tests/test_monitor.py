@@ -5,12 +5,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_goal_watchdog.monitor import (
+    MONITOR_TICK,
     _claim_tmux_recovery_incident_id,
     _save_tmux_thread_id,
     iter_decoded_chunks,
     run_monitor,
 )
 from codex_goal_watchdog.recovery import RecoveryConfig
+from codex_goal_watchdog.sessions import ThreadTelemetry
 
 
 THREAD_ID = "550e8400-e29b-41d4-a716-446655440000"
@@ -628,6 +630,140 @@ class MonitorTests(unittest.TestCase):
         save_count_mock.assert_called_once_with("project-a", 3)
         clear_pending_mock.assert_called_once_with("project-a")
 
+    def test_verified_recovery_resets_count_but_failed_verification_does_not(self):
+        calls = []
+        persisted_counts = []
+        incidents = iter(
+            [
+                ("turn-503-a", "retryable_http_503"),
+                ("turn-503-b", "retryable_http_503"),
+            ]
+        )
+        verifications = iter([False, True])
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+                "Pursuing goal (5m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
+            resolve_recovery_incident=lambda thread_id: next(incidents),
+            claim_recovery_incident_id=lambda incident_id: True,
+            verify_recovery=lambda target: next(verifications),
+            save_recovery_count=persisted_counts.append,
+            now=iter([100.0, 101.0, 102.0, 103.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual([1, 2, 0], persisted_counts)
+        self.assertEqual("300", calls[1][1][4].value)
+
+    def test_duplicate_incident_redraws_log_once_then_aggregate(self):
+        messages = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                *[
+                    "■ unexpected status 503 Service Unavailable: upstream failed\n"
+                    for _ in range(3)
+                ],
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            resolve_recovery_incident=lambda thread_id: (
+                "turn-redrawn",
+                "retryable_http_503",
+            ),
+            initial_recovery_incident_id="turn-redrawn",
+            now=iter([100.0, 101.0, 102.0, 103.0]).__next__,
+            log=messages.append,
+        )
+
+        first_logs = [
+            message for message in messages if "ignored redrawn fatal event" in message
+        ]
+        summaries = [message for message in messages if "suppressed=2" in message]
+        self.assertEqual(1, len(first_logs))
+        self.assertEqual(1, len(summaries))
+
+    def test_health_tick_rotates_large_thread_with_bounded_handoff(self):
+        calls = []
+        marked_counts = []
+        handoffs = []
+        telemetry = ThreadTelemetry(
+            thread_id=THREAD_ID,
+            rollout_path=Path("/tmp/rollout.jsonl"),
+            rollout_bytes=2_000,
+            total_tokens=10_000,
+            context_tokens=400,
+            context_window=1_000,
+            compaction_count=0,
+            tokens_at_last_progress=9_900,
+            last_event_at=100.0,
+            last_progress_at=100.0,
+        )
+
+        run_monitor(
+            lines=["Pursuing goal (4m)\n", MONITOR_TICK],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                thread_max_rollout_bytes=1_000,
+            ),
+            resolve_thread_telemetry=lambda thread_id: telemetry,
+            resolve_goal_objective=lambda thread_id: "Goal ID: FE-CREATOR-8",
+            write_thread_handoff=lambda **kwargs: (
+                handoffs.append(kwargs) or Path("/state/handoffs/latest.json")
+            ),
+            mark_thread_rotation=marked_counts.append,
+            save_recovery_count=lambda count: None,
+            now=iter([100.0, 101.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([1], marked_counts)
+        self.assertEqual("max_rollout_bytes", handoffs[0]["reason"])
+        self.assertIn("/state/handoffs/latest.json", calls[0][1][-1].value)
+
+    def test_compaction_timeout_falls_back_to_fresh_thread_rotation(self):
+        calls = []
+        handoffs = []
+
+        def execute(target, steps):
+            calls.append((target, steps))
+            if any(step.kind == "wait_compaction" for step in steps):
+                raise TimeoutError("compaction timed out")
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ stream disconnected before completion: codex upstream stalled: "
+                "no real data for 5m0s, connection recycled\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            resolve_goal_objective=lambda thread_id: "Goal ID: FE-CREATOR-8",
+            write_thread_handoff=lambda **kwargs: (
+                handoffs.append(kwargs) or Path("/state/handoffs/latest.json")
+            ),
+            mark_thread_rotation=lambda count: None,
+            now=iter([100.0, 101.0]).__next__,
+            execute=execute,
+            log=lambda message: None,
+        )
+
+        self.assertEqual(2, len(calls))
+        self.assertTrue(any(step.kind == "wait_compaction" for step in calls[0][1]))
+        self.assertFalse(any(step.kind == "wait_compaction" for step in calls[1][1]))
+        self.assertEqual("compaction_timeout", handoffs[0]["reason"])
 
 if __name__ == "__main__":
     unittest.main()

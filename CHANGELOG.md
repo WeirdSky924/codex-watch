@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.21] - 2026-08-28
+
+### Fixed
+
+- Retry Enter when recovery text remains in the Codex composer or interactive
+  shell input, so shared recovery steps cannot silently stop at an unsent
+  prompt.
+
+## [0.1.20] - 2026-08-28
+
+### Changed
+
+- Increase the default watchdog rollout-size threshold from 128 MiB to
+  512 MiB.
+
+## [0.1.19] - 2026-08-28
+
+### Changed
+
+- Remove watchdog actions based on rollout context usage or
+  model_context_window; Codex now exclusively owns context limits and
+  automatic compaction.
+- Leave Codex's native context-window exhaustion message untouched instead of
+  compacting or rotating the thread from the monitor.
+- Keep --thread-max-context-tokens as an ignored compatibility option for
+  existing launch scripts.
+
+## [0.1.18] - 2026-08-27
+
+### Added
+
+- Detect consecutive repeated assistant output and repeated shell `exec` calls
+  inside one active Codex turn, then route the loop through the existing bounded
+  handoff and fresh-thread recovery flow.
+- Expose `--thread-max-repeated-content` and
+  `--thread-max-repeated-commands`; both default to three and accept `0` to
+  disable their detector.
+
+### Changed
+
+- Arm repetition detection only for rollout events observed after the monitor
+  starts, preventing a monitor restart from replaying historical loops.
+- Exclude `write_stdin` and `wait` polling calls from repeated-command signals.
+
 ## [0.1.17] - 2026-08-27
 
 ### Added

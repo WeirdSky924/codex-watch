@@ -1,7 +1,14 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from codex_goal_watchdog.recovery import RecoveryStep
+from codex_goal_watchdog.monitor import MONITOR_TICK, run_monitor
+from codex_goal_watchdog.recovery import RecoveryConfig, RecoveryStep
+from codex_goal_watchdog.sessions import ThreadTelemetry, ThreadTelemetryTracker
 from codex_goal_watchdog.tmux_control import (
+    _submit_text,
+    _submission_is_pending,
     capture_update_prompt_version,
     commands_for_step,
     ensure_codex_version,
@@ -14,7 +21,295 @@ from codex_goal_watchdog.tmux_control import (
 )
 
 
+THREAD_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+
 class TmuxControlTests(unittest.TestCase):
+    def _telemetry(
+        self,
+        *,
+        total_tokens=10_000,
+        tokens_at_last_progress=0,
+        last_event_at=100.0,
+        turn_active=False,
+    ):
+        return ThreadTelemetry(
+            thread_id=THREAD_ID,
+            rollout_path=Path("/tmp/rollout.jsonl"),
+            rollout_bytes=100,
+            total_tokens=total_tokens,
+            context_tokens=400,
+            context_window=1_000,
+            compaction_count=0,
+            tokens_at_last_progress=tokens_at_last_progress,
+            last_event_at=last_event_at,
+            last_progress_at=last_event_at,
+            turn_active=turn_active,
+        )
+
+    def test_submit_text_retries_when_initial_codex_composer_stays_open(self):
+        calls = []
+        sleeps = []
+        captures = iter(("Create a plan?\n", "Working (1s)\n"))
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                returncode = 0
+                stdout = next(captures) if command[1] == "capture-pane" else ""
+
+            return Result()
+
+        _submit_text(
+            "codex-goal",
+            "handoff prompt",
+            runner=runner,
+            sleeper=sleeps.append,
+        )
+
+        enter_calls = [
+            command
+            for command in calls
+            if command[:5] == ["tmux", "send-keys", "-t", "codex-goal", "Enter"]
+        ]
+        self.assertEqual(2, len(enter_calls))
+        self.assertEqual(2, len(sleeps))
+        self.assertEqual(2, len([c for c in calls if c[1] == "capture-pane"]))
+
+    def test_submit_text_retries_when_the_actual_text_stays_in_composer(self):
+        calls = []
+        sleeps = []
+        captures = iter(
+            (
+                "› handoff prompt\n",
+                "› handoff prompt\n",
+                "› Ask Codex to do anything\n",
+            )
+        )
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                returncode = 0
+                stdout = next(captures) if command[1] == "capture-pane" else ""
+
+            return Result()
+
+        _submit_text(
+            "codex-goal",
+            "handoff prompt",
+            runner=runner,
+            sleeper=sleeps.append,
+        )
+
+        enter_calls = [
+            command
+            for command in calls
+            if command[:5] == ["tmux", "send-keys", "-t", "codex-goal", "Enter"]
+        ]
+        self.assertEqual(3, len(enter_calls))
+        self.assertEqual(3, len(sleeps))
+
+    def test_submission_pending_ignores_text_in_transcript_history(self):
+        self.assertFalse(
+            _submission_is_pending(
+                "› handoff prompt\n"
+                "Working (1s)\n"
+                "› Ask Codex to do anything\n",
+                "handoff prompt",
+            )
+        )
+
+    def test_submission_pending_ignores_old_plan_picker_in_history(self):
+        self.assertFalse(
+            _submission_is_pending(
+                "› old prompt\n"
+                "Create a plan?\n"
+                "› Ask Codex to do anything\n",
+                "new prompt",
+            )
+        )
+
+    def test_submit_text_retries_pending_shell_input(self):
+        calls = []
+        sleeps = []
+        captures = iter(
+            (
+                "bash-5.2# codex resume abc\n",
+                "bash-5.2#\n",
+            )
+        )
+        pane_commands = iter(("bash",))
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                returncode = 0
+                stdout = (
+                    next(captures)
+                    if command[1] == "capture-pane"
+                    else (
+                        next(pane_commands)
+                        if command[1] == "display-message"
+                        else ""
+                    )
+                )
+
+            return Result()
+
+        _submit_text(
+            "codex-goal",
+            "codex resume abc",
+            runner=runner,
+            sleeper=sleeps.append,
+        )
+
+        enter_calls = [
+            command
+            for command in calls
+            if command[:5] == ["tmux", "send-keys", "-t", "codex-goal", "Enter"]
+        ]
+        self.assertEqual(2, len(enter_calls))
+        self.assertEqual(2, len(sleeps))
+
+    def test_submit_text_does_not_retry_shell_command_already_running(self):
+        calls = []
+        sleeps = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                returncode = 0
+                stdout = (
+                    "bash-5.2# codex resume abc\n"
+                    if command[1] == "capture-pane"
+                    else "node\n"
+                    if command[1] == "display-message"
+                    else ""
+                )
+
+            return Result()
+
+        _submit_text(
+            "codex-goal",
+            "codex resume abc",
+            runner=runner,
+            sleeper=sleeps.append,
+        )
+
+        enter_calls = [
+            command
+            for command in calls
+            if command[:5] == ["tmux", "send-keys", "-t", "codex-goal", "Enter"]
+        ]
+        self.assertEqual(1, len(enter_calls))
+        self.assertEqual(1, len(sleeps))
+
+    def test_active_turn_is_not_rotated_for_no_progress_tokens(self):
+        calls = []
+        telemetry = self._telemetry(turn_active=True)
+
+        run_monitor(
+            lines=["Pursuing goal (4m)\n", MONITOR_TICK],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, thread_no_progress_tokens=500),
+            resolve_thread_telemetry=lambda thread_id: telemetry,
+            now=lambda: 101.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], calls)
+
+    def test_recent_turn_end_is_not_rotated_before_health_poll_interval(self):
+        calls = []
+        telemetry = self._telemetry()
+
+        run_monitor(
+            lines=["Pursuing goal (4m)\n", MONITOR_TICK],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                thread_no_progress_tokens=500,
+                thread_health_poll_seconds=30,
+            ),
+            resolve_thread_telemetry=lambda thread_id: telemetry,
+            now=lambda: 101.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], calls)
+
+    def test_active_turn_does_not_resume_stale_paused_goal_marker(self):
+        resumed = []
+        telemetry = self._telemetry(total_tokens=100, tokens_at_last_progress=100, turn_active=True)
+
+        run_monitor(
+            lines=["Goal paused (/goal resume)\n", "Working (5s)\n"],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            resolve_thread_telemetry=lambda thread_id: telemetry,
+            resume_goal=resumed.append,
+            now=lambda: 101.0,
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], resumed)
+
+    def test_rollout_tracker_tracks_active_turn_lifecycle(self):
+        events = [
+            {
+                "timestamp": "2026-08-27T08:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": THREAD_ID,
+                    "cwd": "/workspace/target",
+                    "source": "cli",
+                    "timestamp": "2026-08-27T08:00:00Z",
+                },
+            },
+            {
+                "timestamp": "2026-08-27T08:01:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / f"rollout-{THREAD_ID}.jsonl"
+            path.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            tracker = ThreadTelemetryTracker(
+                thread_id=THREAD_ID,
+                sessions_root=Path(temp_dir),
+            )
+            active = tracker.snapshot()
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-08-27T08:02:00Z",
+                            "type": "event_msg",
+                            "payload": {"type": "turn_aborted"},
+                        }
+                    )
+                    + "\n"
+                )
+            inactive = tracker.snapshot()
+
+        self.assertIsNotNone(active)
+        self.assertIsNotNone(inactive)
+        assert active is not None
+        assert inactive is not None
+        self.assertTrue(active.turn_active)
+        self.assertFalse(inactive.turn_active)
+
     def test_goal_active_objective_survives_fatal_shell_exit(self):
         screen = (
             "■ unexpected status 502 Bad Gateway: Upstream access denied\n"
@@ -612,6 +907,8 @@ class TmuxControlTests(unittest.TestCase):
             thread_no_progress_tokens=9012,
             thread_no_event_seconds=3456,
             thread_health_poll_seconds=78,
+            thread_max_repeated_content=4,
+            thread_max_repeated_commands=5,
         )
 
         self.assertIn("--thread-max-compactions 3", command)
@@ -620,6 +917,8 @@ class TmuxControlTests(unittest.TestCase):
         self.assertIn("--thread-no-progress-tokens 9012", command)
         self.assertIn("--thread-no-event-seconds 3456", command)
         self.assertIn("--thread-health-poll-seconds 78", command)
+        self.assertIn("--thread-max-repeated-content 4", command)
+        self.assertIn("--thread-max-repeated-commands 5", command)
 
 
 if __name__ == "__main__":

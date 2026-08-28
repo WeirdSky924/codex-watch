@@ -1,6 +1,6 @@
 # Codex Goal Watchdog
 
-Codex Goal Watchdog 用 tmux 托管 Codex CLI，并在长时间 Goal 因上游错误、网络错误、上下文耗尽或 Codex 自更新而停止时，自动恢复固定的 Codex thread。
+Codex Goal Watchdog 用 tmux 托管 Codex CLI，并在长时间 Goal 因上游错误、网络错误或 Codex 自更新而停止时，自动恢复固定的 Codex thread。上下文窗口和自动压缩完全由 Codex 自身管理。
 
 本工具适用于 Linux 服务器上的长时间 Codex 任务。它会自动向 Codex 终端发送按键和命令，但不会修改 `~/.codex/sessions` 中的 Codex 会话文件。
 
@@ -296,7 +296,7 @@ codex-watch \
 参数含义：
 
 - `primary-model`：平时执行 Goal 和恢复后继续工作的模型。
-- `compact-model`：遇到 5 分钟上游停滞或上下文耗尽时，用来执行 `/compact` 的模型。
+- `compact-model`：遇到 5 分钟上游停滞时，用来执行 `/compact` 的模型。
 - `primary-reasoning-effort`：主模型支持的推理强度。
 - `compact-reasoning-effort`：压缩模型支持的推理强度。
 
@@ -412,11 +412,12 @@ Codex 模型每隔 30 秒执行一次 `ps`、`tail` 或其他状态轮询。默�
 
 ```text
 thread max compactions:       3
-thread max rollout bytes:     134217728 (128 MiB)
-thread max context tokens:    850000
+thread max rollout bytes:     536870912 (512 MiB)
 thread no-progress tokens:    1000000
 thread no-event seconds:      1800 (30 分钟)
 thread health poll seconds:   30
+thread max repeated content:  3
+thread max repeated commands: 3
 ```
 
 阈值只对 `Pursuing`、`Goal stalled` 和 `Goal blocked` 生效；没有 Goal、普通
@@ -425,6 +426,12 @@ paused Goal 或已完成 Goal 不会因为历史体积触发轮换。达到任�
 退出旧 Codex、启动不带旧 thread ID 的新 Codex thread，并要求新 thread 先按
 当前工作树、ACTIVE Plan 和 canonical 记录校准，再创建同一 Goal。旧 thread
 不会被删除，rollout 也不会被修改。
+
+重复内容和重复命令检测只处理 monitor 启动后新增的 rollout 事件，并按同一
+active turn 内的连续 streak 计数。连续第三次出现相同的 assistant 输出或相同
+的 shell `exec` 调用时，使用同一套 handoff 和新 thread 恢复流程；不同内容或
+命令会结束对应 streak。`write_stdin`、`wait` 等等待轮询不计入重复命令，避免
+正常等待长命令时被误判。将对应阈值设为 `0` 或负数可关闭该项检测。
 
 compact 等待超过 `--compact-wait-seconds` 时，流程会把它视为压缩失败，写入
 `compaction_timeout` handoff 并走同一套新 thread 轮换；不会无限等待，也不会
@@ -435,21 +442,24 @@ monitor 重挂或 tmux 重启都不会清零；只有检测到新的成功 `task
 `context_compacted` 或新 thread 已完成可验证接力后才会清零。`--max-recoveries 0`
 仍表示无限恢复，长会话健康轮换不会改变这一设置。
 
-可按项目调整阈值：
+可按项目调整 watchdog 自己负责的阈值：
 
 ```bash
 codex-watch --safe \
   --thread-max-compactions 3 \
-  --thread-max-rollout-bytes 134217728 \
-  --thread-max-context-tokens 850000 \
+  --thread-max-rollout-bytes 536870912 \
   --thread-no-progress-tokens 1000000 \
   --thread-no-event-seconds 1800 \
-  --thread-health-poll-seconds 30
+  --thread-health-poll-seconds 30 \
+  --thread-max-repeated-content 3 \
+  --thread-max-repeated-commands 3
 ```
 
-将某个阈值设为 `0` 或负数可关闭该项检查。阈值检查是本地 watchdog 行为，
-不是 Codex 的上下文窗口配置；Codex 的 `model_context_window` 和自动 compact
-触发值仍由 Codex 自身配置决定。
+将某个 watchdog 阈值设为 `0` 或负数可关闭该项检查。watchdog 不再读取
+`context_tokens` 或 `model_context_window` 来决定 compact、重启或新建 thread；
+上下文窗口、上下文上限和自动 compact 触发值全部由 Codex 自身决定。
+旧参数 `--thread-max-context-tokens` 仅为兼容旧启动脚本而保留，传入任何值
+都不会产生 watchdog 行为。
 
 ### 自定义日志路径
 
@@ -798,7 +808,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | 错误 | 自动操作 |
 | --- | --- |
 | `codex upstream stalled: no real data for 5m0s` | 切到 compact model，恢复固定 thread，执行 `/compact`，等待真实压缩事件，再切回 primary model 并继续 Goal |
-| Codex context window exhausted | 执行相同的 compact 流程 |
+| Codex context window exhausted | 交由 Codex 自身处理，watchdog 不接管 |
 | HTTP 502 且消息为 `Upstream access denied` | 不再恢复被拒绝的 thread；创建新 thread，提取并重建上一 Goal，再自动更新 tmux 与持久绑定 |
 | HTTP 401（包括 `API DISABLE`）、402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
@@ -819,7 +829,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 
 从 `0.1.5` 开始，`Selected model is at capacity` 容量告警进入统一 fatal recovery 流程：首次立即恢复，后续失败按冷静期继续重试，默认不限制次数。
 
-同一版本还会在 tmux 输入 `/quit`、`/compact`、`/goal resume`、Codex 启动命令或续接提示后短暂等待，再发送 Enter，避免 Codex 将过快的“文字 + Enter”识别为带换行的粘贴内容并停在输入框。
+同一版本还会在 tmux 输入 `/quit`、`/compact`、`/goal resume`、Codex 启动命令或续接提示后等待并检查 composer；如果原文或 Shell 命令仍停留在输入行，会自动重试 Enter。该确认逻辑由所有恢复路径共用，避免恢复流程停在未发送的输入框。
 
 从 `0.1.6` 开始，在受管 Codex 会话中执行 `/clear` 后，watchdog 会从当前 tmux pane 的 Codex 进程树中识别最新顶层 CLI rollout，自动更新固定 thread ID，并将新 thread 的恢复计数重置为 0。子 Agent thread 和同目录下其他 Codex 进程不会被误绑定。
 
@@ -1151,11 +1161,13 @@ sha256sum -c SHA256SUMS
 --max-recoveries N                 最大恢复次数，0 表示无限
 --compact-wait-seconds N           等待真实压缩事件的超时
 --thread-max-compactions N         当前 thread 最大成功压缩次数，默认 3
---thread-max-rollout-bytes N       rollout 最大字节数，默认 128 MiB
---thread-max-context-tokens N      单次上下文 token 阈值，默认 850000
+--thread-max-rollout-bytes N       rollout 最大字节数，默认 512 MiB
+--thread-max-context-tokens N      旧版兼容参数，忽略（上下文由 Codex 管理）
 --thread-no-progress-tokens N      无成功进展时允许增长的 token 数，默认 1000000
 --thread-no-event-seconds N        无 rollout 事件阈值，默认 1800
 --thread-health-poll-seconds N     本地健康检查间隔，默认 30
+--thread-max-repeated-content N    连续重复 assistant 内容阈值，默认 3
+--thread-max-repeated-commands N   连续重复 shell 命令阈值，默认 3
 --resume-prompt TEXT               没有 Goal 状态时使用的续接文本
 --log-path PATH                    覆盖默认日志文件
 --dry-run                          只打印将执行的 tmux/Codex 命令

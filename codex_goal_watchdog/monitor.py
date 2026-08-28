@@ -267,6 +267,11 @@ def run_monitor(
                 "tokens_at_last_progress": telemetry.tokens_at_last_progress,
                 "last_event_at": telemetry.last_event_at,
                 "last_progress_at": telemetry.last_progress_at,
+                "turn_active": telemetry.turn_active,
+                "repeated_content_count": telemetry.repeated_content_count,
+                "repeated_command_count": telemetry.repeated_command_count,
+                "repeated_content_signature": telemetry.repeated_content_signature,
+                "repeated_command_signature": telemetry.repeated_command_signature,
             }
         return str(
             write_thread_handoff(
@@ -355,6 +360,14 @@ def run_monitor(
         telemetry = resolve_thread_telemetry(config.thread_id)
         if telemetry is None:
             return False
+        progress_tokens = telemetry.total_tokens
+        recent_event = (
+            telemetry.last_event_at > 0
+            and observed_at - telemetry.last_event_at
+            < max(1, config.thread_health_poll_seconds)
+        )
+        if telemetry.turn_active or recent_event:
+            progress_tokens = telemetry.tokens_at_last_progress
         detail = thread_rotation_reason(
             config,
             compaction_count=max(
@@ -363,9 +376,14 @@ def run_monitor(
             ),
             rollout_bytes=telemetry.rollout_bytes,
             context_tokens=telemetry.context_tokens,
-            total_tokens=telemetry.total_tokens,
+            # A long active turn is work in progress, not a stalled thread.
+            # Context usage is owned by Codex; only watchdog-owned health
+            # signals are evaluated here.
+            total_tokens=progress_tokens,
             tokens_at_last_progress=telemetry.tokens_at_last_progress,
             last_event_age_seconds=max(0, observed_at - telemetry.last_event_at),
+            repeated_content_count=telemetry.repeated_content_count,
+            repeated_command_count=telemetry.repeated_command_count,
         )
         if detail is None:
             return False
@@ -636,6 +654,14 @@ def run_monitor(
             or observed_at - last_goal_resume_at >= GOAL_RESUME_RETRY_SECONDS
         )
         if goal_resume_visible and retry_ready:
+            telemetry = (
+                resolve_thread_telemetry(config.thread_id)
+                if resolve_thread_telemetry is not None
+                else None
+            )
+            if telemetry is not None and telemetry.turn_active:
+                rolling_output = ""
+                continue
             emit("[codex-goal-watchdog] resuming paused goal")
             run_resume_goal(target)
             last_goal_resume_at = observed_at
@@ -686,6 +712,7 @@ def _save_tmux_thread_id(target: str, thread_id: str) -> None:
 
 def monitor_stdin(target: str, config: RecoveryConfig) -> None:
     print(f"[codex-goal-watchdog] monitor started: target={target}", flush=True)
+    monitor_started_at = time.time()
     pane_identity = _tmux_pane_identity(target)
     telemetry_trackers: dict[str, ThreadTelemetryTracker] = {}
     binding = load_session_binding(target)
@@ -708,7 +735,10 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
     def resolve_thread_telemetry(thread_id: str) -> ThreadTelemetry | None:
         tracker = telemetry_trackers.get(thread_id)
         if tracker is None:
-            tracker = ThreadTelemetryTracker(thread_id=thread_id)
+            tracker = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                repetition_started_at=monitor_started_at,
+            )
             telemetry_trackers[thread_id] = tracker
         return tracker.snapshot()
 

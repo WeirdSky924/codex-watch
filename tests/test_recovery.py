@@ -159,13 +159,12 @@ class RecoveryControllerTests(unittest.TestCase):
             )
         )
 
-    def test_classifies_context_window_exhaustion_on_terminal_fatal_row(self):
-        self.assertEqual(
-            "context_window_exhausted",
+    def test_ignores_context_window_exhaustion_for_codex_to_handle(self):
+        self.assertIsNone(
             classify_recovery_reason(
                 "■ Codex ran out of room in the model's context window. "
                 "Start a new thread or clear earlier history before retrying."
-            ),
+            )
         )
 
     def test_ignores_context_window_message_without_terminal_fatal_marker(self):
@@ -506,7 +505,6 @@ class RecoveryStepTests(unittest.TestCase):
 
         for reason in (
             "codex_upstream_stalled",
-            "context_window_exhausted",
             "retryable_http_402",
             "retryable_http_502",
             "upstream_access_denied",
@@ -553,47 +551,25 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertTrue(any("gpt-5.6-sol" in value for value in values))
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
 
-    def test_context_window_exhaustion_compacts_with_luna_then_resumes_sol(self):
-        config = RecoveryConfig(
-            thread_id="550e8400-e29b-41d4-a716-446655440000",
-            compact_model="gpt-5.6-luna",
-            compact_reasoning_effort="xhigh",
-            primary_model="gpt-5.6-sol",
-            primary_reasoning_effort="max",
-            codex_args=("--dangerously-bypass-approvals-and-sandbox",),
-            compact_wait_seconds=600,
-            resume_prompt="继续上下文耗尽前的 goal。",
-        )
-
-        steps = build_recovery_steps(config, reason="context_window_exhausted")
-        values = [step.value for step in steps]
-
-        self.assertIn("/compact", values)
-        self.assertTrue(any("gpt-5.6-luna" in value for value in values))
-        self.assertTrue(any("gpt-5.6-sol" in value for value in values))
-        self.assertEqual("mark_compaction", steps[9].kind)
-        self.assertEqual(config.thread_id, steps[9].value)
-        self.assertEqual("wait_compaction", steps[11].kind)
-        self.assertEqual(600, steps[11].timeout_seconds)
-        self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
-
     def test_thread_health_thresholds_request_rotation(self):
         config = RecoveryConfig(
             thread_max_compactions=3,
             thread_max_rollout_bytes=1_000,
-            thread_max_context_tokens=800,
             thread_no_progress_tokens=500,
             thread_no_event_seconds=120,
+            thread_max_repeated_content=3,
+            thread_max_repeated_commands=3,
         )
 
         cases = (
             ({"compaction_count": 3}, "max_compactions"),
             ({"rollout_bytes": 1_000}, "max_rollout_bytes"),
-            ({"context_tokens": 800}, "max_context_tokens"),
             (
                 {"total_tokens": 1_500, "tokens_at_last_progress": 1_000},
                 "no_progress_tokens",
             ),
+            ({"repeated_content_count": 3}, "repeated_content"),
+            ({"repeated_command_count": 3}, "repeated_command"),
             ({"last_event_age_seconds": 120}, "no_rollout_events"),
         )
         defaults = {
@@ -602,6 +578,8 @@ class RecoveryStepTests(unittest.TestCase):
             "context_tokens": 0,
             "total_tokens": 0,
             "tokens_at_last_progress": 0,
+            "repeated_content_count": 0,
+            "repeated_command_count": 0,
             "last_event_age_seconds": 0,
         }
 
@@ -611,6 +589,41 @@ class RecoveryStepTests(unittest.TestCase):
                     expected,
                     thread_rotation_reason(config, **(defaults | values)),
                 )
+
+    def test_context_usage_never_requests_thread_rotation(self):
+        config = RecoveryConfig(thread_max_context_tokens=800)
+
+        self.assertIsNone(
+            thread_rotation_reason(
+                config,
+                compaction_count=0,
+                rollout_bytes=0,
+                context_tokens=900,
+                total_tokens=0,
+                tokens_at_last_progress=0,
+                last_event_age_seconds=0,
+            )
+        )
+
+    def test_zero_repetition_thresholds_disable_loop_rotation(self):
+        config = RecoveryConfig(
+            thread_max_repeated_content=0,
+            thread_max_repeated_commands=0,
+        )
+
+        self.assertIsNone(
+            thread_rotation_reason(
+                config,
+                compaction_count=0,
+                rollout_bytes=0,
+                context_tokens=0,
+                total_tokens=0,
+                tokens_at_last_progress=0,
+                last_event_age_seconds=0,
+                repeated_content_count=100,
+                repeated_command_count=100,
+            )
+        )
 
     def test_thread_health_rotation_starts_fresh_thread_with_handoff(self):
         thread_id = "550e8400-e29b-41d4-a716-446655440000"

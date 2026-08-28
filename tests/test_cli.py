@@ -367,7 +367,18 @@ class ConsoleEntrypointTests(unittest.TestCase):
             successful_compactions=2,
         )
 
-        result = main(["start", "--session", "project-a", "--no-attach"])
+        result = main(
+            [
+                "start",
+                "--session",
+                "project-a",
+                "--thread-max-repeated-content",
+                "4",
+                "--thread-max-repeated-commands",
+                "5",
+                "--no-attach",
+            ]
+        )
 
         self.assertEqual(0, result)
         option_calls = [
@@ -383,6 +394,28 @@ class ConsoleEntrypointTests(unittest.TestCase):
                 "project-a",
                 "@codex_recovery_count",
                 "4",
+            ],
+            option_calls,
+        )
+        self.assertIn(
+            [
+                "tmux",
+                "set-option",
+                "-t",
+                "project-a",
+                "@codex_thread_max_repeated_content",
+                "4",
+            ],
+            option_calls,
+        )
+        self.assertIn(
+            [
+                "tmux",
+                "set-option",
+                "-t",
+                "project-a",
+                "@codex_thread_max_repeated_commands",
+                "5",
             ],
             option_calls,
         )

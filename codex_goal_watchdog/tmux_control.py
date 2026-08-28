@@ -47,8 +47,17 @@ CODEX_VERSION_RE = re.compile(
     r"\b(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b"
 )
 TEXT_SUBMIT_SETTLE_SECONDS = 0.5
+TEXT_SUBMIT_RETRY_COUNT = 10
+TEXT_SUBMIT_CAPTURE_LINES = 200
 ANSI_ESCAPE_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b\x07]*(?:\x07|\x1b\\)|[@-_])"
+)
+SHELL_COMMANDS = {"bash", "zsh", "sh", "fish"}
+SHELL_PROMPT_RE = re.compile(
+    r"^\s*(?:\([^)\r\n]+\)\s+)?"
+    r"(?:(?:[\w.-]+@[\w.-]+:[^#$\r\n]*)|"
+    r"(?:bash|zsh|sh|fish)(?:-[\w.-]+)?)[#$%]\s*"
+    r"|^\s*(?:\([^)\r\n]+\)\s+)?[$#]\s+"
 )
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
 PENDING_THREAD_ROTATION_OPTION = "@codex_pending_thread_rotation_count"
@@ -352,9 +361,112 @@ def _submit_text(
 ) -> None:
     commands = commands_for_step(target, RecoveryStep("text", value))
     runner(commands[0], check=True)
-    # Codex treats a rapid text-plus-Enter burst as pasted multiline input.
-    sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
-    runner(commands[1], check=True)
+    # Codex can still be mounting its composer after the text arrives. Only
+    # retry when the exact submitted value is still in the current input block
+    # (or a known selection prompt is still visible).
+    for attempt in range(TEXT_SUBMIT_RETRY_COUNT + 1):
+        sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
+        enter_result = runner(commands[1], check=True)
+        # Lightweight test/dry-run runners may not return a process result.
+        if not hasattr(enter_result, "returncode"):
+            return
+        if attempt == TEXT_SUBMIT_RETRY_COUNT:
+            return
+        try:
+            result = runner(
+                [
+                    "tmux",
+                    "capture-pane",
+                    "-p",
+                    "-J",
+                    "-t",
+                    target,
+                    "-S",
+                    f"-{TEXT_SUBMIT_CAPTURE_LINES}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        if getattr(result, "returncode", 0) != 0:
+            return
+        screen = getattr(result, "stdout", "")
+        pending_kind = _submission_pending_kind(screen, value)
+        if pending_kind is None:
+            return
+        if pending_kind == "shell":
+            # A shell command may remain in scrollback while Codex is already
+            # running. Retry only when the pane is still an interactive shell.
+            pane_command = _current_pane_command(target, runner=runner)
+            if pane_command not in SHELL_COMMANDS:
+                return
+
+
+def _submission_is_pending(screen: str, normalized_value: str) -> bool:
+    return _submission_pending_kind(screen, normalized_value) is not None
+
+
+def _submission_pending_kind(screen: str, value: str) -> str | None:
+    lines = ANSI_ESCAPE_RE.sub("", screen).splitlines()
+    normalized_value = normalize_terminal_text(value)
+
+    prompt_indices: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("›"):
+            prompt_indices.append((index, "codex"))
+        elif SHELL_PROMPT_RE.match(line):
+            prompt_indices.append((index, "shell"))
+    if prompt_indices:
+        prompt_index, prompt_kind = prompt_indices[-1]
+        composer = normalize_terminal_text(" ".join(lines[prompt_index:]))
+        if "Create a plan?" in composer:
+            return "picker"
+        if not normalized_value:
+            return None
+        if _submitted_text_matches(composer, normalized_value):
+            return prompt_kind
+        return None
+
+    # A picker can be rendered without a composer marker during startup.
+    tail = normalize_terminal_text(
+        " ".join(lines[-TEXT_SUBMIT_CAPTURE_LINES:])
+    )
+    return "picker" if "Create a plan?" in tail else None
+
+
+def _submitted_text_matches(composer: str, expected: str) -> bool:
+    if expected in composer:
+        return True
+    if len(expected) < 48:
+        return False
+    # Very long input can scroll its prefix out of the capture window. Seeing
+    # both stable ends in the current composer still identifies the pending
+    # submission without matching an older transcript line.
+    return expected[:48] in composer and expected[-48:] in composer
+
+
+def _current_pane_command(target: str, *, runner=subprocess.run) -> str:
+    try:
+        result = runner(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{pane_current_command}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if getattr(result, "returncode", 0) != 0:
+        return ""
+    return getattr(result, "stdout", "").strip()
 
 
 def wait_for_pane_state(
@@ -732,11 +844,13 @@ def monitor_pipe_command(
     max_recoveries: int = 0,
     compact_wait_seconds: int = 600,
     thread_max_compactions: int = 3,
-    thread_max_rollout_bytes: int = 128 * 1024 * 1024,
-    thread_max_context_tokens: int = 850_000,
+    thread_max_rollout_bytes: int = 512 * 1024 * 1024,
+    thread_max_context_tokens: int = 0,
     thread_no_progress_tokens: int = 1_000_000,
     thread_no_event_seconds: int = 30 * 60,
     thread_health_poll_seconds: int = 30,
+    thread_max_repeated_content: int = 3,
+    thread_max_repeated_commands: int = 3,
 ) -> str:
     root = str(Path(root_dir).resolve())
     parts = [
@@ -779,6 +893,10 @@ def monitor_pipe_command(
         str(thread_no_event_seconds),
         "--thread-health-poll-seconds",
         str(thread_health_poll_seconds),
+        "--thread-max-repeated-content",
+        str(thread_max_repeated_content),
+        "--thread-max-repeated-commands",
+        str(thread_max_repeated_commands),
     ]
     command = shlex.join(parts)
     return f"{command} >> {shlex.quote(log_path)} 2>&1"

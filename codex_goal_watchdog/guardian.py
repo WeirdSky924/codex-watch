@@ -277,11 +277,11 @@ def _recovery_config(
             option_getter(
                 session,
                 "@codex_thread_max_rollout_bytes",
-                str(128 * 1024 * 1024),
+                str(512 * 1024 * 1024),
             )
         ),
         thread_max_context_tokens=int(
-            option_getter(session, "@codex_thread_max_context_tokens", "850000")
+            option_getter(session, "@codex_thread_max_context_tokens", "0")
         ),
         thread_no_progress_tokens=int(
             option_getter(session, "@codex_thread_no_progress_tokens", "1000000")
@@ -291,6 +291,12 @@ def _recovery_config(
         ),
         thread_health_poll_seconds=int(
             option_getter(session, "@codex_thread_health_poll_seconds", "30")
+        ),
+        thread_max_repeated_content=int(
+            option_getter(session, "@codex_thread_max_repeated_content", "3")
+        ),
+        thread_max_repeated_commands=int(
+            option_getter(session, "@codex_thread_max_repeated_commands", "3")
         ),
         resume_prompt=option_getter(
             session, "@codex_resume_prompt", DEFAULT_RESUME_PROMPT
@@ -411,6 +417,8 @@ def run_guardian(
                     thread_no_progress_tokens=config.thread_no_progress_tokens,
                     thread_no_event_seconds=config.thread_no_event_seconds,
                     thread_health_poll_seconds=config.thread_health_poll_seconds,
+                    thread_max_repeated_content=config.thread_max_repeated_content,
+                    thread_max_repeated_commands=config.thread_max_repeated_commands,
                 )
                 subprocess.run(
                     ["tmux", "pipe-pane", "-o", "-t", session, pipe_command],

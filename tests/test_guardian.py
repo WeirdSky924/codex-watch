@@ -210,6 +210,8 @@ class GuardianTests(unittest.TestCase):
             "@codex_thread_no_progress_tokens": "9012",
             "@codex_thread_no_event_seconds": "3456",
             "@codex_thread_health_poll_seconds": "78",
+            "@codex_thread_max_repeated_content": "4",
+            "@codex_thread_max_repeated_commands": "5",
         }
 
         config = _recovery_config(
@@ -223,6 +225,8 @@ class GuardianTests(unittest.TestCase):
         self.assertEqual(9012, config.thread_no_progress_tokens)
         self.assertEqual(3456, config.thread_no_event_seconds)
         self.assertEqual(78, config.thread_health_poll_seconds)
+        self.assertEqual(4, config.thread_max_repeated_content)
+        self.assertEqual(5, config.thread_max_repeated_commands)
 
     def test_visible_recovery_requires_active_or_blocked_goal(self):
         def runner(command, **kwargs):

@@ -105,12 +105,22 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--compact-wait-seconds", type=int, default=600)
     start.add_argument("--thread-max-compactions", type=int, default=3)
     start.add_argument(
-        "--thread-max-rollout-bytes", type=int, default=128 * 1024 * 1024
+        "--thread-max-rollout-bytes", type=int, default=512 * 1024 * 1024
     )
-    start.add_argument("--thread-max-context-tokens", type=int, default=850_000)
+    start.add_argument(
+        "--thread-max-context-tokens",
+        type=int,
+        default=0,
+        help=(
+            "legacy compatibility option; ignored because Codex owns "
+            "context-window management"
+        ),
+    )
     start.add_argument("--thread-no-progress-tokens", type=int, default=1_000_000)
     start.add_argument("--thread-no-event-seconds", type=int, default=30 * 60)
     start.add_argument("--thread-health-poll-seconds", type=int, default=30)
+    start.add_argument("--thread-max-repeated-content", type=int, default=3)
+    start.add_argument("--thread-max-repeated-commands", type=int, default=3)
     start.add_argument("--log-path", default="")
     start_mode = start.add_mutually_exclusive_group()
     start_mode.add_argument("--resume", action="store_true")
@@ -143,12 +153,19 @@ def main(argv: list[str] | None = None) -> int:
     monitor.add_argument("--compact-wait-seconds", type=int, default=600)
     monitor.add_argument("--thread-max-compactions", type=int, default=3)
     monitor.add_argument(
-        "--thread-max-rollout-bytes", type=int, default=128 * 1024 * 1024
+        "--thread-max-rollout-bytes", type=int, default=512 * 1024 * 1024
     )
-    monitor.add_argument("--thread-max-context-tokens", type=int, default=850_000)
+    monitor.add_argument(
+        "--thread-max-context-tokens",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
     monitor.add_argument("--thread-no-progress-tokens", type=int, default=1_000_000)
     monitor.add_argument("--thread-no-event-seconds", type=int, default=30 * 60)
     monitor.add_argument("--thread-health-poll-seconds", type=int, default=30)
+    monitor.add_argument("--thread-max-repeated-content", type=int, default=3)
+    monitor.add_argument("--thread-max-repeated-commands", type=int, default=3)
 
     guardian = subparsers.add_parser(
         "guardian", help="supervise and restore the tmux output monitor"
@@ -182,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
             thread_no_progress_tokens=args.thread_no_progress_tokens,
             thread_no_event_seconds=args.thread_no_event_seconds,
             thread_health_poll_seconds=args.thread_health_poll_seconds,
+            thread_max_repeated_content=args.thread_max_repeated_content,
+            thread_max_repeated_commands=args.thread_max_repeated_commands,
             resume_prompt=args.resume_prompt,
         )
         monitor_stdin(args.session, config)
@@ -358,6 +377,12 @@ def main(argv: list[str] | None = None) -> int:
             "@codex_thread_health_poll_seconds": str(
                 args.thread_health_poll_seconds
             ),
+            "@codex_thread_max_repeated_content": str(
+                args.thread_max_repeated_content
+            ),
+            "@codex_thread_max_repeated_commands": str(
+                args.thread_max_repeated_commands
+            ),
             "@codex_log_path": log_path,
             "@codex_resume_prompt": args.resume_prompt,
         }
@@ -383,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
         thread_no_progress_tokens=args.thread_no_progress_tokens,
         thread_no_event_seconds=args.thread_no_event_seconds,
         thread_health_poll_seconds=args.thread_health_poll_seconds,
+        thread_max_repeated_content=args.thread_max_repeated_content,
+        thread_max_repeated_commands=args.thread_max_repeated_commands,
     )
 
     run_command(tmux_pipe_pane_command(args.session, pipe_command))

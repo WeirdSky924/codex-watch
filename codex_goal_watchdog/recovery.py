@@ -14,10 +14,6 @@ from .launcher import build_codex_command
 DEFAULT_STALL_PATTERN = (
     "codex upstream stalled: no real data for 5m0s, connection recycled"
 )
-CONTEXT_WINDOW_EXHAUSTED_PATTERN = (
-    "Codex ran out of room in the model's context window. "
-    "Start a new thread or clear earlier history before retrying."
-)
 MODEL_AT_CAPACITY_PATTERN = (
     "Selected model is at capacity. Please try a different model"
 )
@@ -32,7 +28,6 @@ THREAD_ROTATION_RECOVERY_REASONS = {
 }
 COMPACTION_RECOVERY_REASONS = {
     "codex_upstream_stalled",
-    "context_window_exhausted",
 }
 DEFAULT_RESUME_PROMPT = (
     "继续刚才被 5m0s 中断的 goal。从当前仓库状态和最近上下文继续，"
@@ -128,8 +123,6 @@ def classify_recovery_message(message: str) -> str | None:
         return "servers_overloaded"
     if DEFAULT_STALL_PATTERN in message:
         return "codex_upstream_stalled"
-    if CONTEXT_WINDOW_EXHAUSTED_PATTERN in message:
-        return "context_window_exhausted"
     if UPSTREAM_ACCESS_DENIED_PATTERN.lower() in message.lower():
         return "upstream_access_denied"
     if _is_retryable_upstream_error(message):
@@ -181,11 +174,16 @@ class RecoveryConfig:
     compact_wait_seconds: int = 600
     resume_prompt: str = DEFAULT_RESUME_PROMPT
     thread_max_compactions: int = 3
-    thread_max_rollout_bytes: int = 128 * 1024 * 1024
-    thread_max_context_tokens: int = 850_000
+    thread_max_rollout_bytes: int = 512 * 1024 * 1024
+    # Retained only so older launchers and tmux options remain parseable.
+    # Context-window management belongs entirely to Codex and this value is
+    # never used by watchdog recovery decisions.
+    thread_max_context_tokens: int = 0
     thread_no_progress_tokens: int = 1_000_000
     thread_no_event_seconds: int = 30 * 60
     thread_health_poll_seconds: int = 30
+    thread_max_repeated_content: int = 3
+    thread_max_repeated_commands: int = 3
 
 
 @dataclass(frozen=True)
@@ -275,7 +273,15 @@ def thread_rotation_reason(
     total_tokens: int,
     tokens_at_last_progress: int,
     last_event_age_seconds: float,
+    repeated_content_count: int = 0,
+    repeated_command_count: int = 0,
 ) -> str | None:
+    """Return watchdog-owned health failures.
+
+    context_tokens remains an argument for compatibility with older callers
+    and telemetry snapshots, but Codex exclusively owns context compaction
+    and context-window limits. It is intentionally not a trigger.
+    """
     checks = (
         (
             config.thread_max_compactions,
@@ -288,9 +294,14 @@ def thread_rotation_reason(
             "max_rollout_bytes",
         ),
         (
-            config.thread_max_context_tokens,
-            context_tokens,
-            "max_context_tokens",
+            config.thread_max_repeated_content,
+            repeated_content_count,
+            "repeated_content",
+        ),
+        (
+            config.thread_max_repeated_commands,
+            repeated_command_count,
+            "repeated_command",
         ),
         (
             config.thread_no_progress_tokens,

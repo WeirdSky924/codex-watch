@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
@@ -14,6 +16,8 @@ from uuid import UUID
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 DEFAULT_SHELL_SNAPSHOTS_ROOT = Path.home() / ".codex" / "shell_snapshots"
+MIN_REPEATED_CONTENT_CHARS = 16
+COMMAND_TOOL_NAMES = {"exec", "exec_command", "run_command", "shell"}
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,11 @@ class ThreadTelemetry:
     verified_event_count: int = 0
     progress_event_count: int = 0
     latest_failure: TaskFailure | None = None
+    turn_active: bool = False
+    repeated_content_count: int = 0
+    repeated_command_count: int = 0
+    repeated_content_signature: str = ""
+    repeated_command_signature: str = ""
 
 
 VERIFIED_GOAL_STATES = {"achieved", "complete", "completed"}
@@ -271,6 +280,43 @@ def _event_epoch(event: dict, *, fallback: float) -> float:
         return fallback
 
 
+def _normalized_content(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _canonical_tool_input(value: object) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        try:
+            decoded = json.loads(stripped)
+        except (TypeError, json.JSONDecodeError):
+            return stripped.replace("\r\n", "\n")
+        value = decoded
+    if isinstance(value, (dict, list)):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return "" if value is None else str(value).strip()
+
+
+def _repetition_signature(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _next_repetition_streak(
+    previous_signature: str,
+    previous_count: int,
+    value: str,
+) -> tuple[str, int]:
+    if not value:
+        return "", 0
+    signature = _repetition_signature(value)
+    return signature, previous_count + 1 if signature == previous_signature else 1
+
+
 class ThreadTelemetryTracker:
     """Incrementally summarize one rollout without rescanning it on every tick."""
 
@@ -279,9 +325,11 @@ class ThreadTelemetryTracker:
         *,
         thread_id: str,
         sessions_root: Path = DEFAULT_SESSIONS_ROOT,
+        repetition_started_at: float | None = None,
     ) -> None:
         self.thread_id = validate_thread_id(thread_id)
         self.sessions_root = sessions_root
+        self.repetition_started_at = repetition_started_at
         self._path: Path | None = None
         self._offset = 0
         self._partial_line_start: int | None = None
@@ -299,6 +347,83 @@ class ThreadTelemetryTracker:
         self.verified_event_count = 0
         self.progress_event_count = 0
         self.latest_failure: TaskFailure | None = None
+        self.turn_active = False
+        self._reset_repetition_streaks()
+
+    def _reset_repetition_streaks(self) -> None:
+        self.repeated_content_count = 0
+        self.repeated_command_count = 0
+        self.repeated_content_signature = ""
+        self.repeated_command_signature = ""
+        self._content_streak_signature = ""
+        self._content_streak_count = 0
+        self._command_streak_signature = ""
+        self._command_streak_count = 0
+
+    def _consume_repetition_event(self, payload: dict) -> None:
+        payload_type = payload.get("type")
+        if payload_type == "message" and payload.get("role") == "assistant":
+            content = payload.get("content")
+            if isinstance(content, str):
+                text = _normalized_content(content)
+            else:
+                items = content if isinstance(content, list) else []
+                text = _normalized_content(
+                    " ".join(
+                        item.get("text", "")
+                        for item in items
+                        if isinstance(item, dict)
+                        and item.get("type") in {"output_text", "text"}
+                        and isinstance(item.get("text"), str)
+                    )
+                )
+            if len(text) < MIN_REPEATED_CONTENT_CHARS:
+                text = ""
+            (
+                self._content_streak_signature,
+                self._content_streak_count,
+            ) = _next_repetition_streak(
+                self._content_streak_signature,
+                self._content_streak_count,
+                text,
+            )
+            if self._content_streak_count > self.repeated_content_count:
+                self.repeated_content_signature = self._content_streak_signature
+                self.repeated_content_count = self._content_streak_count
+            return
+
+        if payload_type not in {
+            "custom_tool_call",
+            "function_call",
+            "local_shell_call",
+        }:
+            return
+        name = payload.get("name")
+        if payload_type != "local_shell_call" and name not in COMMAND_TOOL_NAMES:
+            return
+        raw_input = payload.get("input")
+        if raw_input is None:
+            raw_input = payload.get("arguments")
+        if raw_input is None:
+            raw_input = payload.get("command") or payload.get("action")
+        if (
+            isinstance(raw_input, str)
+            and "tools.exec_command" not in raw_input
+            and ("tools.write_stdin" in raw_input or "tools.wait" in raw_input)
+        ):
+            return
+        command = _canonical_tool_input(raw_input)
+        (
+            self._command_streak_signature,
+            self._command_streak_count,
+        ) = _next_repetition_streak(
+            self._command_streak_signature,
+            self._command_streak_count,
+            command,
+        )
+        if self._command_streak_count > self.repeated_command_count:
+            self.repeated_command_signature = self._command_streak_signature
+            self.repeated_command_count = self._command_streak_count
 
     def _consume_event(self, event: dict, *, fallback_time: float) -> None:
         observed_at = _event_epoch(event, fallback=fallback_time)
@@ -306,6 +431,26 @@ class ThreadTelemetryTracker:
         payload = event.get("payload")
         payload = payload if isinstance(payload, dict) else {}
         payload_type = payload.get("type")
+
+        if payload_type in {"task_started", "turn_started"}:
+            self.turn_active = True
+            self._reset_repetition_streaks()
+        elif payload_type in {
+            "task_complete",
+            "turn_aborted",
+            "turn_completed",
+        }:
+            self.turn_active = False
+            self._reset_repetition_streaks()
+
+        if (
+            event.get("type") == "response_item"
+            and (
+                self.repetition_started_at is None
+                or observed_at >= self.repetition_started_at
+            )
+        ):
+            self._consume_repetition_event(payload)
 
         compacted = event.get("type") == "compacted" or (
             payload_type == "context_compacted"
@@ -427,6 +572,11 @@ class ThreadTelemetryTracker:
             verified_event_count=self.verified_event_count,
             progress_event_count=self.progress_event_count,
             latest_failure=self.latest_failure,
+            turn_active=self.turn_active,
+            repeated_content_count=self.repeated_content_count,
+            repeated_command_count=self.repeated_command_count,
+            repeated_content_signature=self.repeated_content_signature,
+            repeated_command_signature=self.repeated_command_signature,
         )
 
 

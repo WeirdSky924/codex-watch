@@ -469,6 +469,314 @@ class SessionResolverTests(unittest.TestCase):
         self.assertEqual("turn-503", telemetry.latest_failure.incident_id)
         self.assertIn("503", telemetry.latest_failure.message)
 
+    def test_thread_telemetry_detects_consecutive_repeated_assistant_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            events = [
+                {
+                    "timestamp": "2026-08-27T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                *[
+                    {
+                        "timestamp": f"2026-08-27T08:01:0{index}Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text" if index == 2 else "output_text",
+                                    "text": "The same unresolved state remains.",
+                                }
+                            ],
+                        },
+                    }
+                    for index in range(1, 4)
+                ],
+            ]
+            with path.open("a", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            ).snapshot()
+
+        assert telemetry is not None
+        self.assertTrue(telemetry.turn_active)
+        self.assertEqual(3, telemetry.repeated_content_count)
+        self.assertTrue(telemetry.repeated_content_signature)
+
+    def test_thread_telemetry_detects_repeated_exec_commands_and_resets_streak(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            events = [
+                {
+                    "timestamp": "2026-08-27T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                *[
+                    {
+                        "timestamp": f"2026-08-27T08:01:0{index}Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "input": (
+                                'const r = await tools.exec_command('
+                                '{cmd:"git status --short",workdir:"/workspace"});'
+                            ),
+                        },
+                    }
+                    for index in range(1, 4)
+                ],
+                {
+                    "timestamp": "2026-08-27T08:01:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "input": (
+                            'const r = await tools.exec_command('
+                            '{cmd:"git diff --check",workdir:"/workspace"});'
+                        ),
+                    },
+                },
+            ]
+            with path.open("a", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            ).snapshot()
+
+        assert telemetry is not None
+        self.assertEqual(3, telemetry.repeated_command_count)
+        self.assertTrue(telemetry.repeated_command_signature)
+
+    def test_thread_telemetry_ignores_repetition_before_monitor_activation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            events = [
+                {
+                    "timestamp": "2026-08-27T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                *[
+                    {
+                        "timestamp": f"2026-08-27T08:01:0{index}Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "input": "git status --short",
+                        },
+                    }
+                    for index in range(1, 4)
+                ],
+                *[
+                    {
+                        "timestamp": f"2026-08-27T08:02:0{index}Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "input": "git diff --check",
+                        },
+                    }
+                    for index in range(1, 4)
+                ],
+            ]
+            with path.open("a", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+                repetition_started_at=datetime(
+                    2026, 8, 27, 8, 2, tzinfo=timezone.utc
+                ).timestamp(),
+            ).snapshot()
+
+        assert telemetry is not None
+        self.assertEqual(3, telemetry.repeated_command_count)
+
+    def test_thread_telemetry_ignores_repeated_wait_polling(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-08-27T08:01:00Z",
+                            "type": "event_msg",
+                            "payload": {"type": "task_started"},
+                        }
+                    )
+                    + "\n"
+                )
+                for index in range(1, 5):
+                    stream.write(
+                        json.dumps(
+                            {
+                                "timestamp": f"2026-08-27T08:01:0{index}Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "custom_tool_call",
+                                    "name": "exec",
+                                    "input": (
+                                        "const r = await tools.write_stdin("
+                                        "{session_id:42,chars:\"\"});"
+                                    ),
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            ).snapshot()
+
+        assert telemetry is not None
+        self.assertEqual(0, telemetry.repeated_command_count)
+
+    def test_thread_telemetry_normalizes_repeated_content_whitespace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            events = [
+                {
+                    "timestamp": "2026-08-27T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                *[
+                    {
+                        "timestamp": f"2026-08-27T08:01:0{index}Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": text,
+                                }
+                            ],
+                        },
+                    }
+                    for index, text in enumerate(
+                        (
+                            "The same unresolved state remains.",
+                            "The   same unresolved state remains.",
+                            "The same\nunresolved state remains.",
+                        ),
+                        start=1,
+                    )
+                ],
+            ]
+            with path.open("a", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            ).snapshot()
+
+        assert telemetry is not None
+        self.assertEqual(3, telemetry.repeated_content_count)
+
+    def test_thread_telemetry_canonicalizes_json_command_arguments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = "550e8400-e29b-41d4-a716-446655440000"
+            path = self._write_session(
+                root,
+                thread_id=thread_id,
+                cwd="/workspace/target",
+                started_at=datetime(2026, 8, 27, 8, tzinfo=timezone.utc),
+            )
+            inputs = (
+                '{"cmd":"git status","workdir":"/workspace"}',
+                '{ "workdir": "/workspace", "cmd": "git status" }',
+                '{"cmd":"git status","workdir":"/workspace"}',
+            )
+            events = [
+                {
+                    "timestamp": "2026-08-27T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                *[
+                    {
+                        "timestamp": f"2026-08-27T08:01:0{index}Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec",
+                            "arguments": raw_input,
+                        },
+                    }
+                    for index, raw_input in enumerate(inputs, start=1)
+                ],
+            ]
+            with path.open("a", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(event) + "\n")
+
+            telemetry = ThreadTelemetryTracker(
+                thread_id=thread_id,
+                sessions_root=root,
+            ).snapshot()
+
+        assert telemetry is not None
+        self.assertEqual(3, telemetry.repeated_command_count)
+
 
 if __name__ == "__main__":
     unittest.main()

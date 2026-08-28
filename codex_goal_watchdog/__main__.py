@@ -103,7 +103,15 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--cooldown-seconds", type=int, default=300)
     start.add_argument("--max-recoveries", type=int, default=0)
     start.add_argument("--compact-wait-seconds", type=int, default=600)
-    start.add_argument("--thread-max-compactions", type=int, default=3)
+    start.add_argument(
+        "--thread-max-compactions",
+        type=int,
+        default=0,
+        help=(
+            "legacy compatibility option; ignored because Codex owns "
+            "context compaction"
+        ),
+    )
     start.add_argument(
         "--thread-max-rollout-bytes", type=int, default=512 * 1024 * 1024
     )
@@ -151,7 +159,12 @@ def main(argv: list[str] | None = None) -> int:
     monitor.add_argument("--cooldown-seconds", type=int, default=300)
     monitor.add_argument("--max-recoveries", type=int, default=0)
     monitor.add_argument("--compact-wait-seconds", type=int, default=600)
-    monitor.add_argument("--thread-max-compactions", type=int, default=3)
+    monitor.add_argument(
+        "--thread-max-compactions",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
     monitor.add_argument(
         "--thread-max-rollout-bytes", type=int, default=512 * 1024 * 1024
     )

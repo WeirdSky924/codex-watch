@@ -763,6 +763,36 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual([], calls)
 
+    def test_health_tick_ignores_compaction_count(self):
+        calls = []
+        telemetry = ThreadTelemetry(
+            thread_id=THREAD_ID,
+            rollout_path=Path("/tmp/rollout.jsonl"),
+            rollout_bytes=100,
+            total_tokens=100,
+            context_tokens=400,
+            context_window=1_000,
+            compaction_count=100,
+            tokens_at_last_progress=100,
+            last_event_at=100.0,
+            last_progress_at=100.0,
+        )
+
+        run_monitor(
+            lines=["Pursuing goal (4m)\n", MONITOR_TICK],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                thread_max_compactions=1,
+            ),
+            resolve_thread_telemetry=lambda thread_id: telemetry,
+            now=iter([100.0, 101.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([], calls)
+
     def test_health_tick_rotates_repeated_command_loop(self):
         calls = []
         handoffs = []

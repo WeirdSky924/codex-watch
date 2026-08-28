@@ -889,7 +889,7 @@ class TmuxControlTests(unittest.TestCase):
         self.assertIn("--max-recoveries 0", command)
         self.assertIn(">> '/tmp/codex watchdog.log' 2>&1", command)
 
-    def test_monitor_pipe_command_includes_thread_health_thresholds(self):
+    def test_monitor_pipe_command_omits_legacy_compaction_threshold(self):
         command = monitor_pipe_command(
             root_dir="/opt/codex-goal-watchdog",
             session="codex-goal",
@@ -911,7 +911,7 @@ class TmuxControlTests(unittest.TestCase):
             thread_max_repeated_commands=5,
         )
 
-        self.assertIn("--thread-max-compactions 3", command)
+        self.assertNotIn("--thread-max-compactions", command)
         self.assertIn("--thread-max-rollout-bytes 1234", command)
         self.assertIn("--thread-max-context-tokens 5678", command)
         self.assertIn("--thread-no-progress-tokens 9012", command)

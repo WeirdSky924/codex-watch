@@ -173,7 +173,9 @@ class RecoveryConfig:
     model_switch_delay_seconds: int = 2
     compact_wait_seconds: int = 600
     resume_prompt: str = DEFAULT_RESUME_PROMPT
-    thread_max_compactions: int = 3
+    # Retained for backwards-compatible config parsing. Codex owns native
+    # context compaction; watchdog never limits the number of compactions.
+    thread_max_compactions: int = 0
     thread_max_rollout_bytes: int = 512 * 1024 * 1024
     # Retained only so older launchers and tmux options remain parseable.
     # Context-window management belongs entirely to Codex and this value is
@@ -278,16 +280,11 @@ def thread_rotation_reason(
 ) -> str | None:
     """Return watchdog-owned health failures.
 
-    context_tokens remains an argument for compatibility with older callers
-    and telemetry snapshots, but Codex exclusively owns context compaction
-    and context-window limits. It is intentionally not a trigger.
+    compaction_count and context_tokens remain arguments for compatibility with
+    older callers and telemetry snapshots. Codex exclusively owns context
+    compaction and context-window limits; neither value is a trigger.
     """
     checks = (
-        (
-            config.thread_max_compactions,
-            compaction_count,
-            "max_compactions",
-        ),
         (
             config.thread_max_rollout_bytes,
             rollout_bytes,

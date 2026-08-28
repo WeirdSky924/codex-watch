@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.22] - 2026-08-29
+
+### Changed
+
+- Remove the watchdog-owned `max_compactions` thread-health trigger. Codex may
+  compact a thread any number of times, and historical or native compaction
+  events can no longer cause an unnecessary thread rotation.
+- Keep the legacy `--thread-max-compactions` option parseable but ignored, so
+  existing tmux and guardian configurations remain compatible.
+- Ordinary fatal recovery and the 5m0s compact flow continue the pinned Codex
+  thread. Fresh-thread recovery remains limited to an upstream access denial
+  or a compact timeout, plus explicitly configured watchdog health detectors.
+
 ## [0.1.21] - 2026-08-28
 
 ### Fixed

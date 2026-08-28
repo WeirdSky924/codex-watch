@@ -411,7 +411,7 @@ watchdog 会在本机 monitor 内部读取固定 thread 的 rollout 增量，不
 Codex 模型每隔 30 秒执行一次 `ps`、`tail` 或其他状态轮询。默认阈值为：
 
 ```text
-thread max compactions:       3
+thread max compactions:       disabled (legacy option; ignored)
 thread max rollout bytes:     536870912 (512 MiB)
 thread no-progress tokens:    1000000
 thread no-event seconds:      1800 (30 分钟)
@@ -420,12 +420,14 @@ thread max repeated content:  3
 thread max repeated commands: 3
 ```
 
-阈值只对 `Pursuing`、`Goal stalled` 和 `Goal blocked` 生效；没有 Goal、普通
-paused Goal 或已完成 Goal 不会因为历史体积触发轮换。达到任一阈值时，watchdog
-会把最近的 Goal Objective 和有限遥测写入私有状态目录的 handoff 文件，然后
-退出旧 Codex、启动不带旧 thread ID 的新 Codex thread，并要求新 thread 先按
-当前工作树、ACTIVE Plan 和 canonical 记录校准，再创建同一 Goal。旧 thread
-不会被删除，rollout 也不会被修改。
+`max_compactions` 不属于有效健康阈值。Codex 的原生或历史 `compacted` /
+`context_compacted` 事件不会触发 watchdog 轮换；一个 thread 可以进行任意多次
+compact。其余阈值只对 `Pursuing`、`Goal stalled` 和 `Goal blocked` 生效；没有
+Goal、普通 paused Goal 或已完成 Goal 不会因为历史体积触发轮换。达到仍有效的
+watchdog 阈值时，watchdog 会把最近的 Goal Objective 和有限遥测写入私有状态
+目录的 handoff 文件，然后退出旧 Codex、启动不带旧 thread ID 的新 Codex thread，
+并要求新 thread 先按当前工作树、ACTIVE Plan 和 canonical 记录校准，再创建同一
+Goal。旧 thread 不会被删除，rollout 也不会被修改。
 
 重复内容和重复命令检测只处理 monitor 启动后新增的 rollout 事件，并按同一
 active turn 内的连续 streak 计数。连续第三次出现相同的 assistant 输出或相同
@@ -435,18 +437,20 @@ active turn 内的连续 streak 计数。连续第三次出现相同的 assistan
 
 compact 等待超过 `--compact-wait-seconds` 时，流程会把它视为压缩失败，写入
 `compaction_timeout` handoff 并走同一套新 thread 轮换；不会无限等待，也不会
-反复让模型执行状态查询。
+反复让模型执行状态查询。该新 thread 例外仅适用于压缩确实超时，不能由
+compaction 次数触发。
 
-恢复次数与成功 compact 次数保存在 watchdog session binding 中。guardian 接管、
-monitor 重挂或 tmux 重启都不会清零；只有检测到新的成功 `task_complete`、成功
-`context_compacted` 或新 thread 已完成可验证接力后才会清零。`--max-recoveries 0`
-仍表示无限恢复，长会话健康轮换不会改变这一设置。
+恢复次数保存在 watchdog session binding 中。guardian 接管、monitor 重挂或 tmux
+重启都不会清零；只有检测到新的成功 `task_complete`、成功 `context_compacted` 或
+新 thread 已完成可验证接力后才会清零。`context_compacted` 只作为 Codex 恢复
+验证和遥测事件，不会累计成 thread 上限，也不会单独触发新 thread。`--max-recoveries
+0` 仍表示无限恢复，长会话健康轮换不会改变这一设置。
 
 可按项目调整 watchdog 自己负责的阈值：
 
 ```bash
 codex-watch --safe \
-  --thread-max-compactions 3 \
+  --thread-max-compactions 0 \
   --thread-max-rollout-bytes 536870912 \
   --thread-no-progress-tokens 1000000 \
   --thread-no-event-seconds 1800 \
@@ -455,9 +459,11 @@ codex-watch --safe \
   --thread-max-repeated-commands 3
 ```
 
-将某个 watchdog 阈值设为 `0` 或负数可关闭该项检查。watchdog 不再读取
+将某个仍有效的 watchdog 阈值设为 `0` 或负数可关闭该项检查。watchdog 不再读取
 `context_tokens` 或 `model_context_window` 来决定 compact、重启或新建 thread；
 上下文窗口、上下文上限和自动 compact 触发值全部由 Codex 自身决定。
+`--thread-max-compactions` 无论传入何值都不会产生 watchdog 行为，只为兼容旧
+启动脚本保留。
 旧参数 `--thread-max-context-tokens` 仅为兼容旧启动脚本而保留，传入任何值
 都不会产生 watchdog 行为。
 
@@ -1160,7 +1166,7 @@ sha256sum -c SHA256SUMS
 --cooldown-seconds N               首次恢复失败后再次重试前的等待秒数，默认 300
 --max-recoveries N                 最大恢复次数，0 表示无限
 --compact-wait-seconds N           等待真实压缩事件的超时
---thread-max-compactions N         当前 thread 最大成功压缩次数，默认 3
+--thread-max-compactions N         旧版兼容参数，忽略（Codex 可无限 compact）
 --thread-max-rollout-bytes N       rollout 最大字节数，默认 512 MiB
 --thread-max-context-tokens N      旧版兼容参数，忽略（上下文由 Codex 管理）
 --thread-no-progress-tokens N      无成功进展时允许增长的 token 数，默认 1000000

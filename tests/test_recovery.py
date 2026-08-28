@@ -355,6 +355,7 @@ class RecoveryStepTests(unittest.TestCase):
 
         self.assertEqual(300, config.cooldown_seconds)
         self.assertEqual(0, config.max_recoveries)
+        self.assertEqual(0, config.thread_max_compactions)
 
     def test_recovery_refuses_to_resume_without_pinned_thread(self):
         with self.assertRaisesRegex(ValueError, "thread ID"):
@@ -378,6 +379,18 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertFalse(any("gpt-5.6-luna" in value for value in values))
         self.assertTrue(any("gpt-5.6-sol" in value for value in values))
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
+
+    def test_legacy_max_compactions_reason_resumes_pinned_thread(self):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        steps = build_recovery_steps(
+            RecoveryConfig(thread_id=thread_id),
+            reason="max_compactions",
+        )
+        values = [step.value for step in steps]
+
+        self.assertTrue(any(thread_id in value for value in values))
+        self.assertNotIn("gpt-5.6-luna", " ".join(values))
+        self.assertNotIn("/compact", values)
 
     def test_access_denied_starts_fresh_thread_and_rebuilds_goal(self):
         old_thread_id = "550e8400-e29b-41d4-a716-446655440000"
@@ -553,7 +566,6 @@ class RecoveryStepTests(unittest.TestCase):
 
     def test_thread_health_thresholds_request_rotation(self):
         config = RecoveryConfig(
-            thread_max_compactions=3,
             thread_max_rollout_bytes=1_000,
             thread_no_progress_tokens=500,
             thread_no_event_seconds=120,
@@ -562,7 +574,6 @@ class RecoveryStepTests(unittest.TestCase):
         )
 
         cases = (
-            ({"compaction_count": 3}, "max_compactions"),
             ({"rollout_bytes": 1_000}, "max_rollout_bytes"),
             (
                 {"total_tokens": 1_500, "tokens_at_last_progress": 1_000},
@@ -589,6 +600,21 @@ class RecoveryStepTests(unittest.TestCase):
                     expected,
                     thread_rotation_reason(config, **(defaults | values)),
                 )
+
+    def test_compaction_count_never_requests_thread_rotation(self):
+        config = RecoveryConfig(thread_max_compactions=1)
+
+        self.assertIsNone(
+            thread_rotation_reason(
+                config,
+                compaction_count=100,
+                rollout_bytes=0,
+                context_tokens=0,
+                total_tokens=0,
+                tokens_at_last_progress=0,
+                last_event_age_seconds=0,
+            )
+        )
 
     def test_context_usage_never_requests_thread_rotation(self):
         config = RecoveryConfig(thread_max_context_tokens=800)

@@ -271,7 +271,7 @@ def _recovery_config(
             option_getter(session, "@codex_compact_wait_seconds", "600")
         ),
         thread_max_compactions=int(
-            option_getter(session, "@codex_thread_max_compactions", "3")
+            option_getter(session, "@codex_thread_max_compactions", "0")
         ),
         thread_max_rollout_bytes=int(
             option_getter(

@@ -429,6 +429,12 @@ watchdog 阈值时，watchdog 会把最近的 Goal Objective 和有限遥测写�
 并要求新 thread 先按当前工作树、ACTIVE Plan 和 canonical 记录校准，再创建同一
 Goal。旧 thread 不会被删除，rollout 也不会被修改。
 
+`no_rollout_events` 只表示真正没有 rollout 活动的安静 thread。若终端持续出现
+503、502、429 或其他已识别的 fatal error，watchdog 会先处理统一 fatal recovery；
+在该 fatal recovery 尚未验证成功时，不会让 `no_rollout_events` 抢先执行。新的
+成功 task/compact 或恢复验证会清除 fatal 状态，之后安静 thread 才重新按健康
+阈值检查；fatal 文本本身不会被当作 rollout 事件计数。
+
 重复内容和重复命令检测只处理 monitor 启动后新增的 rollout 事件，并按同一
 active turn 内的连续 streak 计数。连续第三次出现相同的 assistant 输出或相同
 的 shell `exec` 调用时，使用同一套 handoff 和新 thread 恢复流程；不同内容或

@@ -2,11 +2,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from codex_goal_watchdog.monitor import MONITOR_TICK, run_monitor
 from codex_goal_watchdog.recovery import RecoveryConfig, RecoveryStep
 from codex_goal_watchdog.sessions import ThreadTelemetry, ThreadTelemetryTracker
 from codex_goal_watchdog.tmux_control import (
+    _submit_codex_text,
+    _submit_shell_command,
     _submit_text,
     _submission_is_pending,
     capture_update_prompt_version,
@@ -208,6 +211,55 @@ class TmuxControlTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(enter_calls))
         self.assertEqual(1, len(sleeps))
+
+    @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
+    def test_submit_codex_text_refuses_to_inject_prompt_into_shell(self, _command_mock):
+        calls = []
+
+        with self.assertRaisesRegex(TimeoutError, "Codex text"):
+            _submit_codex_text(
+                "codex-goal",
+                '继续执行，检查 "当前状态"。',
+                runner=lambda command, **kwargs: calls.append(command),
+                sleeper=lambda seconds: None,
+            )
+
+        self.assertEqual([], calls)
+
+    @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
+    def test_submit_codex_quit_is_skipped_when_codex_already_exited(self, _command_mock):
+        calls = []
+
+        _submit_codex_text(
+            "codex-goal",
+            "/quit",
+            runner=lambda command, **kwargs: calls.append(command),
+            sleeper=lambda seconds: None,
+        )
+
+        self.assertEqual([], calls)
+
+    @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
+    def test_submit_shell_command_cancels_bash_continuation_before_launch(self, _command_mock):
+        calls = []
+        sleeps = []
+
+        _submit_shell_command(
+            "codex-goal",
+            "env codex resume abc",
+            runner=lambda command, **kwargs: calls.append(command),
+            sleeper=sleeps.append,
+        )
+
+        self.assertEqual(
+            [
+                ["tmux", "send-keys", "-t", "codex-goal", "C-c"],
+                ["tmux", "send-keys", "-t", "codex-goal", "-l", "env codex resume abc"],
+                ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
+            ],
+            calls,
+        )
+        self.assertEqual([0.5], sleeps)
 
     def test_active_turn_is_not_rotated_for_no_progress_tokens(self):
         calls = []
@@ -448,6 +500,14 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "codex-goal",
+                    "#{pane_current_command}",
+                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "继续 goal"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
@@ -599,6 +659,14 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "codex-goal",
+                    "#{pane_current_command}",
+                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
@@ -630,6 +698,14 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "codex-goal",
+                    "#{pane_current_command}",
+                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
@@ -709,6 +785,14 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "codex-goal",
+                    "#{pane_current_command}",
+                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
@@ -841,6 +925,17 @@ class TmuxControlTests(unittest.TestCase):
 
         self.assertEqual(
             [
+                (
+                    "run",
+                    [
+                        "tmux",
+                        "display-message",
+                        "-p",
+                        "-t",
+                        "codex-goal",
+                        "#{pane_current_command}",
+                    ],
+                ),
                 (
                     "run",
                     ["tmux", "send-keys", "-t", "codex-goal", "-l", "/quit"],

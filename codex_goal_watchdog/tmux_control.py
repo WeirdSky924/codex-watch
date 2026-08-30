@@ -60,6 +60,7 @@ SHELL_PROMPT_RE = re.compile(
     r"|^\s*(?:\([^)\r\n]+\)\s+)?[$#]\s+"
 )
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
+UPDATE_COMPLETION_CONSUMED_OPTION = "@codex_update_completion_consumed"
 PENDING_THREAD_ROTATION_OPTION = "@codex_pending_thread_rotation_count"
 SUCCESSFUL_COMPACTIONS_OPTION = "@codex_successful_compactions"
 LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
@@ -342,7 +343,7 @@ def ensure_codex_version(
 def commands_for_step(target: str, step: RecoveryStep) -> list[list[str]]:
     if step.kind == "key":
         return [["tmux", "send-keys", "-t", target, step.value]]
-    if step.kind == "text":
+    if step.kind in {"text", "shell_command"}:
         return [
             ["tmux", "send-keys", "-t", target, "-l", step.value],
             ["tmux", "send-keys", "-t", target, "Enter"],
@@ -402,6 +403,44 @@ def _submit_text(
             pane_command = _current_pane_command(target, runner=runner)
             if pane_command not in SHELL_COMMANDS:
                 return
+
+
+def _submit_codex_text(
+    target: str,
+    value: str,
+    *,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+) -> None:
+    """Submit text only while the pane is owned by Codex."""
+    pane_command = _current_pane_command(target, runner=runner)
+    if pane_command in SHELL_COMMANDS:
+        if value.strip() == "/quit":
+            return
+        raise TimeoutError(
+            f"refusing to send Codex text to {target}: pane is {pane_command}"
+        )
+    _submit_text(target, value, runner=runner, sleeper=sleeper)
+
+
+def _submit_shell_command(
+    target: str,
+    value: str,
+    *,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+) -> None:
+    """Submit a generated command after resetting any Bash continuation line."""
+    pane_command = _current_pane_command(target, runner=runner)
+    if pane_command not in SHELL_COMMANDS:
+        raise TimeoutError(
+            f"refusing to send Shell command to {target}: "
+            f"pane is {pane_command or '<unknown>'}"
+        )
+    runner(["tmux", "send-keys", "-t", target, "C-c"], check=True)
+    runner(["tmux", "send-keys", "-t", target, "-l", value], check=True)
+    sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
+    runner(["tmux", "send-keys", "-t", target, "Enter"], check=True)
 
 
 def _submission_is_pending(screen: str, normalized_value: str) -> bool:
@@ -592,7 +631,7 @@ def handle_goal_prompt(
             return True
         if goal_state == "stalled":
             if action == "resume_stalled":
-                _submit_text(
+                _submit_codex_text(
                     target,
                     "/goal resume",
                     runner=runner,
@@ -609,7 +648,7 @@ def handle_goal_prompt(
         goal_resume_required = goal_state in {"paused", "usage_limited"}
         if goal_resume_required:
             if action in {"resume", "resume_stalled"}:
-                _submit_text(
+                _submit_codex_text(
                     target,
                     "/goal resume",
                     runner=runner,
@@ -624,7 +663,7 @@ def handle_goal_prompt(
         sleeper(poll_seconds)
 
     if action in {"resume", "resume_stalled"} and send_fallback_prompt:
-        _submit_text(target, prompt, runner=runner, sleeper=sleeper)
+        _submit_codex_text(target, prompt, runner=runner, sleeper=sleeper)
     return False
 
 
@@ -720,7 +759,15 @@ def execute_steps(
             )
             continue
         if step.kind == "text" and not dry_run:
-            _submit_text(
+            _submit_codex_text(
+                target,
+                step.value,
+                runner=runner,
+                sleeper=sleeper,
+            )
+            continue
+        if step.kind == "shell_command" and not dry_run:
+            _submit_shell_command(
                 target,
                 step.value,
                 runner=runner,
@@ -744,6 +791,37 @@ def pending_update_version(target: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def update_completion_consumed(target: str) -> str:
+    result = subprocess.run(
+        ["tmux", "show-option", "-v", "-t", target, UPDATE_COMPLETION_CONSUMED_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def mark_update_completion_consumed(target: str, marker: str = "1") -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            target,
+            UPDATE_COMPLETION_CONSUMED_OPTION,
+            marker or "1",
+        ],
+        check=True,
+    )
+
+
+def clear_update_completion_consumed(target: str) -> None:
+    subprocess.run(
+        ["tmux", "set-option", "-u", "-t", target, UPDATE_COMPLETION_CONSUMED_OPTION],
+        check=True,
+    )
+
+
 def set_pending_update_version(target: str, version: str) -> None:
     subprocess.run(
         ["tmux", "set-option", "-t", target, PENDING_UPDATE_OPTION, version],
@@ -765,6 +843,7 @@ def run_codex_update(
     *,
     resume_goal: bool = True,
 ) -> None:
+    clear_update_completion_consumed(target)
     set_pending_update_version(target, expected_version)
     execute_steps(
         target,

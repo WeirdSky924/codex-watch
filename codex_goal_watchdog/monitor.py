@@ -360,13 +360,17 @@ def run_monitor(
         telemetry = resolve_thread_telemetry(config.thread_id)
         if telemetry is None:
             return False
+        fatal_recovery_active = controller.fatal_recovery_active or bool(
+            telemetry.latest_failure
+            and classify_recovery_message(telemetry.latest_failure.message)
+        )
         progress_tokens = telemetry.total_tokens
-        recent_event = (
+        recent_rollout_event = (
             telemetry.last_event_at > 0
             and observed_at - telemetry.last_event_at
             < max(1, config.thread_health_poll_seconds)
         )
-        if telemetry.turn_active or recent_event:
+        if telemetry.turn_active or recent_rollout_event:
             progress_tokens = telemetry.tokens_at_last_progress
         detail = thread_rotation_reason(
             config,
@@ -376,14 +380,13 @@ def run_monitor(
             ),
             rollout_bytes=telemetry.rollout_bytes,
             context_tokens=telemetry.context_tokens,
-            # A long active turn is work in progress, not a stalled thread.
-            # Context usage is owned by Codex; only watchdog-owned health
-            # signals are evaluated here.
+            # Codex owns context usage; health checks use watchdog signals.
             total_tokens=progress_tokens,
             tokens_at_last_progress=telemetry.tokens_at_last_progress,
             last_event_age_seconds=max(0, observed_at - telemetry.last_event_at),
             repeated_content_count=telemetry.repeated_content_count,
             repeated_command_count=telemetry.repeated_command_count,
+            suppress_no_event=fatal_recovery_active,
         )
         if detail is None:
             return False
@@ -394,7 +397,6 @@ def run_monitor(
             increment_attempt=True,
             observed_at=observed_at,
         )
-
     for line in lines:
         if line is MONITOR_TICK:
             observed_at = now()
@@ -472,14 +474,12 @@ def run_monitor(
         rolling_output = normalize_terminal_text(f"{rolling_output} {normalized_line}")
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
         observed_at = now()
-        if check_thread_health(
-            observed_at=observed_at,
-            goal_state=latest_goal_state,
-            force=False,
+        recovery_reason = classify_recovery_reason(rolling_output)
+        if recovery_reason is None and check_thread_health(
+            observed_at=observed_at, goal_state=latest_goal_state, force=False
         ):
             rolling_output = ""
             continue
-        recovery_reason = classify_recovery_reason(rolling_output)
         if recovery_reason is not None and resolve_recovery_incident is not None:
             incident = resolve_recovery_incident(config.thread_id)
             if incident is None or incident[1] != recovery_reason:

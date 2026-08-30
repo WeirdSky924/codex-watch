@@ -1,6 +1,7 @@
 import unittest
 
 from codex_goal_watchdog.guardian import (
+    UPDATE_COMPLETION_CONSUMED_OPTION,
     _guardian_update_restart_needed,
     _next_recovery_attempt,
     _recovery_config,
@@ -27,6 +28,19 @@ class GuardianTests(unittest.TestCase):
             _guardian_update_restart_needed(
                 "codex-goal",
                 option_getter=lambda session, name, default="": "",
+                completion_checker=lambda session: True,
+            )
+        )
+
+    def test_guardian_does_not_repeat_consumed_update_completion(self):
+        self.assertFalse(
+            _guardian_update_restart_needed(
+                "codex-goal",
+                option_getter=lambda session, name, default="": (
+                    "0.151.0"
+                    if name == UPDATE_COMPLETION_CONSUMED_OPTION
+                    else ""
+                ),
                 completion_checker=lambda session: True,
             )
         )
@@ -157,6 +171,73 @@ class GuardianTests(unittest.TestCase):
 
         self.assertEqual("restarted_after_update", status)
         self.assertEqual(["restart_after_update"], calls)
+
+    def test_guard_once_consumes_update_before_restart(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            stalled_screen=lambda: False,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+            update_restart_needed=lambda: True,
+            consume_update_completion=lambda: calls.append("consume"),
+            restart_after_update=lambda: calls.append("restart"),
+        )
+
+        self.assertEqual("restarted_after_update", status)
+        self.assertEqual(["consume", "restart"], calls)
+
+    def test_guard_once_clears_consumed_update_when_codex_is_running(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            codex_running=lambda: True,
+            clear_update_completion=lambda: calls.append("clear"),
+            stalled_screen=lambda: False,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+        )
+
+        self.assertEqual("healthy", status)
+        self.assertEqual(["clear"], calls)
+
+    def test_guard_once_recovers_when_pipe_is_active_but_codex_is_missing(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            codex_running=lambda: False,
+            missing_codex_recovery_needed=lambda: True,
+            recover_missing_codex=lambda: calls.append("recover_missing"),
+            stalled_screen=lambda: False,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+        )
+
+        self.assertEqual("recovered", status)
+        self.assertEqual(["recover_missing"], calls)
+
+    def test_guard_once_does_not_call_missing_recovery_without_pending_state(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            codex_running=lambda: False,
+            missing_codex_recovery_needed=lambda: False,
+            recover_missing_codex=lambda: calls.append("recover_missing"),
+            stalled_screen=lambda: False,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+        )
+
+        self.assertEqual("codex_missing", status)
+        self.assertEqual([], calls)
 
     def test_update_completion_requires_success_marker_and_shell_pane(self):
         def runner(command, **kwargs):

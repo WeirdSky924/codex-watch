@@ -435,6 +435,7 @@ class ThreadTelemetryTracker:
         if payload_type in {"task_started", "turn_started"}:
             self.turn_active = True
             self._reset_repetition_streaks()
+            self.latest_failure = None
         elif payload_type in {
             "task_complete",
             "turn_aborted",
@@ -471,6 +472,7 @@ class ThreadTelemetryTracker:
         if is_verified_state:
             self.verified_event_count += 1
         if is_progress:
+            self.latest_failure = None
             self.progress_event_count += 1
             self.last_progress_at = max(self.last_progress_at, observed_at)
             self.tokens_at_last_progress = self.total_tokens

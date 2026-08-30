@@ -1,6 +1,8 @@
 import json
 import unittest
+from pathlib import Path
 
+from codex_goal_watchdog.monitor import MONITOR_TICK, run_monitor
 from codex_goal_watchdog.recovery import (
     RecoveryConfig,
     RecoveryController,
@@ -8,11 +10,13 @@ from codex_goal_watchdog.recovery import (
     build_codex_update_steps,
     build_post_update_restart_steps,
     build_recovery_steps,
+    build_shell_restart_steps,
     build_startup_update_steps,
     classify_recovery_message,
     classify_recovery_reason,
     thread_rotation_reason,
 )
+from codex_goal_watchdog.sessions import ThreadTelemetry
 
 
 class RecoveryControllerTests(unittest.TestCase):
@@ -30,6 +34,9 @@ class RecoveryControllerTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual("codex_upstream_stalled", event.reason)
         self.assertEqual(1, controller.recovery_count)
+        self.assertTrue(controller.fatal_recovery_active)
+        controller.reset_after_verified_success()
+        self.assertFalse(controller.fatal_recovery_active)
 
     def test_cooldown_does_not_drop_later_fatal_events(self):
         controller = RecoveryController(
@@ -80,6 +87,26 @@ class RecoveryControllerTests(unittest.TestCase):
 
         self.assertTrue(all(event is not None for event in events))
         self.assertEqual(10, controller.recovery_count)
+
+    def test_fatal_activity_suppresses_only_no_event_rotation(self):
+        config = RecoveryConfig(
+            thread_no_event_seconds=120,
+            thread_max_rollout_bytes=1_000,
+        )
+
+        self.assertEqual(
+            "max_rollout_bytes",
+            thread_rotation_reason(
+                config,
+                compaction_count=0,
+                rollout_bytes=1_000,
+                context_tokens=0,
+                total_tokens=0,
+                tokens_at_last_progress=0,
+                last_event_age_seconds=999,
+                suppress_no_event=True,
+            ),
+        )
 
     def test_classifies_retryable_terminal_http_errors(self):
         for status in (401, 402, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
@@ -142,6 +169,14 @@ class RecoveryControllerTests(unittest.TestCase):
             classify_recovery_reason(
                 '■ {"error":{"message":"Upstream request failed",'
                 '"type":"upstream_error"}}'
+            ),
+        )
+
+    def test_classifies_plain_stream_disconnect_upstream_failure(self):
+        self.assertEqual(
+            "retryable_upstream_error",
+            classify_recovery_reason(
+                "■ stream disconnected before completion: Upstream request failed"
             ),
         )
 
@@ -263,7 +298,7 @@ class RecoveryStepTests(unittest.TestCase):
         values = [step.value for step in steps]
 
         self.assertEqual(RecoveryStep("update_codex", ""), steps[0])
-        self.assertEqual("text", steps[1].kind)
+        self.assertEqual("shell_command", steps[1].kind)
         self.assertIn("gpt-5.6-sol", steps[1].value)
         self.assertIn(config.thread_id, steps[1].value)
         self.assertNotIn("C-c", values)
@@ -271,6 +306,29 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertNotIn("/compact", values)
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
         self.assertEqual(config.resume_prompt, steps[-1].value)
+
+    def test_launch_commands_are_explicit_shell_steps(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+
+        steps = build_recovery_steps(config, reason="retryable_http_503")
+
+        self.assertEqual("shell_command", steps[5].kind)
+        self.assertIn(config.thread_id, steps[5].value)
+
+    def test_shell_restart_applies_cooldown_after_first_failed_attempt(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            cooldown_seconds=300,
+        )
+
+        first = build_shell_restart_steps(config, recovery_attempt=1)
+        retry = build_shell_restart_steps(config, recovery_attempt=2)
+
+        self.assertEqual(RecoveryStep("sleep", "0"), first[0])
+        self.assertEqual(RecoveryStep("sleep", "300"), retry[0])
+        self.assertEqual("shell_command", first[1].kind)
 
     def test_build_recovery_steps_switches_compacts_and_resumes(self):
         config = RecoveryConfig(
@@ -299,7 +357,7 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep("wait_shell", "30"),
                 RecoveryStep("sleep", "0"),
                 RecoveryStep(
-                    "text",
+                    "shell_command",
                     "env -u NO_COLOR -u CODEX_THREAD_ID -u CODEX_CI "
                     "COLORTERM=truecolor "
                     "codex --no-alt-screen -m gpt-5.6-luna -c "
@@ -324,7 +382,7 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep("wait_shell", "30"),
                 RecoveryStep("sleep", "1"),
                 RecoveryStep(
-                    "text",
+                    "shell_command",
                     "env -u NO_COLOR -u CODEX_THREAD_ID -u CODEX_CI "
                     "COLORTERM=truecolor "
                     "codex --no-alt-screen -m gpt-5.6-sol -c "
@@ -669,6 +727,122 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertIn("/state/handoffs/codex-goal.json", values[-1])
         self.assertIn("max_rollout_bytes", values[-1])
         self.assertIn("Goal ID: FE-CREATOR-8", values[-1])
+
+    def test_fatal_output_takes_priority_over_expired_no_event_timer(self):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        calls = []
+        telemetry = ThreadTelemetry(
+            thread_id=thread_id,
+            rollout_path=Path("/tmp/rollout.jsonl"),
+            rollout_bytes=100,
+            total_tokens=100,
+            context_tokens=100,
+            context_window=1_000,
+            compaction_count=0,
+            tokens_at_last_progress=100,
+            last_event_at=100.0,
+            last_progress_at=100.0,
+        )
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=thread_id,
+                thread_no_event_seconds=1,
+                thread_no_progress_tokens=0,
+                thread_max_rollout_bytes=0,
+            ),
+            resolve_thread_telemetry=lambda _thread_id: telemetry,
+            now=iter([100.0, 300.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda _message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertTrue(
+            any(
+                step.kind == "shell_command" and f"resume {thread_id}" in step.value
+                for step in calls[0][1]
+            )
+        )
+
+    def test_plain_upstream_failure_enters_fatal_recovery(self):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        calls = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ stream disconnected before completion: Upstream request failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=thread_id, cooldown_seconds=0),
+            resolve_recovery_incident=lambda _thread_id: (
+                "turn-upstream-failed",
+                "retryable_upstream_error",
+            ),
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda _message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertTrue(
+            any(
+                step.kind == "shell_command" and thread_id in step.value
+                for step in calls[0][1]
+            )
+        )
+
+    def test_repeated_fatal_activity_delays_no_event_rotation(self):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        calls = []
+        telemetry = ThreadTelemetry(
+            thread_id=thread_id,
+            rollout_path=Path("/tmp/rollout.jsonl"),
+            rollout_bytes=100,
+            total_tokens=100,
+            context_tokens=100,
+            context_window=1_000,
+            compaction_count=0,
+            tokens_at_last_progress=100,
+            last_event_at=100.0,
+            last_progress_at=100.0,
+        )
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+                MONITOR_TICK,
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=thread_id,
+                thread_no_event_seconds=120,
+                thread_no_progress_tokens=0,
+                thread_max_rollout_bytes=0,
+            ),
+            resolve_thread_telemetry=lambda _thread_id: telemetry,
+            now=iter([100.0, 101.0, 201.0, 202.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda _message: None,
+        )
+
+        self.assertEqual(2, len(calls))
+        self.assertTrue(
+            all(
+                not any(
+                    step.kind == "text" and "thread-health" in step.value
+                    for step in steps
+                )
+                for _, steps in calls
+            )
+        )
 
 
 if __name__ == "__main__":

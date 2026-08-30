@@ -459,15 +459,26 @@ class SessionResolverTests(unittest.TestCase):
                     + "\n"
                 )
 
-            telemetry = ThreadTelemetryTracker(
+            tracker = ThreadTelemetryTracker(
                 thread_id=thread_id,
                 sessions_root=root,
-            ).snapshot()
+            )
+            telemetry = tracker.snapshot()
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {"type": "event_msg", "payload": {"type": "task_started"}}
+                    )
+                    + "\n"
+                )
+            cleared = tracker.snapshot()
 
         assert telemetry is not None
         assert telemetry.latest_failure is not None
+        assert cleared is not None
         self.assertEqual("turn-503", telemetry.latest_failure.incident_id)
         self.assertIn("503", telemetry.latest_failure.message)
+        self.assertIsNone(cleared.latest_failure)
 
     def test_thread_telemetry_detects_consecutive_repeated_assistant_content(self):
         with tempfile.TemporaryDirectory() as temp_dir:

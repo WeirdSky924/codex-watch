@@ -19,20 +19,26 @@ from .monitor import (
     recovery_goal_state_on_screen,
 )
 from .paths import default_log_path
-from .bindings import save_binding_runtime_state
+from .bindings import load_session_binding, save_binding_runtime_state
 from .recovery import (
     DEFAULT_RESUME_PROMPT,
     RecoveryConfig,
-    build_post_update_restart_steps,
     build_recovery_steps,
+    build_shell_restart_steps,
     classify_recovery_reason,
 )
 from .sessions import ThreadTelemetryTracker, find_latest_goal_objective
 from .tmux_control import (
     LAST_RECOVERY_INCIDENT_OPTION,
     PENDING_UPDATE_OPTION,
+    UPDATE_COMPLETION_CONSUMED_OPTION,
     execute_steps,
+    clear_update_completion_consumed,
+    clear_pending_thread_rotation,
+    mark_update_completion_consumed,
     monitor_pipe_command,
+    pane_codex_running,
+    pending_thread_rotation_count,
 )
 
 
@@ -49,17 +55,27 @@ def guard_once(
     attach_monitor: Callable[[], None],
     update_restart_needed: Callable[[], bool] | None = None,
     restart_after_update: Callable[[], None] | None = None,
+    consume_update_completion: Callable[[], None] | None = None,
+    clear_update_completion: Callable[[], None] | None = None,
+    codex_running: Callable[[], bool] | None = None,
+    missing_codex_recovery_needed: Callable[[], bool] | None = None,
+    recover_missing_codex: Callable[[], None] | None = None,
     inspect_active_screen: bool = True,
 ) -> str:
     if not session_exists():
         return "session_missing"
+    codex_is_running = codex_running is None or codex_running()
+    if codex_is_running and clear_update_completion is not None:
+        clear_update_completion()
     if update_restart_needed is not None and update_restart_needed():
         if restart_after_update is None:
             raise ValueError("update restart callback is required")
+        if consume_update_completion is not None:
+            consume_update_completion()
         restart_after_update()
         return "restarted_after_update"
     monitor_is_active = pipe_active()
-    if monitor_is_active and not inspect_active_screen:
+    if monitor_is_active and not inspect_active_screen and codex_is_running:
         return "healthy"
     if stalled_screen():
         recover()
@@ -67,6 +83,19 @@ def guard_once(
             return "recovered"
         attach_monitor()
         return "recovered_and_reattached"
+    if not codex_is_running:
+        if (
+            missing_codex_recovery_needed is not None
+            and missing_codex_recovery_needed()
+        ):
+            if recover_missing_codex is None:
+                raise ValueError("missing Codex recovery callback is required")
+            recover_missing_codex()
+            if monitor_is_active:
+                return "recovered"
+            attach_monitor()
+            return "recovered_and_reattached"
+        return "codex_missing"
     if monitor_is_active:
         return "healthy"
     attach_monitor()
@@ -191,9 +220,11 @@ def _guardian_update_restart_needed(
     option_getter: Callable[[str, str, str], str] = _tmux_option,
     completion_checker: Callable[[str], bool] = _update_completed_on_shell,
 ) -> bool:
-    return not option_getter(session, PENDING_UPDATE_OPTION, "") and (
-        completion_checker(session)
-    )
+    if option_getter(session, PENDING_UPDATE_OPTION, ""):
+        return False
+    if option_getter(session, UPDATE_COMPLETION_CONSUMED_OPTION, ""):
+        return False
+    return completion_checker(session)
 
 
 def _recovery_reason_on_screen(session: str, *, runner=subprocess.run) -> str | None:
@@ -383,17 +414,56 @@ def run_guardian(
             def restart_after_update() -> None:
                 assert config is not None
                 goal_state = recovery_goal_state_on_screen(session)
+                recovery_attempt = _next_recovery_attempt(session)
+                _mark_verification_pending(session, config)
                 _append_log(
                     log_path,
                     "Codex update completed; restarting pinned thread",
                 )
                 execute_steps(
                     session,
-                    build_post_update_restart_steps(
+                    build_shell_restart_steps(
                         config,
+                        recovery_attempt=recovery_attempt,
                         resume_goal=goal_state not in {"blocked", "stalled"},
+                        resume_stalled_goal=goal_state == "stalled",
                     ),
                 )
+
+            def missing_codex_recovery_needed() -> bool:
+                binding = load_session_binding(session)
+                return (
+                    pending_thread_rotation_count(session) is not None
+                    or bool(binding is not None and binding.verification_pending)
+                )
+
+            def recover_missing_codex() -> None:
+                assert config is not None
+                recovery_attempt = _next_recovery_attempt(session)
+                goal_state = recovery_goal_state_on_screen(session)
+                _mark_verification_pending(session, config)
+                if pending_thread_rotation_count(session) is not None:
+                    clear_pending_thread_rotation(session)
+                _append_log(
+                    log_path,
+                    "Codex process missing; restarting from shell: "
+                    f"recovery #{recovery_attempt}",
+                )
+                execute_steps(
+                    session,
+                    build_shell_restart_steps(
+                        config,
+                        recovery_attempt=recovery_attempt,
+                        resume_goal=goal_state not in {"blocked", "stalled"},
+                        resume_stalled_goal=goal_state == "stalled",
+                    ),
+                )
+
+            def consume_update_completion() -> None:
+                mark_update_completion_consumed(session)
+
+            def clear_update_completion() -> None:
+                clear_update_completion_consumed(session)
 
             def attach_monitor() -> None:
                 assert config is not None
@@ -435,13 +505,22 @@ def run_guardian(
                     session
                 ),
                 restart_after_update=restart_after_update,
+                consume_update_completion=consume_update_completion,
+                clear_update_completion=clear_update_completion,
+                codex_running=lambda: pane_codex_running(session),
+                missing_codex_recovery_needed=missing_codex_recovery_needed,
+                recover_missing_codex=recover_missing_codex,
                 inspect_active_screen=active_screen_check_pending,
             )
             active_screen_check_pending = status in {
                 "session_missing",
                 "restarted_after_update",
             }
-            if status != last_status or status not in {"healthy", "session_missing"}:
+            if status != last_status or status not in {
+                "healthy",
+                "session_missing",
+                "codex_missing",
+            }:
                 _append_log(log_path, f"status={status}")
                 last_status = status
         except Exception as exc:

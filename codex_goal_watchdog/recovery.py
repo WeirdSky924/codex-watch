@@ -21,6 +21,9 @@ SERVERS_OVERLOADED_PATTERN = (
     "Our servers are currently overloaded. Please try again later."
 )
 UPSTREAM_ACCESS_DENIED_PATTERN = "Upstream access denied"
+PLAIN_UPSTREAM_REQUEST_FAILURE_PATTERN = (
+    "stream disconnected before completion: Upstream request failed"
+)
 THREAD_HEALTH_ROTATION_REASON = "thread_health_rotation"
 THREAD_ROTATION_RECOVERY_REASONS = {
     "upstream_access_denied",
@@ -123,6 +126,8 @@ def classify_recovery_message(message: str) -> str | None:
         return "servers_overloaded"
     if DEFAULT_STALL_PATTERN in message:
         return "codex_upstream_stalled"
+    if PLAIN_UPSTREAM_REQUEST_FAILURE_PATTERN.lower() in message.lower():
+        return "retryable_upstream_error"
     if UPSTREAM_ACCESS_DENIED_PATTERN.lower() in message.lower():
         return "upstream_access_denied"
     if _is_retryable_upstream_error(message):
@@ -240,6 +245,7 @@ class RecoveryController:
     ) -> None:
         self.config = config
         self.recovery_count = max(0, initial_recovery_count)
+        self.fatal_recovery_active = False
 
     def observe(self, line: str, now: float) -> RecoveryEvent | None:
         reason = classify_recovery_reason(line)
@@ -247,7 +253,10 @@ class RecoveryController:
             reason = "codex_upstream_stalled"
         if reason is None:
             return None
-        return self.begin(reason=reason, now=now, line=line)
+        event = self.begin(reason=reason, now=now, line=line)
+        if event is not None:
+            self.fatal_recovery_active = True
+        return event
 
     def begin(self, *, reason: str, now: float, line: str = "") -> RecoveryEvent | None:
         if (
@@ -264,6 +273,7 @@ class RecoveryController:
 
     def reset_after_verified_success(self) -> None:
         self.recovery_count = 0
+        self.fatal_recovery_active = False
 
 
 def thread_rotation_reason(
@@ -277,12 +287,14 @@ def thread_rotation_reason(
     last_event_age_seconds: float,
     repeated_content_count: int = 0,
     repeated_command_count: int = 0,
+    suppress_no_event: bool = False,
 ) -> str | None:
     """Return watchdog-owned health failures.
 
     compaction_count and context_tokens remain arguments for compatibility with
     older callers and telemetry snapshots. Codex exclusively owns context
-    compaction and context-window limits; neither value is a trigger.
+    compaction and context-window limits; neither value is a trigger. A fatal
+    recovery may suppress only the no-event check.
     """
     checks = (
         (
@@ -312,6 +324,8 @@ def thread_rotation_reason(
         ),
     )
     for threshold, actual, reason in checks:
+        if suppress_no_event and reason == "no_rollout_events":
+            continue
         if threshold > 0 and actual >= threshold:
             return reason
     return None
@@ -325,7 +339,7 @@ def build_startup_update_steps(
         RecoveryStep("key", "1"),
         RecoveryStep("wait_shell", "300"),
         RecoveryStep("ensure_codex_version", expected_version),
-        RecoveryStep("text", shlex.join(codex_command)),
+        RecoveryStep("shell_command", shlex.join(codex_command)),
         RecoveryStep("wait_codex", "30"),
     ]
 
@@ -350,7 +364,7 @@ def build_codex_update_completion_steps(
     return [
         RecoveryStep("wait_shell", "300"),
         RecoveryStep("ensure_codex_version", expected_version),
-        RecoveryStep("text", primary_command),
+        RecoveryStep("shell_command", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
         _goal_recovery_step(config, resume_goal=resume_goal),
@@ -390,10 +404,44 @@ def build_post_update_restart_steps(
     )
     return [
         RecoveryStep("update_codex", ""),
-        RecoveryStep("text", primary_command),
+        RecoveryStep("shell_command", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
         _goal_recovery_step(config, resume_goal=resume_goal),
+    ]
+
+
+def build_shell_restart_steps(
+    config: RecoveryConfig,
+    *,
+    recovery_attempt: int = 1,
+    resume_goal: bool = True,
+    resume_stalled_goal: bool = False,
+) -> list[RecoveryStep]:
+    """Restart a missing Codex process from an already available shell."""
+    if not config.thread_id:
+        raise ValueError("shell restart requires a pinned Codex thread ID")
+    primary_command = shlex.join(
+        build_codex_command(
+            model=config.primary_model,
+            reasoning_effort=config.primary_reasoning_effort,
+            codex_args=config.codex_args,
+            resume_thread_id=config.thread_id,
+        )
+    )
+    return [
+        RecoveryStep(
+            "sleep",
+            str(config.cooldown_seconds if recovery_attempt > 1 else 0),
+        ),
+        RecoveryStep("shell_command", primary_command),
+        RecoveryStep("wait_codex", "30"),
+        RecoveryStep("sleep", str(config.startup_wait_seconds)),
+        _goal_recovery_step(
+            config,
+            resume_goal=resume_goal,
+            resume_stalled_goal=resume_stalled_goal,
+        ),
     ]
 
 
@@ -455,7 +503,7 @@ def build_recovery_steps(
             RecoveryStep("text", "/quit"),
             RecoveryStep("wait_shell", "30"),
             RecoveryStep("sleep", str(max(0, restart_delay))),
-            RecoveryStep("text", fresh_command),
+            RecoveryStep("shell_command", fresh_command),
             RecoveryStep("wait_codex", "30"),
             RecoveryStep("sleep", str(config.startup_wait_seconds)),
             RecoveryStep(
@@ -477,7 +525,7 @@ def build_recovery_steps(
             RecoveryStep("text", "/quit"),
             RecoveryStep("wait_shell", "30"),
             RecoveryStep("sleep", str(max(0, restart_delay))),
-            RecoveryStep("text", primary_command),
+            RecoveryStep("shell_command", primary_command),
             RecoveryStep("wait_codex", "30"),
             RecoveryStep("sleep", str(config.startup_wait_seconds)),
             _goal_recovery_step(
@@ -492,7 +540,7 @@ def build_recovery_steps(
         RecoveryStep("text", "/quit"),
         RecoveryStep("wait_shell", "30"),
         RecoveryStep("sleep", str(max(0, restart_delay))),
-        RecoveryStep("text", compact_command),
+        RecoveryStep("shell_command", compact_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
         RecoveryStep("leave_goal_paused", ""),
@@ -506,7 +554,7 @@ def build_recovery_steps(
         RecoveryStep("text", "/quit"),
         RecoveryStep("wait_shell", "30"),
         RecoveryStep("sleep", "1"),
-        RecoveryStep("text", primary_command),
+        RecoveryStep("shell_command", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
         _goal_recovery_step(

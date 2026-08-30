@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.23] - 2026-08-29
+
+### Fixed
+
+- Prevent persistent recoverable 503 and other fatal errors from being
+  misclassified as `no_rollout_events` thread health failures.
+- Process terminal fatal output before health rotation and keep the
+  `no_rollout_events` check suppressed while fatal recovery is unverified.
+- Clear the unresolved-failure marker when a new turn or verified progress
+  begins, so genuinely quiet threads remain eligible for the no-event check.
+
 ## [0.1.22] - 2026-08-29
 
 ### Changed

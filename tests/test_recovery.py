@@ -359,6 +359,7 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep(
                     "shell_command",
                     "env -u NO_COLOR -u CODEX_THREAD_ID -u CODEX_CI "
+                    "-u CODEX_SESSION_ID "
                     "COLORTERM=truecolor "
                     "codex --no-alt-screen -m gpt-5.6-luna -c "
                     "'model_reasoning_effort=\"xhigh\"' "
@@ -384,6 +385,7 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep(
                     "shell_command",
                     "env -u NO_COLOR -u CODEX_THREAD_ID -u CODEX_CI "
+                    "-u CODEX_SESSION_ID "
                     "COLORTERM=truecolor "
                     "codex --no-alt-screen -m gpt-5.6-sol -c "
                     "'model_reasoning_effort=\"max\"' "

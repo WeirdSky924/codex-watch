@@ -44,6 +44,8 @@ class LauncherTests(unittest.TestCase):
                 "CODEX_THREAD_ID",
                 "-u",
                 "CODEX_CI",
+                "-u",
+                "CODEX_SESSION_ID",
                 "COLORTERM=truecolor",
                 "codex",
                 "--no-alt-screen",
@@ -54,6 +56,22 @@ class LauncherTests(unittest.TestCase):
                 "--dangerously-bypass-approvals-and-sandbox",
             ],
             command,
+        )
+
+    def test_build_codex_command_unsets_inherited_codex_session_identity(self):
+        command = build_codex_command(
+            model="gpt-5.6-sol",
+            reasoning_effort="max",
+        )
+
+        unset_names = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "-u"
+        ]
+        self.assertEqual(
+            ["NO_COLOR", "CODEX_THREAD_ID", "CODEX_CI", "CODEX_SESSION_ID"],
+            unset_names,
         )
 
     def test_build_codex_command_can_resume_last_session(self):
@@ -73,6 +91,8 @@ class LauncherTests(unittest.TestCase):
                 "CODEX_THREAD_ID",
                 "-u",
                 "CODEX_CI",
+                "-u",
+                "CODEX_SESSION_ID",
                 "COLORTERM=truecolor",
                 "codex",
                 "--no-alt-screen",
@@ -103,6 +123,8 @@ class LauncherTests(unittest.TestCase):
                 "CODEX_THREAD_ID",
                 "-u",
                 "CODEX_CI",
+                "-u",
+                "CODEX_SESSION_ID",
                 "COLORTERM=truecolor",
                 "codex",
                 "--no-alt-screen",

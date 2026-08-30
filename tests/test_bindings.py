@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from codex_goal_watchdog.bindings import (
+    load_thread_handoff,
     load_session_binding,
     save_binding_runtime_state,
     save_session_binding,
@@ -115,6 +116,27 @@ class SessionBindingTests(unittest.TestCase):
         self.assertLess(len(payload), 22_000)
         self.assertEqual(0o600, mode)
         self.assertIn("compaction_timeout", payload)
+
+    def test_thread_handoff_can_be_loaded_by_watchdog_session(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            state_root = Path(temporary_dir)
+            expected_path = save_thread_handoff(
+                session="project-a",
+                thread_id="550e8400-e29b-41d4-a716-446655440000",
+                cwd=Path("/workspace/project-a"),
+                reason="no_rollout_events",
+                goal_objective="Goal ID: FE-CREATOR-8",
+                telemetry={},
+                state_root=state_root,
+            )
+
+            loaded = load_thread_handoff("project-a", state_root=state_root)
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        path, payload = loaded
+        self.assertEqual(expected_path, path)
+        self.assertEqual("no_rollout_events", payload["reason"])
 
 
 if __name__ == "__main__":

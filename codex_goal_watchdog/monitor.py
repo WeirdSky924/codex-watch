@@ -37,6 +37,7 @@ from .sessions import (
     find_latest_task_failure,
 )
 from .tmux_control import (
+    RecoveryInProgress,
     capture_update_prompt_version,
     claim_tmux_recovery_incident_id as _claim_tmux_recovery_incident_id,
     clear_pending_thread_rotation as _clear_pending_thread_rotation,
@@ -151,6 +152,8 @@ def run_monitor(
     resolve_goal_state: Callable[[str], str | None] | None = None,
     initial_verification_pending: bool = False,
     initial_verification_baseline: int = 0,
+    initial_rotation_pending: bool = False,
+    pending_rotation: Callable[[str], int | None] | None = None,
     save_verification_state: Callable[[bool, int], None] | None = None,
 ) -> None:
     from .recovery import RecoveryController
@@ -162,7 +165,13 @@ def run_monitor(
     emit = log or (lambda message: print(message, flush=True))
 
     def default_execute(tmux_target: str, steps: list) -> None:
-        execute_steps(tmux_target, steps)
+        try:
+            execute_steps(tmux_target, steps)
+        except RecoveryInProgress:
+            emit(
+                "[codex-goal-watchdog] recovery already in progress; "
+                "leaving this event for the active recovery owner"
+            )
 
     def default_resume_goal(tmux_target: str) -> None:
         handle_goal_prompt(
@@ -177,12 +186,18 @@ def run_monitor(
         visible_version = capture_update_prompt_version(tmux_target)
         if visible_version is None:
             return
-        _run_codex_update(
-            tmux_target,
-            config,
-            visible_version,
-            resume_goal=latest_goal_state not in {"blocked", "stalled"},
-        )
+        try:
+            _run_codex_update(
+                tmux_target,
+                config,
+                visible_version,
+                resume_goal=latest_goal_state not in {"blocked", "stalled"},
+            )
+        except RecoveryInProgress:
+            emit(
+                "[codex-goal-watchdog] update recovery already in progress; "
+                "leaving ownership with the active worker"
+            )
 
     run_execute = execute or default_execute
     run_resume_goal = resume_goal or default_resume_goal
@@ -198,7 +213,7 @@ def run_monitor(
     )
     preserve_recovery_count_on_rebind = False
     awaiting_verified_success = initial_verification_pending
-    rotation_pending = False
+    rotation_pending = initial_verification_pending or initial_rotation_pending
     successful_compactions = max(0, initial_successful_compactions)
     incident_logs = IncidentLogAggregator(emit)
     verified_event_baselines: dict[str, int] = (
@@ -212,8 +227,10 @@ def run_monitor(
             save_recovery_count(controller.recovery_count)
 
     def reset_after_verified_success() -> None:
+        nonlocal rotation_pending
         controller.reset_after_verified_success()
         persist_recovery_count()
+        rotation_pending = False
         if save_verification_state is not None:
             save_verification_state(False, 0)
 
@@ -412,9 +429,13 @@ def run_monitor(
             resolve_thread_id(target) if resolve_thread_id is not None else None
         )
         if resolved_thread_id and resolved_thread_id != config.thread_id:
+            pending_rotation_on_rebind = (
+                pending_rotation is not None
+                and pending_rotation(target) is not None
+            )
             rebind_recovery_count = (
                 controller.recovery_count
-                if preserve_recovery_count_on_rebind
+                if preserve_recovery_count_on_rebind or pending_rotation_on_rebind
                 else 0
             )
             config = replace(config, thread_id=resolved_thread_id)
@@ -435,7 +456,10 @@ def run_monitor(
             ):
                 save_recovery_count(rebind_recovery_count)
             preserve_recovery_count_on_rebind = False
-            awaiting_verified_success = rebind_recovery_count > 0
+            awaiting_verified_success = (
+                rebind_recovery_count > 0 or pending_rotation_on_rebind
+            )
+            rotation_pending = awaiting_verified_success
             rotation_pending = False
             if awaiting_verified_success:
                 mark_verified_progress_baseline(resolved_thread_id)
@@ -682,7 +706,20 @@ def _save_tmux_successful_compactions(target: str, count: int) -> None:
 
 
 def _save_tmux_thread_id(target: str, thread_id: str) -> None:
+    previous_binding = load_session_binding(target)
     pending_rotation_count = _pending_thread_rotation_count(target)
+    verification_pending = (
+        previous_binding.verification_pending
+        if previous_binding is not None
+        else None
+    )
+    verification_baseline = (
+        previous_binding.verification_baseline
+        if previous_binding is not None
+        else None
+    )
+    if pending_rotation_count is not None:
+        verification_pending = True
     subprocess.run(
         ["tmux", "set-option", "-t", target, "@codex_thread_id", thread_id],
         check=True,
@@ -702,11 +739,15 @@ def _save_tmux_thread_id(target: str, thread_id: str) -> None:
             session=target,
             thread_id=thread_id,
             cwd=cwd,
+            verification_pending=verification_pending,
+            verification_baseline=verification_baseline,
         )
         save_binding_runtime_state(
             session=target,
             recovery_count=rebound_recovery_count,
             successful_compactions=0,
+            verification_pending=verification_pending,
+            verification_baseline=verification_baseline,
         )
 
 
@@ -716,6 +757,7 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
     pane_identity = _tmux_pane_identity(target)
     telemetry_trackers: dict[str, ThreadTelemetryTracker] = {}
     binding = load_session_binding(target)
+    initial_rotation_pending = _pending_thread_rotation_count(target) is not None
     initial_verification_pending = bool(
         binding is not None and binding.thread_id == config.thread_id
         and binding.verification_pending
@@ -775,7 +817,14 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
             f"{active_thread_id}",
             flush=True,
         )
-    _resume_interrupted_update(target, config)
+    try:
+        _resume_interrupted_update(target, config)
+    except RecoveryInProgress:
+        print(
+            "[codex-goal-watchdog] update recovery already in progress; "
+            "continuing with the active monitor",
+            flush=True,
+        )
     initial_incident_id = _tmux_recovery_incident_id(target)
     if not initial_incident_id:
         current_incident = resolve_incremental_recovery_incident(config.thread_id)
@@ -814,5 +863,7 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         resolve_goal_state=recovery_goal_state_on_screen,
         initial_verification_pending=initial_verification_pending,
         initial_verification_baseline=initial_verification_baseline,
+        initial_rotation_pending=initial_rotation_pending,
+        pending_rotation=_pending_thread_rotation_count,
         save_verification_state=save_verification_state,
     )

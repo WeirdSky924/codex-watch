@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .bindings import save_binding_runtime_state
@@ -64,6 +65,38 @@ UPDATE_COMPLETION_CONSUMED_OPTION = "@codex_update_completion_consumed"
 PENDING_THREAD_ROTATION_OPTION = "@codex_pending_thread_rotation_count"
 SUCCESSFUL_COMPACTIONS_OPTION = "@codex_successful_compactions"
 LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
+
+
+class RecoveryInProgress(RuntimeError):
+    """Another watchdog owner currently controls this session recovery."""
+
+
+@contextmanager
+def session_recovery_lock(
+    target: str,
+    *,
+    lock_path: Path | None = None,
+):
+    """Claim one non-blocking recovery lease for a tmux session."""
+    if lock_path is None:
+        lock_root = state_dir()
+        lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_root.chmod(0o700)
+        session_key = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+        lock_path = lock_root / f"recovery-session-{session_key}.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path.parent.chmod(0o700)
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        try:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RecoveryInProgress(
+                f"recovery already in progress for tmux session {target}"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
 
 def normalize_terminal_text(value: str) -> str:
@@ -371,8 +404,6 @@ def _submit_text(
         # Lightweight test/dry-run runners may not return a process result.
         if not hasattr(enter_result, "returncode"):
             return
-        if attempt == TEXT_SUBMIT_RETRY_COUNT:
-            return
         try:
             result = runner(
                 [
@@ -389,10 +420,14 @@ def _submit_text(
                 text=True,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
-            return
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise TimeoutError(
+                f"Codex text submission for {target} could not be verified"
+            ) from exc
         if getattr(result, "returncode", 0) != 0:
-            return
+            raise TimeoutError(
+                f"Codex text submission for {target} could not be verified"
+            )
         screen = getattr(result, "stdout", "")
         pending_kind = _submission_pending_kind(screen, value)
         if pending_kind is None:
@@ -403,6 +438,39 @@ def _submit_text(
             pane_command = _current_pane_command(target, runner=runner)
             if pane_command not in SHELL_COMMANDS:
                 return
+        if attempt == TEXT_SUBMIT_RETRY_COUNT:
+            break
+
+    # A terminal can accept the literal text before its TUI input handler is
+    # ready. Try an explicit carriage return once more, then fail closed if
+    # the recovery-owned prompt is still visible.
+    runner(["tmux", "send-keys", "-t", target, "C-m"], check=True)
+    sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
+    try:
+        result = runner(
+            ["tmux", "capture-pane", "-p", "-J", "-t", target],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TimeoutError(
+            f"Codex text submission for {target} could not be verified"
+        ) from exc
+    if getattr(result, "returncode", 0) != 0:
+        raise TimeoutError(
+            f"Codex text submission for {target} could not be verified"
+        )
+    if (
+        _submission_pending_kind(getattr(result, "stdout", ""), value) is not None
+        or _codex_composer_pending_text(
+            getattr(result, "stdout", ""),
+            expected=value,
+        )
+    ):
+        raise TimeoutError(
+            f"Codex text submission for {target} remained in composer"
+        )
 
 
 def _submit_codex_text(
@@ -421,6 +489,83 @@ def _submit_codex_text(
             f"refusing to send Codex text to {target}: pane is {pane_command}"
         )
     _submit_text(target, value, runner=runner, sleeper=sleeper)
+
+
+def _codex_composer_pending_text(
+    screen: str,
+    *,
+    expected: str | None = None,
+    allow_unmatched: bool = False,
+) -> bool:
+    """Identify an active Codex composer without mistaking transcript text."""
+    lines = ANSI_ESCAPE_RE.sub("", screen).splitlines()
+    prompt_indices = [
+        index for index, line in enumerate(lines) if line.lstrip().startswith("›")
+    ]
+    if not prompt_indices:
+        return False
+    prompt = normalize_terminal_text(" ".join(lines[prompt_indices[-1] :]))
+    if "Ask Codex to do anything" in prompt or "Working (" in prompt:
+        return False
+    if expected is not None and _submitted_text_matches(prompt, expected):
+        return True
+    if allow_unmatched:
+        return True
+    return "上一 Codex thread 因" in prompt or "创建一个不设置 token budget" in prompt
+
+
+def codex_composer_pending(
+    target: str,
+    *,
+    expected: str | None = None,
+    allow_unmatched: bool = False,
+    runner=subprocess.run,
+) -> bool:
+    result = runner(
+        ["tmux", "capture-pane", "-p", "-J", "-t", target],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(result, "returncode", 0) != 0:
+        return False
+    return _codex_composer_pending_text(
+        getattr(result, "stdout", ""),
+        expected=expected,
+        allow_unmatched=allow_unmatched,
+    )
+
+
+def retry_codex_submission(
+    target: str,
+    *,
+    expected: str | None = None,
+    allow_unmatched: bool = False,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+) -> bool:
+    """Retry Enter for a known recovery-owned composer and verify it clears."""
+    if not codex_composer_pending(
+        target,
+        expected=expected,
+        allow_unmatched=allow_unmatched,
+        runner=runner,
+    ):
+        return False
+    for attempt in range(TEXT_SUBMIT_RETRY_COUNT + 1):
+        key = "Enter" if attempt < TEXT_SUBMIT_RETRY_COUNT else "C-m"
+        runner(["tmux", "send-keys", "-t", target, key], check=True)
+        sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
+        if not codex_composer_pending(
+            target,
+            expected=expected,
+            allow_unmatched=allow_unmatched,
+            runner=runner,
+        ):
+            return True
+    raise TimeoutError(
+        f"Codex text submission for {target} remained in composer after retry"
+    )
 
 
 def _submit_shell_command(
@@ -476,14 +621,24 @@ def _submission_pending_kind(screen: str, value: str) -> str | None:
 
 
 def _submitted_text_matches(composer: str, expected: str) -> bool:
-    if expected in composer:
+    composer_key = _submission_match_key(composer)
+    expected_key = _submission_match_key(expected)
+    if expected_key in composer_key:
         return True
-    if len(expected) < 48:
+    if len(expected_key) < 48:
         return False
     # Very long input can scroll its prefix out of the capture window. Seeing
     # both stable ends in the current composer still identifies the pending
     # submission without matching an older transcript line.
-    return expected[:48] in composer and expected[-48:] in composer
+    return (
+        expected_key[:48] in composer_key
+        and expected_key[-48:] in composer_key
+    )
+
+
+def _submission_match_key(value: str) -> str:
+    """Ignore terminal soft-wrap whitespace while comparing one submission."""
+    return re.sub(r"\s+", "", normalize_terminal_text(value))
 
 
 def _current_pane_command(target: str, *, runner=subprocess.run) -> str:
@@ -668,6 +823,24 @@ def handle_goal_prompt(
 
 
 def execute_steps(
+    target: str,
+    steps: list[RecoveryStep],
+    *,
+    dry_run: bool = False,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+) -> None:
+    with session_recovery_lock(target):
+        _execute_steps_unlocked(
+            target,
+            steps,
+            dry_run=dry_run,
+            runner=runner,
+            sleeper=sleeper,
+        )
+
+
+def _execute_steps_unlocked(
     target: str,
     steps: list[RecoveryStep],
     *,

@@ -41,6 +41,8 @@ def build_codex_command(
         "CODEX_THREAD_ID",
         "-u",
         "CODEX_CI",
+        "-u",
+        "CODEX_SESSION_ID",
         "COLORTERM=truecolor",
         "codex",
         "--no-alt-screen",

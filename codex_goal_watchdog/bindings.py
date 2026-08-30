@@ -213,3 +213,21 @@ def save_thread_handoff(
     }
     _atomic_json_write(path, payload)
     return path
+
+
+def load_thread_handoff(
+    session: str,
+    *,
+    state_root: Path | None = None,
+) -> tuple[Path, dict[str, object]] | None:
+    """Load the latest bounded handoff for one watchdog session."""
+    digest = hashlib.sha256(session.encode("utf-8")).hexdigest()
+    root = state_dir() if state_root is None else state_root
+    path = root / "handoffs" / f"{digest}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("session") != session:
+        return None
+    return path, payload

@@ -13,6 +13,7 @@ from codex_goal_watchdog.monitor import (
 )
 from codex_goal_watchdog.recovery import RecoveryConfig
 from codex_goal_watchdog.sessions import ThreadTelemetry
+from codex_goal_watchdog.bindings import SessionBinding
 
 
 THREAD_ID = "550e8400-e29b-41d4-a716-446655440000"
@@ -202,6 +203,37 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(1, len(calls))
         self.assertEqual("resume_stalled_goal_or_prompt", calls[0][1][-1].kind)
+
+    def test_pending_verification_suppresses_health_rotation_until_progress(self):
+        calls = []
+        telemetry = ThreadTelemetry(
+            thread_id=THREAD_ID,
+            rollout_path=Path("/tmp/rollout.jsonl"),
+            rollout_bytes=100,
+            total_tokens=100,
+            context_tokens=100,
+            context_window=1_000,
+            compaction_count=0,
+            tokens_at_last_progress=100,
+            last_event_at=0.0,
+            last_progress_at=0.0,
+        )
+
+        run_monitor(
+            lines=["Pursuing goal (4m)\n", MONITOR_TICK],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                thread_no_event_seconds=1,
+            ),
+            initial_verification_pending=True,
+            resolve_thread_telemetry=lambda _thread_id: telemetry,
+            now=iter([100.0, 200.0]).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda _message: None,
+        )
+
+        self.assertEqual([], calls)
 
     def test_run_monitor_keeps_manual_stall_for_redrawn_fatal_incident(self):
         calls = []
@@ -599,6 +631,8 @@ class MonitorTests(unittest.TestCase):
             session="project-a",
             thread_id=new_thread_id,
             cwd=Path("/workspace/project-a"),
+            verification_pending=None,
+            verification_baseline=None,
         )
 
     @patch("codex_goal_watchdog.monitor._clear_pending_thread_rotation")
@@ -628,6 +662,65 @@ class MonitorTests(unittest.TestCase):
 
         save_count_mock.assert_called_once_with("project-a", 3)
         clear_pending_mock.assert_called_once_with("project-a")
+
+    @patch("codex_goal_watchdog.monitor.save_binding_runtime_state")
+    @patch("codex_goal_watchdog.monitor.load_session_binding")
+    @patch("codex_goal_watchdog.monitor.save_session_binding")
+    @patch("codex_goal_watchdog.monitor._pending_thread_rotation_count", return_value=3)
+    @patch("codex_goal_watchdog.monitor._save_tmux_recovery_count")
+    @patch("codex_goal_watchdog.monitor._save_tmux_successful_compactions")
+    @patch("codex_goal_watchdog.monitor._tmux_pane_identity", return_value=(123, Path("/workspace/project-a")))
+    @patch("codex_goal_watchdog.monitor.subprocess.run")
+    def test_thread_rebind_preserves_verification_pending_state(
+        self,
+        _run_mock,
+        _pane_identity_mock,
+        _save_compactions_mock,
+        _save_count_mock,
+        _pending_count_mock,
+        save_binding_mock,
+        load_binding_mock,
+        save_runtime_mock,
+    ):
+        old_thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id=old_thread_id,
+            cwd=Path("/workspace/project-a"),
+            verification_pending=True,
+            verification_baseline=17,
+        )
+
+        _save_tmux_thread_id("project-a", new_thread_id)
+
+        self.assertEqual(
+            {
+                "session": "project-a",
+                "thread_id": new_thread_id,
+                "cwd": Path("/workspace/project-a"),
+                "verification_pending": True,
+                "verification_baseline": 17,
+            },
+            {
+                "session": save_binding_mock.call_args.kwargs["session"],
+                "thread_id": save_binding_mock.call_args.kwargs["thread_id"],
+                "cwd": save_binding_mock.call_args.kwargs["cwd"],
+                "verification_pending": save_binding_mock.call_args.kwargs.get(
+                    "verification_pending"
+                ),
+                "verification_baseline": save_binding_mock.call_args.kwargs.get(
+                    "verification_baseline"
+                ),
+            },
+        )
+        save_runtime_mock.assert_called_once_with(
+            session="project-a",
+            recovery_count=3,
+            successful_compactions=0,
+            verification_pending=True,
+            verification_baseline=17,
+        )
 
     def test_verified_recovery_resets_count_but_failed_verification_does_not(self):
         calls = []

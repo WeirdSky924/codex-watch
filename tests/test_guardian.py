@@ -1,9 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from codex_goal_watchdog.guardian import (
     UPDATE_COMPLETION_CONSUMED_OPTION,
     _guardian_update_restart_needed,
     _next_recovery_attempt,
+    _pending_rotation_prompt,
     _recovery_config,
     _recovery_reason_on_screen,
     recovery_goal_state_on_screen,
@@ -11,6 +15,8 @@ from codex_goal_watchdog.guardian import (
     _update_completed_on_shell,
     guard_once,
 )
+from codex_goal_watchdog.bindings import save_thread_handoff
+from codex_goal_watchdog.recovery import RecoveryConfig
 
 
 class GuardianTests(unittest.TestCase):
@@ -238,6 +244,83 @@ class GuardianTests(unittest.TestCase):
 
         self.assertEqual("codex_missing", status)
         self.assertEqual([], calls)
+
+    def test_guard_once_retries_pending_submission_before_reporting_health(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            codex_running=lambda: True,
+            pending_submission_recovery_needed=lambda: True,
+            recover_pending_submission=lambda: calls.append("retry") or True,
+            stalled_screen=lambda: False,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+        )
+
+        self.assertEqual("recovered", status)
+        self.assertEqual(["retry"], calls)
+
+    def test_guard_once_reports_recovery_in_progress_when_callback_cannot_claim(self):
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            codex_running=lambda: True,
+            pending_submission_recovery_needed=lambda: True,
+            recover_pending_submission=lambda: False,
+            stalled_screen=lambda: False,
+            recover=lambda: None,
+            attach_monitor=lambda: None,
+        )
+
+        self.assertEqual("recovery_in_progress", status)
+
+    def test_guard_once_reattaches_monitor_after_pending_submission(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: False,
+            codex_running=lambda: True,
+            pending_submission_recovery_needed=lambda: True,
+            recover_pending_submission=lambda: True,
+            stalled_screen=lambda: False,
+            recover=lambda: None,
+            attach_monitor=lambda: calls.append("attach"),
+        )
+
+        self.assertEqual("recovered_and_reattached", status)
+        self.assertEqual(["attach"], calls)
+
+    def test_pending_rotation_prompt_uses_bounded_handoff(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_root = Path(temp_dir)
+            with patch("codex_goal_watchdog.bindings.state_dir", return_value=state_root):
+                handoff = save_thread_handoff(
+                    session="codex-goal",
+                    thread_id="550e8400-e29b-41d4-a716-446655440000",
+                    cwd=Path("/workspace/project"),
+                    reason="no_rollout_events",
+                    goal_objective="Goal ID: FE-CREATOR-8",
+                    telemetry={},
+                    state_root=state_root,
+                )
+                with patch(
+                    "codex_goal_watchdog.guardian.recovery_goal_state_on_screen",
+                    return_value="pursuing",
+                ):
+                    prompt = _pending_rotation_prompt(
+                        "codex-goal",
+                        RecoveryConfig(
+                            thread_id="550e8400-e29b-41d4-a716-446655440000"
+                        ),
+                    )
+
+        self.assertIsNotNone(prompt)
+        assert prompt is not None
+        self.assertIn(str(handoff), prompt)
+        self.assertIn("Goal ID: FE-CREATOR-8", prompt)
 
     def test_update_completion_requires_success_marker_and_shell_pane(self):
         def runner(command, **kwargs):

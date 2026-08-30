@@ -8,14 +8,18 @@ from codex_goal_watchdog.monitor import MONITOR_TICK, run_monitor
 from codex_goal_watchdog.recovery import RecoveryConfig, RecoveryStep
 from codex_goal_watchdog.sessions import ThreadTelemetry, ThreadTelemetryTracker
 from codex_goal_watchdog.tmux_control import (
+    RecoveryInProgress,
     _submit_codex_text,
     _submit_shell_command,
     _submit_text,
+    _submitted_text_matches,
     _submission_is_pending,
     capture_update_prompt_version,
     commands_for_step,
     ensure_codex_version,
     execute_steps,
+    retry_codex_submission,
+    session_recovery_lock,
     goal_state_from_text,
     handle_goal_prompt,
     monitor_pipe_command,
@@ -211,6 +215,81 @@ class TmuxControlTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(enter_calls))
         self.assertEqual(1, len(sleeps))
+
+    def test_submitted_text_match_ignores_soft_wrap_spaces(self):
+        expected = (
+            "上一 Codex thread 因 watchdog thread-health 阈值触发，"
+            "请创建一个不设置 token budget 的新 Goal。"
+        )
+        wrapped = (
+            "› 上一 Codex thread 因 watchdog thread-health 阈值触发，"
+            "请创建一个不设 置 token budget 的新 Goal。"
+        )
+
+        self.assertTrue(_submitted_text_matches(wrapped, expected))
+
+    def test_submit_text_raises_when_composer_remains_after_retries(self):
+        captures = iter(["› handoff prompt\n"] * 12)
+
+        def runner(command, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = next(captures) if command[1] == "capture-pane" else ""
+
+            return Result()
+
+        with self.assertRaisesRegex(TimeoutError, "remained in composer"):
+            _submit_text(
+                "codex-goal",
+                "handoff prompt",
+                runner=runner,
+                sleeper=lambda seconds: None,
+            )
+
+    def test_retry_codex_submission_accepts_wrapped_composer(self):
+        calls = []
+        captures = iter(
+            (
+                "› 上一 Codex thread 因 watchdog thread-health 阈值触发，"
+                "请创建一个不设 置 token budget 的新 Goal。\n",
+                "› Ask Codex to do anything\n",
+            )
+        )
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                returncode = 0
+                stdout = next(captures) if command[1] == "capture-pane" else ""
+
+            return Result()
+
+        self.assertTrue(
+            retry_codex_submission(
+                "codex-goal",
+                expected="上一 Codex thread 因 watchdog thread-health 阈值触发，"
+                "请创建一个不设置 token budget 的新 Goal。",
+                runner=runner,
+                sleeper=lambda seconds: None,
+            )
+        )
+        self.assertEqual(
+            [
+                ["tmux", "capture-pane", "-p", "-J", "-t", "codex-goal"],
+                ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
+                ["tmux", "capture-pane", "-p", "-J", "-t", "codex-goal"],
+            ],
+            calls,
+        )
+
+    def test_session_recovery_lock_is_nonblocking(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "session.lock"
+            with session_recovery_lock("codex-goal", lock_path=lock_path):
+                with self.assertRaises(RecoveryInProgress):
+                    with session_recovery_lock("codex-goal", lock_path=lock_path):
+                        pass
 
     @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
     def test_submit_codex_text_refuses_to_inject_prompt_into_shell(self, _command_mock):

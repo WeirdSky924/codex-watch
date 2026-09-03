@@ -206,6 +206,11 @@ cd codex_goal_watchdog-*/
 被手工停止或禁用后，再次启动对应 watchdog session 就会重新启用它。使用
 `./install.sh --no-service` 且本机不存在该 unit 时，不会调用 systemd。
 
+升级时安装器会先读取所选 session 的 guardian 状态，再刷新文件：已经停止且禁用
+的 session 会继续保持停止，已经运行的 session 会继续运行。systemd unit 使用
+安装器拥有的 `$HOME/.local/bin/codex-watch-guardian` 绝对路径，不会因为 `PATH`
+中存在另一份 watchdog 而加载不同版本。首次安装没有旧状态时，guardian 默认启用。
+
 安装器本身不需要 root。只有安装系统依赖和启用 lingering 时可能需要 `sudo`。
 
 ### 修复 `codex-watch: command not found`
@@ -405,14 +410,14 @@ codex-watch --safe --compact-wait-seconds 600
 
 该数值是超时上限，不是固定睡眠时间。
 
-### 长会话健康阈值与自动轮换
+### 长会话健康遥测
 
 watchdog 会在本机 monitor 内部读取固定 thread 的 rollout 增量，不会让
-Codex 模型每隔 30 秒执行一次 `ps`、`tail` 或其他状态轮询。默认阈值为：
+Codex 模型每隔 30 秒执行一次 `ps`、`tail` 或其他状态轮询。默认遥测字段为：
 
 ```text
 thread max compactions:       disabled (legacy option; ignored)
-thread max rollout bytes:     536870912 (512 MiB)
+thread max rollout bytes:     536870912 (512 MiB; telemetry only)
 thread no-progress tokens:    1000000
 thread no-event seconds:      1800 (30 分钟)
 thread health poll seconds:   30
@@ -422,37 +427,34 @@ thread max repeated commands: 3
 
 `max_compactions` 不属于有效健康阈值。Codex 的原生或历史 `compacted` /
 `context_compacted` 事件不会触发 watchdog 轮换；一个 thread 可以进行任意多次
-compact。其余阈值只对 `Pursuing`、`Goal stalled` 和 `Goal blocked` 生效；没有
-Goal、普通 paused Goal 或已完成 Goal 不会因为历史体积触发轮换。达到仍有效的
-watchdog 阈值时，watchdog 会把最近的 Goal Objective 和有限遥测写入私有状态
-目录的 handoff 文件，然后退出旧 Codex、启动不带旧 thread ID 的新 Codex thread，
-并要求新 thread 先按当前工作树、ACTIVE Plan 和 canonical 记录校准，再创建同一
-Goal。旧 thread 不会被删除，rollout 也不会被修改。
+compact。rollout 大小、无进展 token、无事件时长和重复内容/命令只作为诊断遥测，
+不会触发 thread rotation、compact 或业务恢复。没有 Goal、普通 paused Goal 或已
+完成 Goal 也不会因为这些指标被 watchdog 打断。需要新 thread 时，只能由 Codex
+自身、明确的 upstream access denied 恢复，或一次真实 compact timeout 恢复触发。
 
 `no_rollout_events` 只表示真正没有 rollout 活动的安静 thread。若终端持续出现
 503、502、429 或其他已识别的 fatal error，watchdog 会先处理统一 fatal recovery；
 在该 fatal recovery 尚未验证成功时，不会让 `no_rollout_events` 抢先执行。新的
-成功 task/compact 或恢复验证会清除 fatal 状态，之后安静 thread 才重新按健康
-阈值检查；fatal 文本本身不会被当作 rollout 事件计数。
+成功 task/compact 或恢复验证会清除 fatal 状态；fatal 文本本身不会被当作 rollout
+事件计数。
 
 重复内容和重复命令检测只处理 monitor 启动后新增的 rollout 事件，并按同一
-active turn 内的连续 streak 计数。连续第三次出现相同的 assistant 输出或相同
-的 shell `exec` 调用时，使用同一套 handoff 和新 thread 恢复流程；不同内容或
-命令会结束对应 streak。`write_stdin`、`wait` 等等待轮询不计入重复命令，避免
-正常等待长命令时被误判。将对应阈值设为 `0` 或负数可关闭该项检测。
+active turn 内的连续 streak 计数。它们只作为遥测提供给诊断和 handoff，不会因为
+连续重复而自动打断或轮换 thread。`write_stdin`、`wait` 等等待轮询不计入重复
+命令。将对应阈值设为 `0` 或负数可关闭该项遥测。
 
 compact 等待超过 `--compact-wait-seconds` 时，流程会把它视为压缩失败，写入
 `compaction_timeout` handoff 并走同一套新 thread 轮换；不会无限等待，也不会
 反复让模型执行状态查询。该新 thread 例外仅适用于压缩确实超时，不能由
 compaction 次数触发。
 
-恢复次数保存在 watchdog session binding 中。guardian 接管、monitor 重挂或 tmux
-重启都不会清零；只有检测到新的成功 `task_complete`、成功 `context_compacted` 或
-新 thread 已完成可验证接力后才会清零。`context_compacted` 只作为 Codex 恢复
-验证和遥测事件，不会累计成 thread 上限，也不会单独触发新 thread。`--max-recoveries
-0` 仍表示无限恢复，长会话健康轮换不会改变这一设置。
+恢复次数和恢复阶段保存在 watchdog session binding 中。guardian 接管、monitor
+重挂或 tmux 重启都不会清零；只有检测到新的成功 `task_complete`、成功
+`context_compacted` 或新 thread 已完成可验证接力后才会清零。`context_compacted` 只
+作为 Codex 恢复验证和遥测事件，不会累计成 thread 上限，也不会单独触发新 thread。
+`--max-recoveries 0` 仍表示无限恢复，健康遥测不会改变这一设置。
 
-可按项目调整 watchdog 自己负责的阈值：
+可按项目调整 watchdog 遥测阈值：
 
 ```bash
 codex-watch --safe \
@@ -465,7 +467,7 @@ codex-watch --safe \
   --thread-max-repeated-commands 3
 ```
 
-将某个仍有效的 watchdog 阈值设为 `0` 或负数可关闭该项检查。watchdog 不再读取
+将某个 watchdog 遥测阈值设为 `0` 或负数可关闭该项记录。watchdog 不再读取
 `context_tokens` 或 `model_context_window` 来决定 compact、重启或新建 thread；
 上下文窗口、上下文上限和自动 compact 触发值全部由 Codex 自身决定。
 `--thread-max-compactions` 无论传入何值都不会产生 watchdog 行为，只为兼容旧
@@ -660,6 +662,24 @@ tmux attach -t codex-goal
 
 不需要再次运行 `codex-watch --resume`。
 
+如果 tmux 仍在但 Codex 已经被 `/quit` 退出，进入原项目目录后再次运行：
+
+```bash
+PROJECT_DIR="$HOME/projects/your-project"
+cd "$PROJECT_DIR"
+codex-watch --safe
+```
+
+当该 session 有持久 binding 且 pane 是空闲 Shell 时，watchdog 会自动启动
+binding 中固定的 thread，再挂载 monitor。它不会从目录或全局记录猜测其他
+thread；没有 binding、pane 仍在运行其他前台命令，或目录与 binding 不一致时，
+watchdog 会保持 fail-closed 并要求你明确处理。
+
+monitor 看到滚屏中残留的 `Goal paused` 或恢复选择文本时，会先确认 pane
+仍由 Codex 进程拥有；如果当前只是 Shell，不会把 `/goal resume` 或其他文本
+注入 Shell。此时由显式 `codex-watch` 启动绑定 thread，或由带有 pending
+recovery 状态的 guardian 接管恢复。
+
 ### 情况 B：Codex fatal error，但 tmux 仍在
 
 正常情况下 watchdog 会自动处理，不需要人工操作。可以查看日志：
@@ -776,6 +796,29 @@ systemctl --user restart codex-watch-guardian@codex-goal.service
 systemctl --user stop codex-watch-guardian@codex-goal.service
 ```
 
+### 暂停 watchdog 和内部 Codex thread
+
+暂停时保留 tmux、thread ID、Goal 和恢复状态，只停止自动监控及当前正在执行的
+Codex turn：
+
+```bash
+systemctl --user disable --now codex-watch-guardian@codex-goal.service
+tmux pipe-pane -t codex-goal
+tmux send-keys -t codex-goal C-c
+```
+
+确认状态：
+
+```bash
+tmux list-panes -t codex-goal -F 'pipe=#{pane_pipe} cmd=#{pane_current_command}'
+systemctl --user is-active codex-watch-guardian@codex-goal.service
+systemctl --user is-enabled codex-watch-guardian@codex-goal.service
+```
+
+恢复时从原项目目录执行 `codex-watch --no-attach` 或直接执行
+`codex-watch`。这会按该 watchdog session 自己的持久 binding 恢复 thread，并重新
+启用 guardian；不会选择其他 Codex session。
+
 自定义 session 时替换最后的 `codex-goal`：
 
 ```bash
@@ -827,7 +870,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
 | `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
 | `Our servers are currently overloaded` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试，不执行 compact |
-| Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread |
+| Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread；不计入 fatal recovery 次数，也不执行 300 秒冷静期 |
 
 恢复普通 paused 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。`Goal blocked` 不会自动执行 `/goal resume`，也不会发送文本续接提示；用户完成审核、批准或外部条件处理后再手工恢复。Codex 当前没有向 watchdog 暴露稳定的 blocked 原因分类，因此本工具保守地将所有 blocked 状态都按人工审核处理。
 
@@ -839,6 +882,10 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 
 从 `0.1.4` 开始，Codex 更新页即使出现在 thread ID 创建之前也会由 watchdog 处理。watchdog 会选择 `Update now`、等待官方安装命令结束，然后执行 `codex --version` 核验；如果版本仍低于更新页目标，会额外执行一次 `codex update` 并再次核验。只有真实版本达到目标后才会启动或恢复 Codex，不能再用旧版本继续运行并把更新页留在 tmux 中。
 
+从 `0.1.24` 开始，`--no-alt-screen` 在更新页上方保留旧对话时，watchdog 会识别屏幕尾部的完整更新选择块；如果选择块后已经出现新的 composer、Goal 状态或 Shell 提示，则按历史文本忽略。官方更新返回 Shell 后，pending update 会先核验目标版本，再恢复固定 thread。该重启属于更新流程，不增加 fatal recovery count，也不执行 fatal 的 300 秒冷静期；若原 Goal 已 achieved，只恢复 thread，不等待 Goal 选择页或发送续接文本。
+
+monitor 启动时或运行中明确看到 `Goal achieved`，还会清除该 thread 遗留的 pending verification、recovery phase 和 recovery count。guardian 即使读到旧 binding，也不会在 achieved 或其他非恢复 Goal 状态下仅因 Codex 进程缺失而重启 thread。
+
 从 `0.1.5` 开始，`Selected model is at capacity` 容量告警进入统一 fatal recovery 流程：首次立即恢复，后续失败按冷静期继续重试，默认不限制次数。
 
 同一版本还会在 tmux 输入 `/quit`、`/compact`、`/goal resume`、Codex 启动命令或续接提示后等待并检查 composer；如果原文或 Shell 命令仍停留在输入行，会自动重试 Enter。该确认逻辑由所有恢复路径共用，避免恢复流程停在未发送的输入框。
@@ -848,6 +895,11 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 从 `0.1.7` 开始，Codex TUI 中带 `■` fatal 标记的 HTTP 401（包括 `API DISABLE`）进入统一恢复流程：首次立即恢复，后续失败按冷静期继续重试，默认不限制次数。
 
 从 `0.1.8` 开始，每个 `--session` 的固定 thread ID 会持久保存在 watchdog 状态目录。tmux 消失后，不带模式参数重新启动会恢复该 watchdog session 自己的 ID；`/clear` 后的新 ID 会同步覆盖持久绑定。`--resume` 仅在显式使用时选择当前目录最近的 Codex thread，`--new` 用于明确创建新 thread。
+
+从 `0.1.24` 开始，已有 watchdog binding 的 recovery/compaction 计数在手工重启
+时优先于可能过期的 tmux option；如果 tmux 仍在但 Codex 已退出，`codex-watch`
+会在确认 pane 是空闲 Shell 后恢复这个固定 thread。升级安装会保留 guardian
+原有的启用/停止状态，暂停的 session 不会因为升级被偷偷启动。
 
 从 `0.1.9` 开始，fatal recovery 只在最近 Goal 状态为 `Pursuing goal`、`Goal stalled (/goal resume)` 或 `Goal blocked (/goal resume)` 时运行。Goal 完成后即使屏幕上残留 `503`、`upstream_error` 或其他 fatal 行，也不会再触发恢复链。
 
@@ -1015,7 +1067,7 @@ codex-watch --version
 codex-watch --version
 ```
 
-`0.1.4` 及以后会核验真实安装版本，并在官方更新没有落盘时自动补跑 `codex update`。查看更新处理记录：
+`0.1.24` 及以后还会在 `--no-alt-screen` 保留旧对话时识别屏幕尾部的真实更新页，并在更新进程已经返回 Shell、monitor 中途退出的情况下继续 pending update。更新恢复不会消耗 fatal recovery 次数或等待 fatal 冷静期。watchdog 会核验真实安装版本，并在官方更新没有落盘时自动补跑 `codex update`。查看更新处理记录：
 
 ```bash
 tail -n 100 "$HOME/.local/state/codex-goal-watchdog/watchdog.log"
@@ -1057,7 +1109,19 @@ git pull
 ./install.sh --session codex-goal
 ```
 
-安装器会升级私有虚拟环境并刷新 user service 文件。
+安装器会升级私有虚拟环境并刷新 user service 文件；已有 guardian 的启用/停止
+状态会被保留，首次安装才默认启用 guardian。
+
+如果 session 当前处于暂停状态，升级会保留停止/禁用状态，不会偷偷启动 guardian
+或 Codex。升级后先核对两个入口来自同一版本：
+
+```bash
+codex-watch --version
+codex-watch-guardian --version
+systemctl --user cat codex-watch-guardian@.service
+```
+
+两个版本应一致，unit 的 `ExecStart` 应指向 `$HOME/.local/bin/codex-watch-guardian`。
 
 如果 Codex 当前正在 tmux 中工作，不需要杀掉 Codex。让新 monitor 立即加载更新：
 
@@ -1173,13 +1237,13 @@ sha256sum -c SHA256SUMS
 --max-recoveries N                 最大恢复次数，0 表示无限
 --compact-wait-seconds N           等待真实压缩事件的超时
 --thread-max-compactions N         旧版兼容参数，忽略（Codex 可无限 compact）
---thread-max-rollout-bytes N       rollout 最大字节数，默认 512 MiB
+--thread-max-rollout-bytes N       rollout 大小遥测阈值，默认 512 MiB，不触发轮换
 --thread-max-context-tokens N      旧版兼容参数，忽略（上下文由 Codex 管理）
---thread-no-progress-tokens N      无成功进展时允许增长的 token 数，默认 1000000
---thread-no-event-seconds N        无 rollout 事件阈值，默认 1800
---thread-health-poll-seconds N     本地健康检查间隔，默认 30
---thread-max-repeated-content N    连续重复 assistant 内容阈值，默认 3
---thread-max-repeated-commands N   连续重复 shell 命令阈值，默认 3
+--thread-no-progress-tokens N      无进展遥测阈值，默认 1000000，不触发轮换
+--thread-no-event-seconds N        无事件遥测阈值，默认 1800，不触发轮换
+--thread-health-poll-seconds N     遥测采样间隔，默认 30
+--thread-max-repeated-content N    重复 assistant 内容遥测阈值，默认 3
+--thread-max-repeated-commands N   重复 shell 命令遥测阈值，默认 3
 --resume-prompt TEXT               没有 Goal 状态时使用的续接文本
 --log-path PATH                    覆盖默认日志文件
 --dry-run                          只打印将执行的 tmux/Codex 命令

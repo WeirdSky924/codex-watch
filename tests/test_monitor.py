@@ -83,6 +83,50 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual("codex-goal", calls[0][0])
         self.assertEqual("key", calls[0][1][0].kind)
 
+    def test_run_monitor_does_not_submit_goal_resume_when_codex_is_missing(self):
+        resume_calls = []
+        messages = []
+
+        run_monitor(
+            lines=["Goal paused (/goal resume)\n"],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            codex_running=lambda _target: False,
+            resume_goal=lambda target: resume_calls.append(target),
+            now=lambda: 100.0,
+            log=messages.append,
+        )
+
+        self.assertEqual([], resume_calls)
+        self.assertTrue(
+            any("Codex process is not running" in message for message in messages)
+        )
+
+    def test_run_monitor_does_not_submit_update_when_codex_is_missing(self):
+        update_calls = []
+        messages = []
+
+        run_monitor(
+            lines=[
+                "Update available! 0.144.6 -> 0.145.0\n",
+                "1. Update now (runs npm install)\n",
+                "2. Skip\n3. Skip until next version\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            codex_running=lambda _target: False,
+            update_codex=lambda target, version: update_calls.append(
+                (target, version)
+            ),
+            now=iter([100.0, 101.0, 102.0]).__next__,
+            log=messages.append,
+        )
+
+        self.assertEqual([], update_calls)
+        self.assertTrue(
+            any("skipped Codex update" in message for message in messages)
+        )
+
     def test_run_monitor_suppresses_recovery_after_goal_achieved(self):
         calls = []
         persisted_counts = []
@@ -103,6 +147,67 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual([], calls)
         self.assertEqual([], persisted_counts)
+
+    @patch("codex_goal_watchdog.monitor.load_session_binding", return_value=None)
+    @patch("codex_goal_watchdog.monitor._save_recovery_phase")
+    def test_goal_achieved_clears_pending_recovery_state(
+        self,
+        save_recovery_phase_mock,
+        _load_binding_mock,
+    ):
+        persisted_counts = []
+        verification_states = []
+
+        run_monitor(
+            lines=["Goal achieved\n"],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            initial_recovery_count=2,
+            initial_verification_pending=True,
+            initial_verification_baseline=32,
+            save_recovery_count=persisted_counts.append,
+            save_verification_state=lambda pending, baseline: (
+                verification_states.append((pending, baseline))
+            ),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([0], persisted_counts)
+        self.assertEqual([(False, 0)], verification_states)
+        save_recovery_phase_mock.assert_called_once_with(
+            "codex-goal",
+            "idle",
+            reason="",
+            not_before=0.0,
+        )
+
+    @patch("codex_goal_watchdog.monitor.load_session_binding", return_value=None)
+    @patch("codex_goal_watchdog.monitor._save_recovery_phase")
+    def test_monitor_startup_clears_pending_state_for_achieved_goal(
+        self,
+        _save_recovery_phase_mock,
+        _load_binding_mock,
+    ):
+        persisted_counts = []
+        verification_states = []
+
+        run_monitor(
+            lines=[],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            initial_goal_state="achieved",
+            initial_recovery_count=2,
+            initial_verification_pending=True,
+            initial_verification_baseline=32,
+            save_recovery_count=persisted_counts.append,
+            save_verification_state=lambda pending, baseline: (
+                verification_states.append((pending, baseline))
+            ),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([0], persisted_counts)
+        self.assertEqual([(False, 0)], verification_states)
 
     def test_run_monitor_suppresses_recovery_without_goal_state(self):
         calls = []
@@ -784,7 +889,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(1, len(first_logs))
         self.assertEqual(1, len(summaries))
 
-    def test_health_tick_rotates_large_thread_with_bounded_handoff(self):
+    def test_health_thresholds_are_telemetry_only(self):
         calls = []
         marked_counts = []
         handoffs = []
@@ -820,10 +925,9 @@ class MonitorTests(unittest.TestCase):
             log=lambda message: None,
         )
 
-        self.assertEqual(1, len(calls))
-        self.assertEqual([1], marked_counts)
-        self.assertEqual("max_rollout_bytes", handoffs[0]["reason"])
-        self.assertIn("/state/handoffs/latest.json", calls[0][1][-1].value)
+        self.assertEqual([], calls)
+        self.assertEqual([], marked_counts)
+        self.assertEqual([], handoffs)
 
     def test_health_tick_ignores_context_usage_during_active_turn(self):
         calls = []
@@ -886,7 +990,7 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual([], calls)
 
-    def test_health_tick_rotates_repeated_command_loop(self):
+    def test_repeated_command_detection_does_not_rotate_thread(self):
         calls = []
         handoffs = []
         telemetry = ThreadTelemetry(
@@ -923,9 +1027,103 @@ class MonitorTests(unittest.TestCase):
             log=lambda message: None,
         )
 
+        self.assertEqual([], calls)
+        self.assertEqual([], handoffs)
+
+    def test_monitor_tick_reconciles_current_thread_binding(self):
+        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        rebound_ids = []
+
+        run_monitor(
+            lines=[MONITOR_TICK],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            resolve_thread_id=lambda _target: new_thread_id,
+            save_thread_id=rebound_ids.append,
+            now=lambda: 100.0,
+            log=lambda _message: None,
+        )
+
+        self.assertEqual([new_thread_id], rebound_ids)
+
+    def test_fatal_recovery_waits_for_persisted_cooldown(self):
+        calls = []
+        messages = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            initial_recovery_count=1,
+            recovery_deferred=lambda: True,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=messages.append,
+        )
+
         self.assertEqual(1, len(calls))
-        self.assertEqual("repeated_command", handoffs[0]["reason"])
-        self.assertIn("/state/handoffs/latest.json", calls[0][1][-1].value)
+        self.assertTrue(
+            any(step.kind == "sleep" and step.value == "300" for step in calls[0][1])
+        )
+        self.assertTrue(any("deferred during cooldown" in item for item in messages))
+
+    def test_new_fatal_recovery_is_not_dropped_during_persisted_cooldown(self):
+        calls = []
+        messages = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
+            initial_recovery_count=1,
+            recovery_deferred=lambda: True,
+            resolve_recovery_incident=lambda _thread_id: (
+                "turn-new-503",
+                "retryable_http_503",
+            ),
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=messages.append,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertTrue(
+            any(step.kind == "sleep" and step.value == "300" for step in calls[0][1])
+        )
+        self.assertTrue(any("cooldown" in item for item in messages))
+
+    def test_distinct_fatal_incidents_during_cooldown_keep_their_order(self):
+        calls = []
+        incidents = iter(
+            [
+                ("turn-503-a", "retryable_http_503"),
+                ("turn-503-b", "retryable_http_503"),
+            ]
+        )
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+                "Pursuing goal (5m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
+            recovery_deferred=lambda: True,
+            resolve_recovery_incident=lambda _thread_id: next(incidents),
+            execute=lambda target, steps: calls.append((target, steps)),
+            now=iter([100.0, 101.0, 102.0, 103.0]).__next__,
+            log=lambda _message: None,
+        )
+
+        assert len(calls) == 2
+        assert not any(step.kind == "sleep" and step.value == "300" for step in calls[0][1])
+        assert any(step.kind == "sleep" and step.value == "300" for step in calls[1][1])
 
     def test_compaction_timeout_falls_back_to_fresh_thread_rotation(self):
         calls = []

@@ -19,10 +19,14 @@ from codex_goal_watchdog.tmux_control import (
     ensure_codex_version,
     execute_steps,
     retry_codex_submission,
+    recovery_not_before,
+    recovery_phase,
+    save_recovery_phase,
     session_recovery_lock,
     goal_state_from_text,
     handle_goal_prompt,
     monitor_pipe_command,
+    resume_interrupted_update,
     update_prompt_version,
     wait_for_pane_state,
 )
@@ -32,6 +36,49 @@ THREAD_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
 class TmuxControlTests(unittest.TestCase):
+    def test_recovery_phase_round_trip_uses_tmux_options(self):
+        values = {
+            "@codex_recovery_phase": "cooldown",
+            "@codex_recovery_not_before": "1234.5",
+        }
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                returncode = 0
+                stdout = values.get(command[-1], "")
+
+            return Result()
+
+        self.assertEqual(
+            "cooldown",
+            recovery_phase("codex-goal", runner=runner),
+        )
+        self.assertEqual(
+            1234.5,
+            recovery_not_before("codex-goal", runner=runner),
+        )
+
+        save_recovery_phase(
+            "codex-goal",
+            "awaiting_verification",
+            not_before=9.0,
+            reason="503",
+            runner=runner,
+        )
+
+        self.assertEqual(
+            [
+                ["tmux", "show-option", "-v", "-t", "codex-goal", "@codex_recovery_phase"],
+                ["tmux", "show-option", "-v", "-t", "codex-goal", "@codex_recovery_not_before"],
+                ["tmux", "set-option", "-t", "codex-goal", "@codex_recovery_phase", "awaiting_verification"],
+                ["tmux", "set-option", "-t", "codex-goal", "@codex_recovery_not_before", "9.0"],
+                ["tmux", "set-option", "-t", "codex-goal", "@codex_last_recovery_reason", "503"],
+            ],
+            calls,
+        )
     def _telemetry(
         self,
         *,
@@ -477,6 +524,50 @@ class TmuxControlTests(unittest.TestCase):
             capture_update_prompt_version("codex-goal", runner=runner),
         )
 
+    def test_capture_update_prompt_version_allows_prior_conversation(self):
+        def runner(command, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = (
+                    "• Finished checking the previous task.\n"
+                    "\n"
+                    "Update available! 0.144.6 -> 0.145.0\n"
+                    "1. Update now (runs `npm install -g @openai/codex`)\n"
+                    "2. Skip\n3. Skip until next version\n"
+                )
+
+            return Result()
+
+        self.assertEqual(
+            "0.145.0",
+            capture_update_prompt_version("codex-goal", runner=runner),
+        )
+
+    def test_capture_update_prompt_version_ignores_historical_picker(self):
+        picker = (
+            "Update available! 0.144.6 -> 0.145.0\n"
+            "1. Update now (runs `npm install -g @openai/codex`)\n"
+            "2. Skip\n3. Skip until next version\n"
+        )
+        trailing_states = (
+            "\n› Ask Codex to do anything\n",
+            "\n• Goal active Objective: continue the project\n",
+            "\n(base) root@host:/workspace# codex resume thread-id\n",
+        )
+
+        for trailing_state in trailing_states:
+            with self.subTest(trailing_state=trailing_state):
+                def runner(command, **kwargs):
+                    class Result:
+                        returncode = 0
+                        stdout = picker + trailing_state
+
+                    return Result()
+
+                self.assertIsNone(
+                    capture_update_prompt_version("codex-goal", runner=runner)
+                )
+
     def test_capture_update_prompt_version_ignores_transcript_quote(self):
         def runner(command, **kwargs):
             class Result:
@@ -903,6 +994,98 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [["tmux", "capture-pane", "-p", "-t", "codex-goal"]],
             calls,
+        )
+
+    @patch("codex_goal_watchdog.tmux_control.clear_pending_update_version")
+    @patch("codex_goal_watchdog.tmux_control.execute_steps")
+    @patch(
+        "codex_goal_watchdog.tmux_control.recovery_goal_state_on_screen",
+        return_value="pursuing",
+    )
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=False)
+    @patch("codex_goal_watchdog.tmux_control.pane_shell_ready", return_value=True)
+    @patch(
+        "codex_goal_watchdog.tmux_control.pending_update_version",
+        return_value="0.145.0",
+    )
+    def test_interrupted_update_finishes_from_shell_before_restarting_thread(
+        self,
+        _pending_update_mock,
+        _pane_shell_ready_mock,
+        _pane_codex_running_mock,
+        _goal_state_mock,
+        execute_steps_mock,
+        clear_pending_update_mock,
+    ):
+        config = RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300)
+
+        resume_interrupted_update("codex-goal", config)
+
+        steps = execute_steps_mock.call_args.args[1]
+        self.assertEqual(RecoveryStep("wait_shell", "300"), steps[0])
+        self.assertEqual(
+            RecoveryStep("ensure_codex_version", "0.145.0"), steps[1]
+        )
+        self.assertEqual("shell_command", steps[2].kind)
+        self.assertIn(THREAD_ID, steps[2].value)
+        self.assertNotIn(RecoveryStep("sleep", "300"), steps)
+        clear_pending_update_mock.assert_called_once_with("codex-goal")
+
+    @patch("codex_goal_watchdog.tmux_control.clear_pending_update_version")
+    @patch(
+        "codex_goal_watchdog.tmux_control.execute_steps",
+        side_effect=RuntimeError("version verification failed"),
+    )
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=False)
+    @patch("codex_goal_watchdog.tmux_control.pane_shell_ready", return_value=True)
+    @patch(
+        "codex_goal_watchdog.tmux_control.pending_update_version",
+        return_value="0.145.0",
+    )
+    def test_interrupted_update_keeps_pending_marker_when_verification_fails(
+        self,
+        _pending_update_mock,
+        _pane_shell_ready_mock,
+        _pane_codex_running_mock,
+        _execute_steps_mock,
+        clear_pending_update_mock,
+    ):
+        with self.assertRaisesRegex(RuntimeError, "version verification failed"):
+            resume_interrupted_update(
+                "codex-goal",
+                RecoveryConfig(thread_id=THREAD_ID),
+            )
+
+        clear_pending_update_mock.assert_not_called()
+
+    @patch("codex_goal_watchdog.tmux_control.clear_pending_update_version")
+    @patch("codex_goal_watchdog.tmux_control.execute_steps")
+    @patch(
+        "codex_goal_watchdog.tmux_control.recovery_goal_state_on_screen",
+        return_value="achieved",
+    )
+    @patch("codex_goal_watchdog.tmux_control.pane_shell_ready", return_value=True)
+    @patch(
+        "codex_goal_watchdog.tmux_control.pending_update_version",
+        return_value="0.145.0",
+    )
+    def test_interrupted_update_does_not_recover_achieved_goal(
+        self,
+        _pending_update_mock,
+        _pane_shell_ready_mock,
+        _goal_state_mock,
+        execute_steps_mock,
+        _clear_pending_update_mock,
+    ):
+        resume_interrupted_update(
+            "codex-goal",
+            RecoveryConfig(thread_id=THREAD_ID),
+        )
+
+        steps = execute_steps_mock.call_args.args[1]
+        self.assertFalse(
+            {"leave_goal_paused", "resume_goal_or_prompt"}
+            & {step.kind for step in steps}
         )
 
     def test_wait_for_pane_state_waits_until_shell_is_ready(self):

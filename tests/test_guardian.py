@@ -5,26 +5,84 @@ from unittest.mock import patch
 
 from codex_goal_watchdog.guardian import (
     UPDATE_COMPLETION_CONSUMED_OPTION,
+    _RecoveryContentionLogger,
     _guardian_update_restart_needed,
+    _missing_codex_recovery_required,
     _next_recovery_attempt,
     _pending_rotation_prompt,
     _recovery_config,
     _recovery_reason_on_screen,
+    _restart_pinned_thread_after_update,
+    _update_target_version_on_screen,
     recovery_goal_state_on_screen,
     _unhandled_recovery_incident_on_screen,
     _update_completed_on_shell,
     guard_once,
 )
-from codex_goal_watchdog.bindings import save_thread_handoff
+from codex_goal_watchdog.bindings import SessionBinding, save_thread_handoff
 from codex_goal_watchdog.recovery import RecoveryConfig
 
 
 class GuardianTests(unittest.TestCase):
-    def test_guardian_defers_update_restart_while_monitor_owns_update(self):
+    def test_contention_logger_collapses_repeated_owner_messages(self):
+        messages = []
+        logger = _RecoveryContentionLogger(messages.append)
+
+        logger.record(operation="missing Codex", detail="recovery-owner")
+        logger.record(operation="missing Codex", detail="recovery-owner")
+        logger.record(operation="missing Codex", detail="recovery-owner")
+        logger.flush()
+
+        self.assertEqual(2, len(messages))
+        self.assertIn("recovery-owner", messages[0])
+        self.assertIn("suppressed=2", messages[1])
+
+    def test_recovery_config_prefers_persistent_binding(self):
+        persistent_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        binding = SessionBinding(
+            session="codex-goal",
+            thread_id=persistent_thread_id,
+            cwd=Path("/workspace/project"),
+        )
+
+        with patch(
+            "codex_goal_watchdog.guardian.load_session_binding",
+            return_value=binding,
+        ):
+            config = _recovery_config(
+                "codex-goal",
+                option_getter=lambda session, name, default="": (
+                    "550e8400-e29b-41d4-a716-446655440000"
+                    if name == "@codex_thread_id"
+                    else default
+                ),
+            )
+
+        self.assertEqual(persistent_thread_id, config.thread_id)
+
+    def test_achieved_goal_blocks_pending_missing_codex_recovery(self):
         self.assertFalse(
+            _missing_codex_recovery_required(
+                goal_state="achieved",
+                pending_rotation=True,
+                verification_pending=True,
+            )
+        )
+        self.assertTrue(
+            _missing_codex_recovery_required(
+                goal_state="pursuing",
+                pending_rotation=False,
+                verification_pending=True,
+            )
+        )
+
+    def test_guardian_recovers_completed_update_with_pending_version(self):
+        self.assertTrue(
             _guardian_update_restart_needed(
                 "codex-goal",
-                option_getter=lambda session, name, default="": "0.145.0",
+                option_getter=lambda session, name, default="": (
+                    "" if name == UPDATE_COMPLETION_CONSUMED_OPTION else "0.145.0"
+                ),
                 completion_checker=lambda session: True,
             )
         )
@@ -78,6 +136,57 @@ class GuardianTests(unittest.TestCase):
                 ]
             ],
             calls,
+        )
+
+    @patch("codex_goal_watchdog.guardian._mark_verification_pending")
+    @patch("codex_goal_watchdog.guardian._next_recovery_attempt")
+    def test_update_restart_does_not_enter_fatal_retry_state(
+        self,
+        next_recovery_attempt_mock,
+        mark_verification_pending_mock,
+    ):
+        executed = []
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+            cooldown_seconds=300,
+        )
+
+        _restart_pinned_thread_after_update(
+            "codex-goal",
+            config,
+            expected_version="0.145.0",
+            goal_state="pursuing",
+            execute_steps=lambda session, steps: executed.append((session, steps)),
+        )
+
+        next_recovery_attempt_mock.assert_not_called()
+        mark_verification_pending_mock.assert_not_called()
+        self.assertEqual("codex-goal", executed[0][0])
+        steps = executed[0][1]
+        self.assertEqual("ensure_codex_version", steps[0].kind)
+        self.assertEqual("0.145.0", steps[0].value)
+        self.assertNotIn("300", [step.value for step in steps])
+
+    def test_update_restart_does_not_recover_an_achieved_goal(self):
+        executed = []
+
+        _restart_pinned_thread_after_update(
+            "codex-goal",
+            RecoveryConfig(
+                thread_id="550e8400-e29b-41d4-a716-446655440000"
+            ),
+            expected_version="0.145.0",
+            goal_state="achieved",
+            execute_steps=lambda session, steps: executed.extend(steps),
+        )
+
+        self.assertNotIn(
+            "leave_goal_paused",
+            [step.kind for step in executed],
+        )
+        self.assertNotIn(
+            "resume_goal_or_prompt",
+            [step.kind for step in executed],
         )
 
     def test_guard_once_does_nothing_when_monitor_pipe_is_healthy(self):
@@ -193,7 +302,24 @@ class GuardianTests(unittest.TestCase):
         )
 
         self.assertEqual("restarted_after_update", status)
-        self.assertEqual(["consume", "restart"], calls)
+        self.assertEqual(["restart", "consume"], calls)
+
+    def test_guard_once_does_not_consume_update_when_restart_is_contended(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: True,
+            pipe_active=lambda: True,
+            stalled_screen=lambda: False,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+            update_restart_needed=lambda: True,
+            consume_update_completion=lambda: calls.append("consume"),
+            restart_after_update=lambda: False,
+        )
+
+        self.assertEqual("recovery_in_progress", status)
+        self.assertEqual([], calls)
 
     def test_guard_once_clears_consumed_update_when_codex_is_running(self):
         calls = []
@@ -349,6 +475,26 @@ class GuardianTests(unittest.TestCase):
             return Result()
 
         self.assertFalse(_update_completed_on_shell("codex-goal", runner=runner))
+
+    def test_completed_update_reads_target_version_from_picker_history(self):
+        def runner(command, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = (
+                    "• Previous conversation output\n"
+                    "Update available! 0.152.0 -> 0.152.1\n"
+                    "1. Update now (runs `npm install -g @openai/codex`)\n"
+                    "2. Skip\n3. Skip until next version\n"
+                    "Update ran successfully! Please restart Codex.\n"
+                    "(base) root@host:/workspace#\n"
+                )
+
+            return Result()
+
+        self.assertEqual(
+            "0.152.1",
+            _update_target_version_on_screen("codex-goal", runner=runner),
+        )
 
     def test_recovery_config_restores_explicit_retry_policy(self):
         options = {

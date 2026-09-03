@@ -94,6 +94,107 @@ class ConsoleEntrypointTests(unittest.TestCase):
 
     @patch("codex_goal_watchdog.__main__.save_session_binding")
     @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.execute_steps")
+    @patch("codex_goal_watchdog.__main__.pane_codex_running", return_value=False)
+    @patch("codex_goal_watchdog.__main__.pane_shell_ready", return_value=True)
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.tmux_get_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440000",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_manual_start_restarts_missing_codex_for_bound_session(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        _get_thread_id_mock,
+        _run_mock,
+        _pane_codex_running_mock,
+        _pane_shell_ready_mock,
+        execute_steps_mock,
+        _handle_goal_prompt_mock,
+        _save_binding_mock,
+    ):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id=thread_id,
+            cwd=Path.cwd().resolve(),
+        )
+
+        result = main(["start", "--session", "project-a", "--no-attach"])
+
+        self.assertEqual(0, result)
+        execute_steps_mock.assert_called_once()
+        restart_steps = execute_steps_mock.call_args.args[1]
+        shell_commands = [
+            step.value for step in restart_steps if step.kind == "shell_command"
+        ]
+        self.assertEqual(1, len(shell_commands))
+        self.assertIn(f"resume {thread_id}", shell_commands[0])
+
+    @patch("codex_goal_watchdog.__main__._guardian_unit_installed", return_value=False)
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.pane_codex_running", return_value=True)
+    @patch("codex_goal_watchdog.__main__.pane_shell_ready", return_value=False)
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.tmux_get_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440000",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_existing_start_prefers_durable_recovery_counters(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        _get_thread_id_mock,
+        run_mock,
+        _pane_codex_running_mock,
+        _pane_shell_ready_mock,
+        _handle_goal_prompt_mock,
+        _save_binding_mock,
+        _guardian_unit_mock,
+    ):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id=thread_id,
+            cwd=Path.cwd().resolve(),
+            recovery_count=4,
+            successful_compactions=2,
+        )
+        run_mock.return_value.returncode = 0
+        run_mock.return_value.stdout = "0\n"
+
+        result = main(["start", "--session", "project-a", "--no-attach"])
+
+        self.assertEqual(0, result)
+        option_calls = [
+            call.args[0]
+            for call in run_mock.call_args_list
+            if call.args and call.args[0][:3] == ["tmux", "set-option", "-t"]
+        ]
+        self.assertIn(
+            ["tmux", "set-option", "-t", "project-a", "@codex_recovery_count", "4"],
+            option_calls,
+        )
+        self.assertIn(
+            [
+                "tmux",
+                "set-option",
+                "-t",
+                "project-a",
+                "@codex_successful_compactions",
+                "2",
+            ],
+            option_calls,
+        )
+
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
     @patch("codex_goal_watchdog.__main__.subprocess.run")
     @patch(
         "codex_goal_watchdog.__main__.tmux_get_thread_id",
@@ -251,6 +352,41 @@ class ConsoleEntrypointTests(unittest.TestCase):
             thread_id=thread_id,
             cwd=Path.cwd().resolve(),
         )
+
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.tmux_get_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440000",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_existing_session_prefers_durable_binding_over_stale_tmux_option(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        _get_thread_id_mock,
+        run_mock,
+        _handle_goal_prompt_mock,
+        _save_binding_mock,
+    ):
+        durable_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id=durable_thread_id,
+            cwd=Path.cwd().resolve(),
+        )
+
+        result = main(["start", "--session", "project-a", "--no-attach"])
+
+        self.assertEqual(0, result)
+        pipe_command = next(
+            call.args[0][-1]
+            for call in run_mock.call_args_list
+            if call.args[0][:3] == ["tmux", "pipe-pane", "-o"]
+        )
+        self.assertIn(durable_thread_id, pipe_command)
 
     @patch("codex_goal_watchdog.__main__.subprocess.run")
     @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)

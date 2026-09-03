@@ -37,7 +37,7 @@ class PackagingTests(unittest.TestCase):
             with self.subTest(path=relative_path):
                 self.assertTrue((ROOT / relative_path).is_file())
 
-    def test_user_service_uses_user_local_console_script(self):
+    def test_user_service_uses_canonical_user_local_console_script(self):
         service = (ROOT / "systemd/codex-watch-guardian@.service").read_text(
             encoding="utf-8"
         )
@@ -47,11 +47,26 @@ class PackagingTests(unittest.TestCase):
             service,
         )
         self.assertIn(
-            "ExecStart=/usr/bin/env codex-watch-guardian --session %i",
+            "ExecStart=%h/.local/bin/codex-watch-guardian --session %i",
             service,
         )
         self.assertIn("WantedBy=default.target", service)
+        self.assertNotIn("ExecStart=/usr/bin/env", service)
         self.assertNotIn("ExecStart=/usr/local/bin", service)
+
+    def test_installer_preserves_existing_guardian_state(self):
+        installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+
+        for marker in (
+            "SERVICE_WAS_PRESENT",
+            "SERVICE_WAS_ENABLED",
+            "SERVICE_WAS_ACTIVE",
+            'systemctl --user is-enabled "$SERVICE_UNIT"',
+            'systemctl --user is-active "$SERVICE_UNIT"',
+            'systemctl --user disable --now "$SERVICE_UNIT"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, installer)
 
     def test_public_readme_has_no_machine_specific_identifiers(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

@@ -5,7 +5,8 @@ After=default.target
 [Service]
 Type=simple
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/env codex-watch-guardian --session %i
+# Use the installer-owned wrapper directly; PATH may contain another watchdog.
+ExecStart=%h/.local/bin/codex-watch-guardian --session %i
 Restart=always
 RestartSec=3
 

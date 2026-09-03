@@ -16,6 +16,7 @@ from .monitor import (
     normalize_terminal_text,
     recovery_incident_for_thread,
     recovery_allowed_for_goal,
+    recovery_allowed_for_goal_state,
     recovery_goal_state_on_screen,
 )
 from .paths import default_log_path
@@ -26,7 +27,10 @@ from .bindings import (
 )
 from .recovery import (
     DEFAULT_RESUME_PROMPT,
+    IncidentLogAggregator,
     RecoveryConfig,
+    RecoveryStep,
+    build_post_update_restart_steps,
     build_thread_rotation_prompt,
     build_recovery_steps,
     build_shell_restart_steps,
@@ -39,6 +43,7 @@ from .tmux_control import (
     UPDATE_COMPLETION_CONSUMED_OPTION,
     RecoveryInProgress,
     codex_composer_pending,
+    clear_pending_update_version,
     clear_pending_thread_rotation,
     clear_update_completion_consumed,
     _execute_steps_unlocked,
@@ -47,12 +52,40 @@ from .tmux_control import (
     pane_codex_running,
     pending_thread_rotation_count,
     retry_codex_submission,
+    save_recovery_phase,
+    recovery_phase,
+    recovery_not_before,
     session_recovery_lock,
+    update_prompt_version,
 )
 
 
 UPDATE_SUCCESS_MARKER = "Update ran successfully! Please restart Codex."
 SHELL_COMMANDS = {"bash", "zsh", "sh", "fish"}
+
+
+class _RecoveryContentionLogger:
+    """Collapse repeated lock-contention messages into one bounded record."""
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._aggregator = IncidentLogAggregator(emit)
+
+    def record(self, *, operation: str, detail: str) -> None:
+        key = f"{operation}:{detail}"
+        self._aggregator.record(
+            key=key,
+            first=(
+                "recovery already owned by another worker: "
+                f"{operation} ({detail})"
+            ),
+            summary=(
+                "recovery contention aggregate: "
+                f"{operation} ({detail})"
+            ),
+        )
+
+    def flush(self) -> None:
+        self._aggregator.flush()
 
 
 def guard_once(
@@ -81,10 +114,10 @@ def guard_once(
     if update_restart_needed is not None and update_restart_needed():
         if restart_after_update is None:
             raise ValueError("update restart callback is required")
-        if consume_update_completion is not None:
-            consume_update_completion()
         if restart_after_update() is False:
             return "recovery_in_progress"
+        if consume_update_completion is not None:
+            consume_update_completion()
         return "restarted_after_update"
     monitor_is_active = pipe_active()
     if (
@@ -188,6 +221,45 @@ def _mark_verification_pending(session: str, config: RecoveryConfig) -> None:
         ),
         verification_pending=True,
         verification_baseline=baseline,
+        recovery_phase="awaiting_verification",
+        last_recovery_reason="recovery_pending_verification",
+    )
+
+
+def _set_recovery_phase(
+    session: str,
+    phase: str,
+    *,
+    not_before: float = 0.0,
+    reason: str = "",
+) -> None:
+    """Persist the recovery state in both tmux and the durable binding."""
+    try:
+        save_recovery_phase(session, phase, not_before=not_before, reason=reason)
+    except (OSError, subprocess.SubprocessError):
+        # The binding is still useful when tmux disappears during recovery.
+        pass
+    binding = load_session_binding(session)
+    if binding is None:
+        return
+    save_binding_runtime_state(
+        session=session,
+        recovery_count=_tmux_option_int(session, "@codex_recovery_count", 0),
+        successful_compactions=_tmux_successful_compactions(session),
+        verification_pending=binding.verification_pending,
+        verification_baseline=binding.verification_baseline,
+        recovery_phase=phase,
+        recovery_not_before=not_before,
+        last_recovery_reason=reason,
+    )
+
+
+def _recovery_deferred(session: str, *, now: Callable[[], float] = time.time) -> bool:
+    binding = load_session_binding(session)
+    return bool(
+        binding is not None
+        and binding.recovery_phase == "cooldown"
+        and binding.recovery_not_before > now()
     )
 
 
@@ -240,17 +312,60 @@ def _update_completed_on_shell(
     )
 
 
+def _update_target_version_on_screen(
+    session: str, *, runner=subprocess.run
+) -> str | None:
+    result = runner(
+        ["tmux", "capture-pane", "-p", "-t", session],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return update_prompt_version(result.stdout)
+
+
 def _guardian_update_restart_needed(
     session: str,
     *,
     option_getter: Callable[[str, str, str], str] = _tmux_option,
     completion_checker: Callable[[str], bool] = _update_completed_on_shell,
 ) -> bool:
-    if option_getter(session, PENDING_UPDATE_OPTION, ""):
-        return False
     if option_getter(session, UPDATE_COMPLETION_CONSUMED_OPTION, ""):
         return False
     return completion_checker(session)
+
+
+def _missing_codex_recovery_required(
+    *,
+    goal_state: str | None,
+    pending_rotation: bool,
+    verification_pending: bool,
+) -> bool:
+    return recovery_allowed_for_goal_state(goal_state) and (
+        pending_rotation or verification_pending
+    )
+
+
+def _restart_pinned_thread_after_update(
+    session: str,
+    config: RecoveryConfig,
+    *,
+    expected_version: str | None,
+    goal_state: str | None,
+    execute_steps: Callable[[str, list[RecoveryStep]], None],
+) -> None:
+    """Restore an updated CLI without consuming the fatal retry budget."""
+    execute_steps(
+        session,
+        build_post_update_restart_steps(
+            config,
+            expected_version=expected_version,
+            resume_goal=goal_state not in {"blocked", "stalled", "achieved"},
+            restore_goal=goal_state != "achieved",
+        ),
+    )
 
 
 def _recovery_reason_on_screen(session: str, *, runner=subprocess.run) -> str | None:
@@ -298,13 +413,20 @@ def _recovery_config(
     *,
     option_getter: Callable[[str, str, str], str] = _tmux_option,
 ) -> RecoveryConfig:
+    binding = load_session_binding(session)
     codex_args_json = option_getter(
         session,
         "@codex_args_json",
         json.dumps([DANGEROUS_BYPASS_ARG]),
     )
     return RecoveryConfig(
-        thread_id=option_getter(session, "@codex_thread_id", ""),
+        # The persistent session binding survives tmux recreation and /clear;
+        # tmux options are only the compatibility fallback.
+        thread_id=(
+            binding.thread_id
+            if binding is not None
+            else option_getter(session, "@codex_thread_id", "")
+        ),
         primary_model=option_getter(
             session, "@codex_primary_model", "gpt-5.6-sol"
         ),
@@ -358,6 +480,16 @@ def _recovery_config(
         resume_prompt=option_getter(
             session, "@codex_resume_prompt", DEFAULT_RESUME_PROMPT
         ),
+        recovery_phase=(
+            binding.recovery_phase
+            if binding is not None
+            else recovery_phase(session)
+        ),
+        recovery_not_before=(
+            binding.recovery_not_before
+            if binding is not None
+            else recovery_not_before(session)
+        ),
     )
 
 
@@ -387,6 +519,13 @@ def _recover_visible_incident(
     goal_state = recovery_goal_state_on_screen(session)
     recovery_attempt = _next_recovery_attempt(session)
     _mark_verification_pending(session, config)
+    delay = config.cooldown_seconds if recovery_attempt > 1 else 0
+    _set_recovery_phase(
+        session,
+        "cooldown" if delay else "action",
+        not_before=time.time() + max(0, delay),
+        reason=reason,
+    )
     if reason == "upstream_access_denied":
         _set_pending_thread_rotation(session, recovery_attempt)
     _append_log(
@@ -394,21 +533,24 @@ def _recover_visible_incident(
         "visible recoverable error claimed during guardian handoff: "
         f"{reason}; recovery #{recovery_attempt}",
     )
-    execute_steps(
-        session,
-        build_recovery_steps(
-            config,
-            reason=reason,
-            recovery_attempt=recovery_attempt,
-            resume_goal=goal_state != "blocked",
-            resume_stalled_goal=goal_state == "stalled",
-            goal_objective=(
-                find_latest_goal_objective(thread_id=config.thread_id)
-                if reason == "upstream_access_denied"
-                else None
+    try:
+        execute_steps(
+            session,
+            build_recovery_steps(
+                config,
+                reason=reason,
+                recovery_attempt=recovery_attempt,
+                resume_goal=goal_state != "blocked",
+                resume_stalled_goal=goal_state == "stalled",
+                goal_objective=(
+                    find_latest_goal_objective(thread_id=config.thread_id)
+                    if reason == "upstream_access_denied"
+                    else None
+                ),
             ),
-        ),
-    )
+        )
+    finally:
+        _set_recovery_phase(session, "awaiting_verification", reason=reason)
     return True
 
 
@@ -461,6 +603,22 @@ def run_guardian(
     last_status = ""
     active_screen_check_pending = True
     pending_retry_after = 0.0
+    contention_logs = _RecoveryContentionLogger(
+        lambda message: _append_log(log_path, message)
+    )
+    contention_active = False
+
+    def record_contention(*, operation: str, detail: str) -> None:
+        nonlocal contention_active
+        contention_active = True
+        contention_logs.record(operation=operation, detail=detail)
+
+    def flush_contention() -> None:
+        nonlocal contention_active
+        if contention_active:
+            contention_logs.flush()
+            contention_active = False
+
     _append_log(log_path, f"guardian started: session={session}")
 
     while True:
@@ -496,10 +654,8 @@ def run_guardian(
                             execute_steps=_execute_steps_unlocked,
                         )
                 except RecoveryInProgress:
-                    _append_log(
-                        log_path,
-                        "recovery already owned by another worker: "
-                        f"{pending_incident[0]}",
+                    record_contention(
+                        operation="visible incident", detail=pending_incident[0]
                     )
                     return False
                 except TimeoutError as exc:
@@ -512,27 +668,29 @@ def run_guardian(
             def restart_after_update() -> bool:
                 assert config is not None
                 goal_state = recovery_goal_state_on_screen(session)
+                expected_version = _tmux_option(
+                    session,
+                    PENDING_UPDATE_OPTION,
+                    "",
+                ) or _update_target_version_on_screen(session)
                 try:
                     with session_recovery_lock(session):
-                        recovery_attempt = _next_recovery_attempt(session)
-                        _mark_verification_pending(session, config)
                         _append_log(
                             log_path,
                             "Codex update completed; restarting pinned thread",
                         )
-                        _execute_steps_unlocked(
+                        _restart_pinned_thread_after_update(
                             session,
-                            build_shell_restart_steps(
-                                config,
-                                recovery_attempt=recovery_attempt,
-                                resume_goal=goal_state not in {"blocked", "stalled"},
-                                resume_stalled_goal=goal_state == "stalled",
-                            ),
+                            config,
+                            expected_version=expected_version or None,
+                            goal_state=goal_state,
+                            execute_steps=_execute_steps_unlocked,
                         )
+                        if expected_version:
+                            clear_pending_update_version(session)
                 except RecoveryInProgress:
-                    _append_log(
-                        log_path,
-                        "recovery already owned by another worker: update restart",
+                    record_contention(
+                        operation="update restart", detail="session lock"
                     )
                     return False
                 except TimeoutError as exc:
@@ -545,9 +703,16 @@ def run_guardian(
 
             def missing_codex_recovery_needed() -> bool:
                 binding = load_session_binding(session)
-                return (
-                    pending_thread_rotation_count(session) is not None
-                    or bool(binding is not None and binding.verification_pending)
+                if _recovery_deferred(session):
+                    return False
+                return _missing_codex_recovery_required(
+                    goal_state=recovery_goal_state_on_screen(session),
+                    pending_rotation=(
+                        pending_thread_rotation_count(session) is not None
+                    ),
+                    verification_pending=bool(
+                        binding is not None and binding.verification_pending
+                    ),
                 )
 
             def recover_missing_codex() -> bool:
@@ -574,9 +739,8 @@ def run_guardian(
                             ),
                         )
                 except RecoveryInProgress:
-                    _append_log(
-                        log_path,
-                        "recovery already owned by another worker: missing Codex",
+                    record_contention(
+                        operation="missing Codex", detail="session lock"
                     )
                     return False
                 except TimeoutError as exc:
@@ -589,6 +753,8 @@ def run_guardian(
 
             def pending_submission_recovery_needed() -> bool:
                 assert config is not None
+                if _recovery_deferred(session):
+                    return False
                 if time.monotonic() < pending_retry_after:
                     return False
                 if pending_thread_rotation_count(session) is None:
@@ -611,9 +777,8 @@ def run_guardian(
                             expected=prompt,
                         )
                 except RecoveryInProgress:
-                    _append_log(
-                        log_path,
-                        "recovery already owned by another worker: pending submission",
+                    record_contention(
+                        operation="pending submission", detail="session lock"
                     )
                     return False
                 except TimeoutError as exc:
@@ -700,6 +865,8 @@ def run_guardian(
             }:
                 _append_log(log_path, f"status={status}")
                 last_status = status
+            if status != "recovery_in_progress":
+                flush_contention()
         except Exception as exc:
             _append_log(log_path, f"iteration failed: {type(exc).__name__}: {exc}")
         time.sleep(poll_seconds)

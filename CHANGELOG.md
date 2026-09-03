@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.24] - 2026-08-31
+
+### Changed
+
+- Use the installer-owned user-local guardian wrapper through an absolute
+  `ExecStart` path, so systemd cannot select a different watchdog from `PATH`.
+- Preserve an existing guardian's enabled/running state while upgrading the
+  watchdog; an intentionally paused session remains paused until explicitly
+  started again.
+- Keep rollout size, no-progress, no-event, and repeated-content/command
+  measurements as telemetry only; watchdog no longer rotates a thread from
+  those health thresholds. Codex owns context and thread lifecycle decisions.
+- Persist recovery phase, cooldown deadline, and last recovery reason in the
+  session binding so guardian and monitor share one recovery state machine.
+- Keep a newly identified fatal rollout incident during an existing cooldown;
+  the cooldown is applied by the serialized recovery steps instead of dropping
+  the incident.
+
+### Fixed
+
+- Detect the active Codex update picker at the visible screen tail even when
+  `--no-alt-screen` leaves prior conversation above it, while ignoring a
+  historical picker followed by a newer composer, Goal state, or shell prompt.
+- Complete a persisted pending update after the pane has returned to the shell,
+  verify the requested CLI version before restoring the pinned thread, and keep
+  the pending marker when verification fails.
+- Keep Codex self-update restarts outside the fatal recovery budget and cooldown;
+  an update no longer increments `@codex_recovery_count` or waits 300 seconds.
+- Restore an achieved thread after an update without waiting for a Goal picker
+  or injecting a Goal continuation command.
+- Clear stale pending-verification state when a monitor starts on, or later
+  observes, an achieved Goal; guardian also refuses missing-process recovery
+  for an achieved/non-recoverable Goal even if an old binding remains pending.
+- Prefer the durable watchdog session binding when a tmux option still points
+  at an older thread after `/clear`, tmux recreation, or recovery.
+- Reconcile the active thread on monitor ticks and aggregate repeated recovery
+  lock-contention messages instead of emitting a line every polling cycle.
+- When a bound tmux session is left at an idle shell after Codex exits, start the
+  durable pinned thread on the next explicit `codex-watch` invocation; refuse
+  to inject a command into a non-shell pane.
+- Prefer durable recovery and compaction counters over stale tmux option values
+  during reconnect and manual startup.
+- Never submit a paused-Goal recovery command to a pane that has already fallen
+  back to a Shell; the monitor records the skip and leaves process recovery to
+  the explicit startup or pending guardian path.
+
 ## [0.1.23] - 2026-08-29
 
 ### Fixed

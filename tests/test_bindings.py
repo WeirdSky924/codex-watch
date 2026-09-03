@@ -98,6 +98,32 @@ class SessionBindingTests(unittest.TestCase):
         self.assertTrue(binding.verification_pending)
         self.assertEqual(10, binding.verification_baseline)
 
+    def test_recovery_phase_survives_binding_rewrite(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            state_root = Path(temporary_dir)
+            save_session_binding(
+                session="project-a",
+                thread_id="550e8400-e29b-41d4-a716-446655440000",
+                cwd=Path("/workspace/project-a"),
+                state_root=state_root,
+                recovery_phase="cooldown",
+                recovery_not_before=1234.5,
+                last_recovery_reason="retryable_http_503",
+            )
+            save_binding_runtime_state(
+                session="project-a",
+                recovery_count=2,
+                successful_compactions=0,
+                state_root=state_root,
+            )
+            binding = load_session_binding("project-a", state_root=state_root)
+
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual("cooldown", binding.recovery_phase)
+        self.assertEqual(1234.5, binding.recovery_not_before)
+        self.assertEqual("retryable_http_503", binding.last_recovery_reason)
+
     def test_thread_handoff_is_bounded_and_private(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             state_root = Path(temporary_dir)

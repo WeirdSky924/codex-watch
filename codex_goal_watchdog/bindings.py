@@ -24,6 +24,9 @@ class SessionBinding:
     successful_compactions: int = 0
     verification_pending: bool = False
     verification_baseline: int = 0
+    recovery_phase: str = "idle"
+    recovery_not_before: float = 0.0
+    last_recovery_reason: str = ""
 
 
 def _binding_path(session: str, *, state_root: Path | None = None) -> Path:
@@ -54,6 +57,20 @@ def load_session_binding(
             verification_baseline=_nonnegative_int(
                 payload.get("verification_baseline", 0)
             ),
+            recovery_phase=(
+                payload.get("recovery_phase", "idle")
+                if payload.get("recovery_phase", "idle")
+                in {"idle", "cooldown", "action", "awaiting_verification"}
+                else "idle"
+            ),
+            recovery_not_before=_nonnegative_float(
+                payload.get("recovery_not_before", 0.0)
+            ),
+            last_recovery_reason=(
+                payload.get("last_recovery_reason", "")
+                if isinstance(payload.get("last_recovery_reason", ""), str)
+                else ""
+            ),
         )
     except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError):
         return None
@@ -61,6 +78,14 @@ def load_session_binding(
 
 def _nonnegative_int(value: object) -> int:
     return max(0, value) if type(value) is int else 0
+
+
+def _nonnegative_float(value: object) -> float:
+    if type(value) is int:
+        return float(max(0, value))
+    if type(value) is float:
+        return max(0.0, value)
+    return 0.0
 
 
 def _atomic_json_write(path: Path, payload: dict) -> None:
@@ -90,6 +115,9 @@ def save_session_binding(
     successful_compactions: int | None = None,
     verification_pending: bool | None = None,
     verification_baseline: int | None = None,
+    recovery_phase: str | None = None,
+    recovery_not_before: float | None = None,
+    last_recovery_reason: str | None = None,
 ) -> SessionBinding:
     normalized_thread_id = validate_thread_id(thread_id)
     resolved_cwd = cwd.expanduser().resolve()
@@ -114,6 +142,17 @@ def save_session_binding(
         if same_thread and previous is not None
         else 0
     )
+    previous_recovery_phase = (
+        previous.recovery_phase if same_thread and previous is not None else "idle"
+    )
+    previous_recovery_not_before = (
+        previous.recovery_not_before if same_thread and previous is not None else 0.0
+    )
+    previous_recovery_reason = (
+        previous.last_recovery_reason
+        if same_thread and previous is not None
+        else ""
+    )
     resolved_recovery_count = _nonnegative_int(
         recovery_count
         if recovery_count is not None
@@ -134,6 +173,21 @@ def save_session_binding(
         if verification_baseline is not None
         else previous_verification_baseline
     )
+    resolved_recovery_phase = (
+        recovery_phase
+        if recovery_phase in {"idle", "cooldown", "action", "awaiting_verification"}
+        else previous_recovery_phase
+    )
+    resolved_recovery_not_before = _nonnegative_float(
+        recovery_not_before
+        if recovery_not_before is not None
+        else previous_recovery_not_before
+    )
+    resolved_recovery_reason = (
+        last_recovery_reason
+        if last_recovery_reason is not None
+        else previous_recovery_reason
+    )
     payload = {
         "session": session,
         "thread_id": normalized_thread_id,
@@ -142,6 +196,9 @@ def save_session_binding(
         "successful_compactions": resolved_compactions,
         "verification_pending": resolved_verification_pending,
         "verification_baseline": resolved_verification_baseline,
+        "recovery_phase": resolved_recovery_phase,
+        "recovery_not_before": resolved_recovery_not_before,
+        "last_recovery_reason": resolved_recovery_reason,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _atomic_json_write(path, payload)
@@ -153,6 +210,9 @@ def save_session_binding(
         successful_compactions=resolved_compactions,
         verification_pending=resolved_verification_pending,
         verification_baseline=resolved_verification_baseline,
+        recovery_phase=resolved_recovery_phase,
+        recovery_not_before=resolved_recovery_not_before,
+        last_recovery_reason=resolved_recovery_reason,
     )
 
 
@@ -163,6 +223,9 @@ def save_binding_runtime_state(
     successful_compactions: int,
     verification_pending: bool | None = None,
     verification_baseline: int | None = None,
+    recovery_phase: str | None = None,
+    recovery_not_before: float | None = None,
+    last_recovery_reason: str | None = None,
     state_root: Path | None = None,
 ) -> SessionBinding | None:
     binding = load_session_binding(session, state_root=state_root)
@@ -177,6 +240,9 @@ def save_binding_runtime_state(
         successful_compactions=successful_compactions,
         verification_pending=verification_pending,
         verification_baseline=verification_baseline,
+        recovery_phase=recovery_phase,
+        recovery_not_before=recovery_not_before,
+        last_recovery_reason=last_recovery_reason,
     )
 
 

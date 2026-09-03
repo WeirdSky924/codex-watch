@@ -13,7 +13,8 @@ usage() {
         "Usage: ./install.sh [--session NAME] [--no-service]" \
         "" \
         "Installs codex-watch into a private virtual environment and optionally" \
-        "enables the user-level guardian service for the selected tmux session."
+        "installs the user-level guardian service for the selected tmux session." \
+        "An existing guardian keeps its current enabled/running state."
 }
 
 while (($#)); do
@@ -53,9 +54,32 @@ if sys.version_info < (3, 11):
     raise SystemExit("codex-goal-watchdog requires Python 3.11 or newer")
 PY
 
+SERVICE_UNIT="codex-watch-guardian@${SESSION}.service"
+SERVICE_UNIT_FILE="$USER_UNIT_DIR/codex-watch-guardian@.service"
+SYSTEMD_USER_AVAILABLE=0
+SERVICE_WAS_PRESENT=0
+SERVICE_WAS_ENABLED=0
+SERVICE_WAS_ACTIVE=0
+if ((INSTALL_SERVICE)) && command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user show-environment >/dev/null 2>&1; then
+    SYSTEMD_USER_AVAILABLE=1
+    [[ -f "$SERVICE_UNIT_FILE" ]] && SERVICE_WAS_PRESENT=1
+    systemctl --user is-enabled "$SERVICE_UNIT" >/dev/null 2>&1 \
+        && SERVICE_WAS_ENABLED=1 || true
+    systemctl --user is-active "$SERVICE_UNIT" >/dev/null 2>&1 \
+        && SERVICE_WAS_ACTIVE=1 || true
+fi
+
 python3 -m venv "$VENV_DIR"
 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     "$VENV_DIR/bin/python" -m pip install --upgrade "$ROOT_DIR"
+
+INSTALLED_VERSION="$("$VENV_DIR/bin/python" -c \
+    'import codex_goal_watchdog; print(codex_goal_watchdog.__version__)')"
+if [[ -z "$INSTALLED_VERSION" ]]; then
+    printf '%s\n' "watchdog installation did not expose a package version" >&2
+    exit 1
+fi
 
 mkdir -p "$BIN_DIR"
 ln -sfn "$VENV_DIR/bin/codex-watch" "$BIN_DIR/codex-watch"
@@ -66,9 +90,20 @@ if ((INSTALL_SERVICE)); then
     install -m 0644 \
         "$ROOT_DIR/systemd/codex-watch-guardian@.service" \
         "$USER_UNIT_DIR/codex-watch-guardian@.service"
-    if systemctl --user show-environment >/dev/null 2>&1; then
+    if ((SYSTEMD_USER_AVAILABLE)); then
         systemctl --user daemon-reload
-        systemctl --user enable --now "codex-watch-guardian@${SESSION}.service"
+        if ((SERVICE_WAS_ENABLED)); then
+            systemctl --user enable --now "$SERVICE_UNIT"
+        elif ((SERVICE_WAS_ACTIVE)); then
+            systemctl --user start "$SERVICE_UNIT"
+        elif ((SERVICE_WAS_PRESENT)); then
+            systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true
+            printf '%s\n' \
+                "Guardian state preserved: stopped and disabled." \
+                "Run codex-watch explicitly when this session should resume."
+        else
+            systemctl --user enable --now "$SERVICE_UNIT"
+        fi
     else
         printf '%s\n' \
             "User systemd is unavailable in this shell." \
@@ -77,6 +112,7 @@ if ((INSTALL_SERVICE)); then
 fi
 
 printf '\nInstalled codex-goal-watchdog.\n'
+printf 'Installed version: %s\n' "$INSTALLED_VERSION"
 printf 'Ensure %s is on PATH.\n' "$BIN_DIR"
 printf 'Start from a project directory with: codex-watch --safe\n'
 printf '%s\n' \

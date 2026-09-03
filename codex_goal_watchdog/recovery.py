@@ -191,6 +191,8 @@ class RecoveryConfig:
     thread_health_poll_seconds: int = 30
     thread_max_repeated_content: int = 3
     thread_max_repeated_commands: int = 3
+    recovery_phase: str = "idle"
+    recovery_not_before: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -289,45 +291,25 @@ def thread_rotation_reason(
     repeated_command_count: int = 0,
     suppress_no_event: bool = False,
 ) -> str | None:
-    """Return watchdog-owned health failures.
+    """Retain the legacy signature without making health decisions.
 
-    compaction_count and context_tokens remain arguments for compatibility with
-    older callers and telemetry snapshots. Codex exclusively owns context
-    compaction and context-window limits; neither value is a trigger. A fatal
-    recovery may suppress only the no-event check.
+    Codex owns context management. Rollout size, token progress, idle time,
+    and repeated-content measurements are telemetry only; keeping this
+    compatibility entry point inert prevents older callers from reintroducing
+    watchdog-owned thread rotation.
     """
-    checks = (
-        (
-            config.thread_max_rollout_bytes,
-            rollout_bytes,
-            "max_rollout_bytes",
-        ),
-        (
-            config.thread_max_repeated_content,
-            repeated_content_count,
-            "repeated_content",
-        ),
-        (
-            config.thread_max_repeated_commands,
-            repeated_command_count,
-            "repeated_command",
-        ),
-        (
-            config.thread_no_progress_tokens,
-            max(0, total_tokens - tokens_at_last_progress),
-            "no_progress_tokens",
-        ),
-        (
-            config.thread_no_event_seconds,
-            last_event_age_seconds,
-            "no_rollout_events",
-        ),
+    del (
+        config,
+        compaction_count,
+        rollout_bytes,
+        context_tokens,
+        total_tokens,
+        tokens_at_last_progress,
+        last_event_age_seconds,
+        repeated_content_count,
+        repeated_command_count,
+        suppress_no_event,
     )
-    for threshold, actual, reason in checks:
-        if suppress_no_event and reason == "no_rollout_events":
-            continue
-        if threshold > 0 and actual >= threshold:
-            return reason
     return None
 
 
@@ -349,6 +331,7 @@ def build_codex_update_completion_steps(
     expected_version: str,
     *,
     resume_goal: bool = True,
+    restore_goal: bool = True,
 ) -> list[RecoveryStep]:
     """Verify an updater result, then restore the pinned Codex thread."""
     if not config.thread_id:
@@ -361,14 +344,16 @@ def build_codex_update_completion_steps(
             resume_thread_id=config.thread_id,
         )
     )
-    return [
+    steps = [
         RecoveryStep("wait_shell", "300"),
         RecoveryStep("ensure_codex_version", expected_version),
         RecoveryStep("shell_command", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
-        _goal_recovery_step(config, resume_goal=resume_goal),
     ]
+    if restore_goal:
+        steps.append(_goal_recovery_step(config, resume_goal=resume_goal))
+    return steps
 
 
 def build_codex_update_steps(
@@ -376,6 +361,7 @@ def build_codex_update_steps(
     expected_version: str,
     *,
     resume_goal: bool = True,
+    restore_goal: bool = True,
 ) -> list[RecoveryStep]:
     """Accept the official updater and restore only after version verification."""
     return [
@@ -384,12 +370,17 @@ def build_codex_update_steps(
             config,
             expected_version,
             resume_goal=resume_goal,
+            restore_goal=restore_goal,
         ),
     ]
 
 
 def build_post_update_restart_steps(
-    config: RecoveryConfig, *, resume_goal: bool = True
+    config: RecoveryConfig,
+    *,
+    expected_version: str | None = None,
+    resume_goal: bool = True,
+    restore_goal: bool = True,
 ) -> list[RecoveryStep]:
     """Restart the pinned thread after the Codex updater returns to the shell."""
     if not config.thread_id:
@@ -402,13 +393,20 @@ def build_post_update_restart_steps(
             resume_thread_id=config.thread_id,
         )
     )
-    return [
-        RecoveryStep("update_codex", ""),
+    version_step = (
+        RecoveryStep("ensure_codex_version", expected_version)
+        if expected_version
+        else RecoveryStep("update_codex", "")
+    )
+    steps = [
+        version_step,
         RecoveryStep("shell_command", primary_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
-        _goal_recovery_step(config, resume_goal=resume_goal),
     ]
+    if restore_goal:
+        steps.append(_goal_recovery_step(config, resume_goal=resume_goal))
+    return steps
 
 
 def build_shell_restart_steps(

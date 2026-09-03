@@ -88,14 +88,13 @@ class RecoveryControllerTests(unittest.TestCase):
         self.assertTrue(all(event is not None for event in events))
         self.assertEqual(10, controller.recovery_count)
 
-    def test_fatal_activity_suppresses_only_no_event_rotation(self):
+    def test_health_measurements_never_request_rotation(self):
         config = RecoveryConfig(
             thread_no_event_seconds=120,
             thread_max_rollout_bytes=1_000,
         )
 
-        self.assertEqual(
-            "max_rollout_bytes",
+        self.assertIsNone(
             thread_rotation_reason(
                 config,
                 compaction_count=0,
@@ -294,18 +293,42 @@ class RecoveryStepTests(unittest.TestCase):
             resume_prompt="继续更新前的 goal。",
         )
 
-        steps = build_post_update_restart_steps(config)
+        steps = build_post_update_restart_steps(
+            config,
+            expected_version="0.145.0",
+        )
         values = [step.value for step in steps]
 
-        self.assertEqual(RecoveryStep("update_codex", ""), steps[0])
+        self.assertEqual(
+            RecoveryStep("ensure_codex_version", "0.145.0"), steps[0]
+        )
         self.assertEqual("shell_command", steps[1].kind)
         self.assertIn("gpt-5.6-sol", steps[1].value)
         self.assertIn(config.thread_id, steps[1].value)
         self.assertNotIn("C-c", values)
         self.assertNotIn("/quit", values)
         self.assertNotIn("/compact", values)
+        self.assertNotIn(str(config.cooldown_seconds), values)
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
         self.assertEqual(config.resume_prompt, steps[-1].value)
+
+    def test_post_update_restart_can_skip_goal_recovery(self):
+        config = RecoveryConfig(
+            thread_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+
+        steps = build_post_update_restart_steps(
+            config,
+            expected_version="0.145.0",
+            restore_goal=False,
+        )
+
+        self.assertEqual("wait_codex", steps[-2].kind)
+        self.assertEqual("sleep", steps[-1].kind)
+        self.assertFalse(
+            {"leave_goal_paused", "resume_goal_or_prompt"}
+            & {step.kind for step in steps}
+        )
 
     def test_launch_commands_are_explicit_shell_steps(self):
         config = RecoveryConfig(
@@ -624,7 +647,7 @@ class RecoveryStepTests(unittest.TestCase):
         self.assertTrue(any("gpt-5.6-sol" in value for value in values))
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)
 
-    def test_thread_health_thresholds_request_rotation(self):
+    def test_legacy_thread_health_helper_is_inert(self):
         config = RecoveryConfig(
             thread_max_rollout_bytes=1_000,
             thread_no_progress_tokens=500,
@@ -654,12 +677,34 @@ class RecoveryStepTests(unittest.TestCase):
             "last_event_age_seconds": 0,
         }
 
-        for values, expected in cases:
-            with self.subTest(expected=expected):
-                self.assertEqual(
-                    expected,
-                    thread_rotation_reason(config, **(defaults | values)),
+        for values, _expected in cases:
+            with self.subTest(values=values):
+                self.assertIsNone(
+                    thread_rotation_reason(config, **(defaults | values))
                 )
+
+    def test_legacy_thread_health_helper_is_telemetry_only(self):
+        config = RecoveryConfig(
+            thread_max_rollout_bytes=1,
+            thread_no_progress_tokens=1,
+            thread_no_event_seconds=1,
+            thread_max_repeated_content=1,
+            thread_max_repeated_commands=1,
+        )
+
+        self.assertIsNone(
+            thread_rotation_reason(
+                config,
+                compaction_count=99,
+                rollout_bytes=99,
+                context_tokens=99,
+                total_tokens=99,
+                tokens_at_last_progress=0,
+                last_event_age_seconds=99,
+                repeated_content_count=99,
+                repeated_command_count=99,
+            )
+        )
 
     def test_compaction_count_never_requests_thread_rotation(self):
         config = RecoveryConfig(thread_max_compactions=1)

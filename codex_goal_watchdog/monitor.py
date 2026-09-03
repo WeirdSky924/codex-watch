@@ -27,7 +27,6 @@ from .recovery import (
     build_recovery_steps,
     classify_recovery_message,
     classify_recovery_reason,
-    thread_rotation_reason,
 )
 from .sessions import (
     ThreadTelemetry,
@@ -45,10 +44,12 @@ from .tmux_control import (
     goal_state_from_text,
     handle_goal_prompt,
     normalize_terminal_text,
+    pane_codex_running,
     paused_goal_picker_visible,
     pending_thread_rotation_count as _pending_thread_rotation_count,
     save_tmux_recovery_count as _save_tmux_recovery_count_impl,
     save_tmux_successful_compactions as _save_tmux_successful_compactions_impl,
+    save_recovery_phase as _save_recovery_phase,
     set_pending_thread_rotation as _set_pending_thread_rotation,
     tmux_recovery_count as _tmux_recovery_count_impl,
     tmux_recovery_incident_id as _tmux_recovery_incident_id,
@@ -153,8 +154,11 @@ def run_monitor(
     initial_verification_pending: bool = False,
     initial_verification_baseline: int = 0,
     initial_rotation_pending: bool = False,
+    initial_goal_state: str | None = None,
     pending_rotation: Callable[[str], int | None] | None = None,
     save_verification_state: Callable[[bool, int], None] | None = None,
+    recovery_deferred: Callable[[], bool] | None = None,
+    codex_running: Callable[[str], bool] | None = None,
 ) -> None:
     from .recovery import RecoveryController
 
@@ -192,6 +196,7 @@ def run_monitor(
                 config,
                 visible_version,
                 resume_goal=latest_goal_state not in {"blocked", "stalled"},
+                restore_goal=latest_goal_state != "achieved",
             )
         except RecoveryInProgress:
             emit(
@@ -202,20 +207,21 @@ def run_monitor(
     run_execute = execute or default_execute
     run_resume_goal = resume_goal or default_resume_goal
     run_update_codex = update_codex or default_update_codex
+    codex_process_running = codex_running
     rolling_output = ""
     last_goal_resume_at: float | None = None
-    last_health_check_at: float | None = None
-    latest_goal_state: str | None = None
+    latest_goal_state = initial_goal_state
     handled_incident_ids: dict[str, None] = (
         {initial_recovery_incident_id: None}
         if initial_recovery_incident_id
         else {}
     )
     preserve_recovery_count_on_rebind = False
-    awaiting_verified_success = initial_verification_pending
-    rotation_pending = initial_verification_pending or initial_rotation_pending
+    awaiting_verified_success = initial_verification_pending or initial_rotation_pending
     successful_compactions = max(0, initial_successful_compactions)
     incident_logs = IncidentLogAggregator(emit)
+    missing_codex_resume_logged = False
+    missing_codex_update_logged = False
     verified_event_baselines: dict[str, int] = (
         {config.thread_id: max(0, initial_verification_baseline)}
         if initial_verification_pending
@@ -226,13 +232,53 @@ def run_monitor(
         if save_recovery_count is not None:
             save_recovery_count(controller.recovery_count)
 
+    def persist_recovery_phase(
+        phase: str,
+        *,
+        reason: str = "",
+        not_before: float = 0.0,
+    ) -> None:
+        try:
+            _save_recovery_phase(
+                target,
+                phase,
+                reason=reason,
+                not_before=not_before,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # Unit callers and a disappearing tmux server may not have a
+            # writable tmux option; the durable binding remains authoritative.
+            pass
+        binding = load_session_binding(target)
+        if binding is not None:
+            save_binding_runtime_state(
+                session=target,
+                recovery_count=controller.recovery_count,
+                successful_compactions=successful_compactions,
+                verification_pending=binding.verification_pending,
+                verification_baseline=binding.verification_baseline,
+                recovery_phase=phase,
+                recovery_not_before=not_before,
+                last_recovery_reason=reason,
+            )
+
     def reset_after_verified_success() -> None:
-        nonlocal rotation_pending
         controller.reset_after_verified_success()
         persist_recovery_count()
-        rotation_pending = False
+        persist_recovery_phase("idle")
         if save_verification_state is not None:
             save_verification_state(False, 0)
+
+    def clear_pending_recovery_after_goal_achieved() -> None:
+        nonlocal awaiting_verified_success
+        if not awaiting_verified_success:
+            return
+        reset_after_verified_success()
+        awaiting_verified_success = False
+        emit(
+            "[codex-goal-watchdog] goal achieved; "
+            "pending recovery state cleared"
+        )
 
     def mark_verified_progress_baseline(thread_id: str) -> None:
         if resolve_thread_telemetry is None:
@@ -308,7 +354,7 @@ def run_monitor(
         increment_attempt: bool,
         observed_at: float | None = None,
     ) -> bool:
-        nonlocal preserve_recovery_count_on_rebind, rotation_pending
+        nonlocal preserve_recovery_count_on_rebind
         nonlocal awaiting_verified_success
         if increment_attempt:
             event = controller.begin(
@@ -321,8 +367,14 @@ def run_monitor(
             persist_recovery_count()
         handoff_path = create_handoff(reason=detail, telemetry=telemetry)
         preserve_recovery_count_on_rebind = True
-        rotation_pending = True
         awaiting_verified_success = True
+        delay = config.cooldown_seconds if controller.recovery_count > 1 else 0
+        phase_now = observed_at if observed_at is not None else time.time()
+        persist_recovery_phase(
+            "cooldown" if delay else "action",
+            reason=detail,
+            not_before=phase_now + max(0, delay),
+        )
         if mark_thread_rotation is not None:
             mark_thread_rotation(controller.recovery_count)
         mark_verified_progress_baseline(config.thread_id)
@@ -331,147 +383,88 @@ def run_monitor(
             "[codex-goal-watchdog] rotating oversized or unhealthy thread: "
             f"{detail}; recovery #{controller.recovery_count}"
         )
-        run_execute(
-            target,
-            build_recovery_steps(
-                config,
-                reason=THREAD_HEALTH_ROTATION_REASON,
-                recovery_attempt=controller.recovery_count,
-                resume_goal=goal_state != "blocked",
-                resume_stalled_goal=goal_state == "stalled",
-                goal_objective=(
-                    resolve_goal_objective(config.thread_id)
-                    if resolve_goal_objective is not None
-                    else None
+        try:
+            run_execute(
+                target,
+                build_recovery_steps(
+                    config,
+                    reason=THREAD_HEALTH_ROTATION_REASON,
+                    recovery_attempt=controller.recovery_count,
+                    resume_goal=goal_state != "blocked",
+                    resume_stalled_goal=goal_state == "stalled",
+                    goal_objective=(
+                        resolve_goal_objective(config.thread_id)
+                        if resolve_goal_objective is not None
+                        else None
+                    ),
+                    handoff_path=handoff_path,
+                    rotation_detail=detail,
                 ),
-                handoff_path=handoff_path,
-                rotation_detail=detail,
-            ),
-        )
+            )
+        finally:
+            persist_recovery_phase(
+                "awaiting_verification",
+                reason=detail,
+            )
         return True
 
-    def check_thread_health(
-        *,
-        observed_at: float,
-        goal_state: str | None,
-        force: bool,
-    ) -> bool:
-        nonlocal last_health_check_at
-        if resolve_thread_telemetry is None or rotation_pending:
-            return False
-        if not force:
-            if last_health_check_at is None:
-                last_health_check_at = observed_at
-                return False
-            if (
-                observed_at - last_health_check_at
-                < config.thread_health_poll_seconds
-            ):
-                return False
-        last_health_check_at = observed_at
-        effective_state = goal_state
-        if effective_state is None and resolve_goal_state is not None:
-            effective_state = resolve_goal_state(target)
-        if not recovery_allowed_for_goal_state(effective_state):
-            return False
-        telemetry = resolve_thread_telemetry(config.thread_id)
-        if telemetry is None:
-            return False
-        fatal_recovery_active = controller.fatal_recovery_active or bool(
-            telemetry.latest_failure
-            and classify_recovery_message(telemetry.latest_failure.message)
+    def reconcile_thread_binding(resolved_thread_id: str | None) -> None:
+        nonlocal config, rolling_output, last_goal_resume_at
+        nonlocal latest_goal_state, preserve_recovery_count_on_rebind
+        nonlocal awaiting_verified_success, successful_compactions
+        nonlocal controller
+        if not resolved_thread_id or resolved_thread_id == config.thread_id:
+            return
+        pending_rotation_on_rebind = (
+            pending_rotation is not None
+            and pending_rotation(target) is not None
         )
-        progress_tokens = telemetry.total_tokens
-        recent_rollout_event = (
-            telemetry.last_event_at > 0
-            and observed_at - telemetry.last_event_at
-            < max(1, config.thread_health_poll_seconds)
+        rebind_recovery_count = (
+            controller.recovery_count
+            if preserve_recovery_count_on_rebind or pending_rotation_on_rebind
+            else 0
         )
-        if telemetry.turn_active or recent_rollout_event:
-            progress_tokens = telemetry.tokens_at_last_progress
-        detail = thread_rotation_reason(
+        config = replace(config, thread_id=resolved_thread_id)
+        controller = RecoveryController(
             config,
-            compaction_count=max(
-                successful_compactions,
-                telemetry.compaction_count,
-            ),
-            rollout_bytes=telemetry.rollout_bytes,
-            context_tokens=telemetry.context_tokens,
-            # Codex owns context usage; health checks use watchdog signals.
-            total_tokens=progress_tokens,
-            tokens_at_last_progress=telemetry.tokens_at_last_progress,
-            last_event_age_seconds=max(0, observed_at - telemetry.last_event_at),
-            repeated_content_count=telemetry.repeated_content_count,
-            repeated_command_count=telemetry.repeated_command_count,
-            suppress_no_event=fatal_recovery_active,
+            initial_recovery_count=rebind_recovery_count,
         )
-        if detail is None:
-            return False
-        return execute_rotation(
-            detail=detail,
-            goal_state=effective_state,
-            telemetry=telemetry,
-            increment_attempt=True,
-            observed_at=observed_at,
+        rolling_output = ""
+        last_goal_resume_at = None
+        latest_goal_state = None
+        handled_incident_ids.clear()
+        if save_thread_id is not None:
+            save_thread_id(resolved_thread_id)
+        if preserve_recovery_count_on_rebind and save_recovery_count is not None:
+            save_recovery_count(rebind_recovery_count)
+        preserve_recovery_count_on_rebind = False
+        awaiting_verified_success = (
+            rebind_recovery_count > 0 or pending_rotation_on_rebind
         )
+        if awaiting_verified_success:
+            mark_verified_progress_baseline(resolved_thread_id)
+        elif save_verification_state is not None:
+            save_verification_state(False, 0)
+        successful_compactions = 0
+        if save_successful_compactions is not None:
+            save_successful_compactions(0)
+        emit(
+            "[codex-goal-watchdog] rebound active thread: "
+            f"{resolved_thread_id}"
+        )
+
+    if latest_goal_state == "achieved":
+        clear_pending_recovery_after_goal_achieved()
+
     for line in lines:
         if line is MONITOR_TICK:
-            observed_at = now()
-            check_thread_health(
-                observed_at=observed_at,
-                goal_state=latest_goal_state,
-                force=True,
-            )
+            if resolve_thread_id is not None:
+                reconcile_thread_binding(resolve_thread_id(target))
             continue
         if not isinstance(line, str):
             continue
-        resolved_thread_id = (
-            resolve_thread_id(target) if resolve_thread_id is not None else None
-        )
-        if resolved_thread_id and resolved_thread_id != config.thread_id:
-            pending_rotation_on_rebind = (
-                pending_rotation is not None
-                and pending_rotation(target) is not None
-            )
-            rebind_recovery_count = (
-                controller.recovery_count
-                if preserve_recovery_count_on_rebind or pending_rotation_on_rebind
-                else 0
-            )
-            config = replace(config, thread_id=resolved_thread_id)
-            controller = RecoveryController(
-                config,
-                initial_recovery_count=rebind_recovery_count,
-            )
-            rolling_output = ""
-            last_goal_resume_at = None
-            last_health_check_at = None
-            latest_goal_state = None
-            handled_incident_ids.clear()
-            if save_thread_id is not None:
-                save_thread_id(resolved_thread_id)
-            if (
-                preserve_recovery_count_on_rebind
-                and save_recovery_count is not None
-            ):
-                save_recovery_count(rebind_recovery_count)
-            preserve_recovery_count_on_rebind = False
-            awaiting_verified_success = (
-                rebind_recovery_count > 0 or pending_rotation_on_rebind
-            )
-            rotation_pending = awaiting_verified_success
-            rotation_pending = False
-            if awaiting_verified_success:
-                mark_verified_progress_baseline(resolved_thread_id)
-            elif save_verification_state is not None:
-                save_verification_state(False, 0)
-            successful_compactions = 0
-            if save_successful_compactions is not None:
-                save_successful_compactions(0)
-            emit(
-                "[codex-goal-watchdog] rebound active thread: "
-                f"{resolved_thread_id}"
-            )
+        if resolve_thread_id is not None:
+            reconcile_thread_binding(resolve_thread_id(target))
         normalized_line = normalize_terminal_text(line)
         line_goal_state = goal_state_from_text(normalized_line)
         if line_goal_state is not None:
@@ -482,6 +475,8 @@ def run_monitor(
                     "[codex-goal-watchdog] goal blocked; "
                     "waiting for manual /goal resume"
                 )
+            if line_goal_state == "achieved":
+                clear_pending_recovery_after_goal_achieved()
             if (
                 awaiting_verified_success
                 and line_goal_state in RECOVERABLE_GOAL_STATES
@@ -499,11 +494,24 @@ def run_monitor(
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
         observed_at = now()
         recovery_reason = classify_recovery_reason(rolling_output)
-        if recovery_reason is None and check_thread_health(
-            observed_at=observed_at, goal_state=latest_goal_state, force=False
+        if (
+            recovery_reason is not None
+            and recovery_deferred is not None
+            and recovery_deferred()
         ):
-            rolling_output = ""
-            continue
+            incident_logs.record(
+                key=f"cooldown:{recovery_reason}",
+                first=(
+                    "[codex-goal-watchdog] fatal recovery deferred during "
+                    f"cooldown: {recovery_reason}"
+                ),
+                summary=(
+                    "[codex-goal-watchdog] deferred fatal aggregate: "
+                    f"{recovery_reason}"
+                ),
+            )
+            # Cooldown belongs inside the recovery steps.  Do not discard a
+            # distinct fatal incident observed while another attempt waits.
         if recovery_reason is not None and resolve_recovery_incident is not None:
             incident = resolve_recovery_incident(config.thread_id)
             if incident is None or incident[1] != recovery_reason:
@@ -609,6 +617,16 @@ def run_monitor(
                         True,
                         verified_event_baselines[config.thread_id],
                     )
+                recovery_delay = (
+                    config.cooldown_seconds
+                    if controller.recovery_count > 1
+                    else 0
+                )
+                persist_recovery_phase(
+                    "cooldown" if recovery_delay else "action",
+                    reason=event.reason,
+                    not_before=observed_at + max(0, recovery_delay),
+                )
                 run_execute(
                     target,
                     build_recovery_steps(
@@ -634,6 +652,11 @@ def run_monitor(
                     increment_attempt=False,
                 )
                 continue
+            finally:
+                persist_recovery_phase(
+                    "awaiting_verification",
+                    reason=event.reason,
+                )
             if event.reason in COMPACTION_RECOVERY_REASONS:
                 successful_compactions += 1
                 if save_successful_compactions is not None:
@@ -656,6 +679,19 @@ def run_monitor(
 
         expected_update_version = update_prompt_version(rolling_output)
         if expected_update_version is not None:
+            if (
+                codex_process_running is not None
+                and not codex_process_running(target)
+            ):
+                if not missing_codex_update_logged:
+                    emit(
+                        "[codex-goal-watchdog] skipped Codex update: "
+                        "Codex process is not running"
+                    )
+                    missing_codex_update_logged = True
+                rolling_output = ""
+                continue
+            missing_codex_update_logged = False
             emit(
                 "[codex-goal-watchdog] installing Codex update: "
                 f"target={expected_update_version}"
@@ -678,6 +714,19 @@ def run_monitor(
             or observed_at - last_goal_resume_at >= GOAL_RESUME_RETRY_SECONDS
         )
         if goal_resume_visible and retry_ready:
+            if (
+                codex_process_running is not None
+                and not codex_process_running(target)
+            ):
+                if not missing_codex_resume_logged:
+                    emit(
+                        "[codex-goal-watchdog] skipped Goal resume: "
+                        "Codex process is not running"
+                    )
+                    missing_codex_resume_logged = True
+                rolling_output = ""
+                continue
+            missing_codex_resume_logged = False
             telemetry = (
                 resolve_thread_telemetry(config.thread_id)
                 if resolve_thread_telemetry is not None
@@ -718,6 +767,21 @@ def _save_tmux_thread_id(target: str, thread_id: str) -> None:
         if previous_binding is not None
         else None
     )
+    bound_recovery_phase = (
+        previous_binding.recovery_phase
+        if previous_binding is not None
+        else None
+    )
+    bound_recovery_not_before = (
+        previous_binding.recovery_not_before
+        if previous_binding is not None
+        else None
+    )
+    bound_recovery_reason = (
+        previous_binding.last_recovery_reason
+        if previous_binding is not None
+        else None
+    )
     if pending_rotation_count is not None:
         verification_pending = True
     subprocess.run(
@@ -735,20 +799,47 @@ def _save_tmux_thread_id(target: str, thread_id: str) -> None:
     pane_identity = _tmux_pane_identity(target)
     if pane_identity is not None:
         _, cwd = pane_identity
-        save_session_binding(
-            session=target,
-            thread_id=thread_id,
-            cwd=cwd,
-            verification_pending=verification_pending,
-            verification_baseline=verification_baseline,
+        has_recovery_phase = (
+            bound_recovery_phase not in {None, "idle"}
+            or bound_recovery_not_before
+            or bound_recovery_reason
         )
-        save_binding_runtime_state(
-            session=target,
-            recovery_count=rebound_recovery_count,
-            successful_compactions=0,
-            verification_pending=verification_pending,
-            verification_baseline=verification_baseline,
-        )
+        if has_recovery_phase:
+            save_session_binding(
+                session=target,
+                thread_id=thread_id,
+                cwd=cwd,
+                verification_pending=verification_pending,
+                verification_baseline=verification_baseline,
+                recovery_phase=bound_recovery_phase,
+                recovery_not_before=bound_recovery_not_before,
+                last_recovery_reason=bound_recovery_reason,
+            )
+            save_binding_runtime_state(
+                session=target,
+                recovery_count=rebound_recovery_count,
+                successful_compactions=0,
+                verification_pending=verification_pending,
+                verification_baseline=verification_baseline,
+                recovery_phase=bound_recovery_phase,
+                recovery_not_before=bound_recovery_not_before,
+                last_recovery_reason=bound_recovery_reason,
+            )
+        else:
+            save_session_binding(
+                session=target,
+                thread_id=thread_id,
+                cwd=cwd,
+                verification_pending=verification_pending,
+                verification_baseline=verification_baseline,
+            )
+            save_binding_runtime_state(
+                session=target,
+                recovery_count=rebound_recovery_count,
+                successful_compactions=0,
+                verification_pending=verification_pending,
+                verification_baseline=verification_baseline,
+            )
 
 
 def monitor_stdin(target: str, config: RecoveryConfig) -> None:
@@ -808,6 +899,14 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
             verification_baseline=baseline,
         )
 
+    def recovery_deferred() -> bool:
+        binding = load_session_binding(target)
+        return bool(
+            binding is not None
+            and binding.recovery_phase == "cooldown"
+            and binding.recovery_not_before > time.time()
+        )
+
     active_thread_id = resolve_thread_id(target)
     if active_thread_id and active_thread_id != config.thread_id:
         config = replace(config, thread_id=active_thread_id)
@@ -864,6 +963,9 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         initial_verification_pending=initial_verification_pending,
         initial_verification_baseline=initial_verification_baseline,
         initial_rotation_pending=initial_rotation_pending,
+        initial_goal_state=recovery_goal_state_on_screen(target),
         pending_rotation=_pending_thread_rotation_count,
         save_verification_state=save_verification_state,
+        recovery_deferred=recovery_deferred,
+        codex_running=pane_codex_running,
     )

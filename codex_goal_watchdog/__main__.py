@@ -29,6 +29,7 @@ from .paths import default_log_path
 from .recovery import (
     DEFAULT_RESUME_PROMPT,
     RecoveryConfig,
+    build_shell_restart_steps,
     build_startup_update_steps,
 )
 from .sessions import (
@@ -42,6 +43,8 @@ from .tmux_control import (
     execute_steps,
     handle_goal_prompt,
     monitor_pipe_command,
+    pane_codex_running,
+    pane_shell_ready,
 )
 
 
@@ -241,8 +244,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"tmux session {args.session!r} already exists; "
                 "use another --session name or close it before using --new"
             )
+        if (
+            session_binding is not None
+            and not thread_id
+            and session_binding.cwd != working_dir
+        ):
+            raise SystemExit(
+                f"codex-watch session {args.session!r} is bound to "
+                f"{session_binding.cwd}, but the current directory is "
+                f"{working_dir}. Start from the bound directory, use a "
+                "different --session name, or pass --new to replace the binding."
+            )
         pinned_thread_id = tmux_get_thread_id(args.session)
-        thread_id = thread_id or pinned_thread_id
+        # A watchdog binding is the durable owner.  The tmux option is a
+        # compatibility fallback and may lag after tmux recreation or /clear.
+        thread_id = thread_id or (
+            session_binding.thread_id
+            if session_binding is not None
+            else pinned_thread_id
+        )
         if thread_id is None:
             if args.dry_run:
                 thread_id = "00000000-0000-0000-0000-000000000000"
@@ -349,10 +369,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 initial_successful_compactions = max(0, value)
         if session_binding is not None and session_binding.thread_id == thread_id:
-            if tmux_values.get("recovery", -1) < 0:
-                initial_recovery_count = session_binding.recovery_count
-            if tmux_values.get("compactions", -1) < 0:
-                initial_successful_compactions = session_binding.successful_compactions
+            # The durable binding is the owner.  A valid but stale tmux option
+            # must not erase recovery state during a reconnect or manual start.
+            initial_recovery_count = session_binding.recovery_count
+            initial_successful_compactions = session_binding.successful_compactions
     elif session_binding is not None and session_binding.thread_id == thread_id:
         initial_recovery_count = session_binding.recovery_count
         initial_successful_compactions = session_binding.successful_compactions
@@ -401,6 +421,52 @@ def main(argv: list[str] | None = None) -> int:
         }
         for name, value in option_values.items():
             run_command(tmux_set_option_command(args.session, name, value))
+
+    missing_bound_codex = (
+        session_exists
+        and thread_id is not None
+        and not pane_codex_running(args.session)
+        and pane_shell_ready(args.session)
+    )
+    if missing_bound_codex:
+        recovery_config = RecoveryConfig(
+            thread_id=thread_id,
+            primary_model=args.primary_model,
+            primary_reasoning_effort=args.primary_reasoning_effort,
+            compact_model=args.compact_model,
+            compact_reasoning_effort=args.compact_reasoning_effort,
+            codex_args=tuple(codex_args),
+            cooldown_seconds=args.cooldown_seconds,
+            max_recoveries=args.max_recoveries,
+            compact_wait_seconds=args.compact_wait_seconds,
+            resume_prompt=args.resume_prompt,
+        )
+        next_recovery_attempt = initial_recovery_count + 1
+        if (
+            args.max_recoveries > 0
+            and initial_recovery_count >= args.max_recoveries
+        ):
+            raise SystemExit(
+                "codex-watch will not restart the missing Codex process: "
+                "max recoveries reached; increase --max-recoveries or reset "
+                "the binding only after a verified success"
+            )
+        print(
+            "[codex-goal-watchdog] Codex process is missing from the bound "
+            f"session; restarting pinned thread {thread_id}",
+            flush=True,
+        )
+        execute_steps(
+            args.session,
+            build_shell_restart_steps(
+                recovery_config,
+                recovery_attempt=next_recovery_attempt,
+                # The shared goal handler resumes ordinary paused Goals while
+                # retaining its blocked/stalled safeguards.
+                resume_goal=True,
+            ),
+            dry_run=args.dry_run,
+        )
     pipe_command = monitor_pipe_command(
         root_dir=str(root_dir),
         session=args.session,

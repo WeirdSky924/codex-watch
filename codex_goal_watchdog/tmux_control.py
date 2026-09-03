@@ -65,6 +65,9 @@ UPDATE_COMPLETION_CONSUMED_OPTION = "@codex_update_completion_consumed"
 PENDING_THREAD_ROTATION_OPTION = "@codex_pending_thread_rotation_count"
 SUCCESSFUL_COMPACTIONS_OPTION = "@codex_successful_compactions"
 LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
+RECOVERY_PHASE_OPTION = "@codex_recovery_phase"
+RECOVERY_NOT_BEFORE_OPTION = "@codex_recovery_not_before"
+LAST_RECOVERY_REASON_OPTION = "@codex_last_recovery_reason"
 
 
 class RecoveryInProgress(RuntimeError):
@@ -213,6 +216,51 @@ def clear_pending_thread_rotation(target: str) -> None:
     )
 
 
+def recovery_phase(target: str, *, runner=subprocess.run) -> str:
+    result = runner(
+        ["tmux", "show-option", "-v", "-t", target, RECOVERY_PHASE_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    value = result.stdout.strip() if result.returncode == 0 else ""
+    return value if value in {"idle", "cooldown", "action", "awaiting_verification"} else "idle"
+
+
+def recovery_not_before(target: str, *, runner=subprocess.run) -> float:
+    result = runner(
+        ["tmux", "show-option", "-v", "-t", target, RECOVERY_NOT_BEFORE_OPTION],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        return max(0.0, float(result.stdout.strip())) if result.returncode == 0 else 0.0
+    except ValueError:
+        return 0.0
+
+
+def save_recovery_phase(
+    target: str,
+    phase: str,
+    *,
+    not_before: float = 0.0,
+    reason: str = "",
+    runner=subprocess.run,
+) -> None:
+    if phase not in {"idle", "cooldown", "action", "awaiting_verification"}:
+        raise ValueError(f"unsupported recovery phase: {phase}")
+    for name, value in (
+        (RECOVERY_PHASE_OPTION, phase),
+        (RECOVERY_NOT_BEFORE_OPTION, str(max(0.0, not_before))),
+        (LAST_RECOVERY_REASON_OPTION, reason),
+    ):
+        runner(
+            ["tmux", "set-option", "-t", target, name, value],
+            check=True,
+        )
+
+
 def tmux_recovery_incident_id(target: str) -> str:
     result = subprocess.run(
         ["tmux", "show-option", "-v", "-t", target, LAST_RECOVERY_INCIDENT_OPTION],
@@ -287,6 +335,53 @@ def update_prompt_version(text: str) -> str | None:
     return match.group("latest")
 
 
+def _current_update_prompt_version(text: str) -> str | None:
+    """Return the target version only for the picker at the screen tail."""
+    text = ANSI_ESCAPE_RE.sub("", text)
+    candidates: list[int] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        marker_index = line.find("Update available!")
+        if marker_index >= 0 and not any(
+            character.isalnum() or character == "_"
+            for character in line[:marker_index]
+        ):
+            candidates.append(offset + marker_index)
+        offset += len(line)
+
+    for candidate_offset in reversed(candidates):
+        candidate = text[candidate_offset:]
+        match = UPDATE_PROMPT_RE.match(candidate)
+        if match is None:
+            continue
+        update_option_offset = candidate.find("Update now (runs", match.end())
+        picker_end_offset = candidate.find(
+            "Skip until next version",
+            max(match.end(), update_option_offset),
+        )
+        if update_option_offset < 0 or picker_end_offset < 0:
+            continue
+        trailing_text = candidate[
+            picker_end_offset + len("Skip until next version") :
+        ]
+        if goal_state_from_text(trailing_text) is not None:
+            continue
+        if "Update ran successfully!" in trailing_text:
+            continue
+        historical = False
+        for line in trailing_text.splitlines():
+            stripped = line.lstrip(" \t|│┃")
+            if stripped.startswith("›"):
+                historical = True
+                break
+            if SHELL_PROMPT_RE.match(line):
+                historical = True
+                break
+        if not historical:
+            return match.group("latest")
+    return None
+
+
 def capture_update_prompt_version(
     target: str, *, runner=subprocess.run
 ) -> str | None:
@@ -298,10 +393,7 @@ def capture_update_prompt_version(
     )
     if getattr(result, "returncode", 0) != 0:
         return None
-    visible_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if not visible_lines or "Update available!" not in visible_lines[0]:
-        return None
-    return update_prompt_version(result.stdout)
+    return _current_update_prompt_version(result.stdout)
 
 
 def _version_key(value: str) -> tuple[int, int, int, int]:
@@ -753,6 +845,20 @@ def pane_codex_running(target: str, *, runner=subprocess.run) -> bool:
     return True
 
 
+def pane_shell_ready(target: str, *, runner=subprocess.run) -> bool:
+    """Return true only when the pane is an idle shell ready for a command."""
+    try:
+        wait_for_pane_state(
+            target,
+            state="shell",
+            timeout_seconds=0,
+            runner=runner,
+        )
+    except (OSError, RuntimeError, TimeoutError, ValueError):
+        return False
+    return True
+
+
 def handle_goal_prompt(
     target: str,
     *,
@@ -1015,6 +1121,7 @@ def run_codex_update(
     expected_version: str,
     *,
     resume_goal: bool = True,
+    restore_goal: bool = True,
 ) -> None:
     clear_update_completion_consumed(target)
     set_pending_update_version(target, expected_version)
@@ -1024,12 +1131,38 @@ def run_codex_update(
             config,
             expected_version,
             resume_goal=resume_goal,
+            restore_goal=restore_goal,
         ),
     )
     clear_pending_update_version(target)
 
 
 def resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
+    pending_version = pending_update_version(target)
+    if pending_version and pane_shell_ready(target):
+        current_goal_state = recovery_goal_state_on_screen(target)
+        print(
+            "[codex-goal-watchdog] completing interrupted Codex update: "
+            f"target={pending_version}",
+            flush=True,
+        )
+        execute_steps(
+            target,
+            build_codex_update_completion_steps(
+                config,
+                pending_version,
+                resume_goal=current_goal_state not in {"blocked", "stalled"},
+                restore_goal=current_goal_state != "achieved",
+            ),
+        )
+        clear_pending_update_version(target)
+        return
+
+    if not pane_codex_running(target):
+        # The updater may still own the pane. Keep pending state for the next
+        # monitor/guardian pass, but never act on a picker left in scrollback.
+        return
+
     current_goal_state = recovery_goal_state_on_screen(target)
     visible_version = capture_update_prompt_version(target)
     if visible_version is not None:
@@ -1043,26 +1176,9 @@ def resume_interrupted_update(target: str, config: RecoveryConfig) -> None:
             config,
             visible_version,
             resume_goal=current_goal_state not in {"blocked", "stalled"},
+            restore_goal=current_goal_state != "achieved",
         )
         return
-
-    pending_version = pending_update_version(target)
-    if not pending_version:
-        return
-    print(
-        "[codex-goal-watchdog] completing interrupted Codex update: "
-        f"target={pending_version}",
-        flush=True,
-    )
-    execute_steps(
-        target,
-        build_codex_update_completion_steps(
-            config,
-            pending_version,
-            resume_goal=current_goal_state not in {"blocked", "stalled"},
-        ),
-    )
-    clear_pending_update_version(target)
 
 
 def recovery_goal_state_on_screen(

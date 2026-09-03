@@ -860,6 +860,46 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([1, 2, 0], persisted_counts)
         self.assertEqual("300", calls[1][1][4].value)
 
+    @patch("codex_goal_watchdog.monitor.load_session_binding", return_value=None)
+    @patch("codex_goal_watchdog.monitor._save_recovery_phase")
+    def test_recovery_finalizer_does_not_overwrite_achieved_state(
+        self,
+        save_recovery_phase_mock,
+        _load_binding_mock,
+    ):
+        goal_state = {"value": "pursuing"}
+        persisted_counts = []
+        verification_states = []
+
+        def complete_goal_during_recovery(_target, _steps):
+            goal_state["value"] = "achieved"
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ unexpected status 503 Service Unavailable: upstream failed\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=0),
+            initial_recovery_count=1,
+            execute=complete_goal_during_recovery,
+            resolve_goal_state=lambda _target: goal_state["value"],
+            save_recovery_count=persisted_counts.append,
+            save_verification_state=lambda pending, baseline: (
+                verification_states.append((pending, baseline))
+            ),
+            now=iter([100.0, 101.0]).__next__,
+            log=lambda _message: None,
+        )
+
+        self.assertEqual([2, 0], persisted_counts)
+        self.assertEqual((False, 0), verification_states[-1])
+        self.assertEqual("idle", save_recovery_phase_mock.call_args.args[1])
+        self.assertNotEqual(
+            "awaiting_verification",
+            save_recovery_phase_mock.call_args.args[1],
+        )
+
     def test_duplicate_incident_redraws_log_once_then_aggregate(self):
         messages = []
 

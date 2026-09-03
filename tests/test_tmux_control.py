@@ -801,6 +801,31 @@ class TmuxControlTests(unittest.TestCase):
             calls,
         )
 
+    def test_handle_goal_prompt_stops_immediately_for_achieved_goal(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+
+            class Result:
+                stdout = "Goal achieved (21h 55m)"
+
+            return Result()
+
+        handled = handle_goal_prompt(
+            "codex-goal",
+            action="resume",
+            prompt="继续旧 goal",
+            timeout_seconds=0,
+            runner=runner,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [["tmux", "capture-pane", "-p", "-t", "codex-goal"]],
+            calls,
+        )
+
     def test_handle_goal_prompt_uses_latest_goal_state_from_screen_history(self):
         calls = []
         sleeps = []

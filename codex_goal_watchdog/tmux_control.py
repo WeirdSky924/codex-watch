@@ -883,6 +883,8 @@ def handle_goal_prompt(
             check=True,
         )
         goal_state = goal_state_from_text(result.stdout)
+        if goal_state == "achieved":
+            return True
         if goal_state == "blocked":
             print(
                 "[codex-goal-watchdog] goal blocked; "

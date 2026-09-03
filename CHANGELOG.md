@@ -35,6 +35,8 @@ All notable changes to this project will be documented in this file.
 - Clear stale pending-verification state when a monitor starts on, or later
   observes, an achieved Goal; guardian also refuses missing-process recovery
   for an achieved/non-recoverable Goal even if an old binding remains pending.
+- Prevent a superseded monitor's recovery finalizer from restoring stale
+  recovery count/phase after another monitor has observed `Goal achieved`.
 - Prefer the durable watchdog session binding when a tmux option still points
   at an older thread after `/clear`, tmux recreation, or recovery.
 - Reconcile the active thread on monitor ticks and aggregate repeated recovery

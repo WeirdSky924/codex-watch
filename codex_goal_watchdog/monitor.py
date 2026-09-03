@@ -280,6 +280,19 @@ def run_monitor(
             "pending recovery state cleared"
         )
 
+    def finalize_recovery_phase(reason: str) -> None:
+        nonlocal latest_goal_state
+        current_goal_state = (
+            resolve_goal_state(target)
+            if resolve_goal_state is not None
+            else latest_goal_state
+        )
+        if current_goal_state == "achieved":
+            latest_goal_state = "achieved"
+            clear_pending_recovery_after_goal_achieved()
+            return
+        persist_recovery_phase("awaiting_verification", reason=reason)
+
     def mark_verified_progress_baseline(thread_id: str) -> None:
         if resolve_thread_telemetry is None:
             return
@@ -402,10 +415,7 @@ def run_monitor(
                 ),
             )
         finally:
-            persist_recovery_phase(
-                "awaiting_verification",
-                reason=detail,
-            )
+            finalize_recovery_phase(detail)
         return True
 
     def reconcile_thread_binding(resolved_thread_id: str | None) -> None:
@@ -653,10 +663,7 @@ def run_monitor(
                 )
                 continue
             finally:
-                persist_recovery_phase(
-                    "awaiting_verification",
-                    reason=event.reason,
-                )
+                finalize_recovery_phase(event.reason)
             if event.reason in COMPACTION_RECOVERY_REASONS:
                 successful_compactions += 1
                 if save_successful_compactions is not None:
@@ -897,6 +904,9 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
             successful_compactions=_tmux_successful_compactions(target),
             verification_pending=pending,
             verification_baseline=baseline,
+            recovery_phase=None if pending else "idle",
+            recovery_not_before=None if pending else 0.0,
+            last_recovery_reason=None if pending else "",
         )
 
     def recovery_deferred() -> bool:

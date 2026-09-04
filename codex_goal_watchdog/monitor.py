@@ -15,11 +15,12 @@ from typing import BinaryIO
 from .bindings import (
     load_session_binding,
     save_binding_runtime_state,
-    save_session_binding,
     save_thread_handoff,
 )
 from .recovery import (
     COMPACTION_RECOVERY_REASONS,
+    CompactionTimeoutError,
+    CompactionUpstreamError,
     THREAD_HEALTH_ROTATION_REASON,
     THREAD_ROTATION_RECOVERY_REASONS,
     RecoveryConfig,
@@ -27,6 +28,7 @@ from .recovery import (
     build_recovery_steps,
     classify_recovery_message,
     classify_recovery_reason,
+    handle_compaction_upstream_failure,
 )
 from .sessions import (
     ThreadTelemetry,
@@ -39,18 +41,15 @@ from .tmux_control import (
     RecoveryInProgress,
     capture_update_prompt_version,
     claim_tmux_recovery_incident_id as _claim_tmux_recovery_incident_id,
-    clear_pending_thread_rotation as _clear_pending_thread_rotation,
     execute_steps,
     goal_state_from_text,
     handle_goal_prompt,
     normalize_terminal_text,
     pane_codex_running,
     paused_goal_picker_visible,
-    pending_thread_rotation_count as _pending_thread_rotation_count,
     save_tmux_recovery_count as _save_tmux_recovery_count_impl,
     save_tmux_successful_compactions as _save_tmux_successful_compactions_impl,
     save_recovery_phase as _save_recovery_phase,
-    set_pending_thread_rotation as _set_pending_thread_rotation,
     tmux_recovery_count as _tmux_recovery_count_impl,
     tmux_recovery_incident_id as _tmux_recovery_incident_id,
     tmux_successful_compactions as _tmux_successful_compactions,
@@ -60,6 +59,11 @@ from .tmux_control import (
 )
 from .tmux_control import recovery_goal_state_on_screen
 from .launcher import tmux_pane_identity as _tmux_pane_identity
+from .rotation_state import (
+    pending_thread_rotation_marker as _pending_thread_rotation_marker,
+    save_rebound_thread_id as _save_tmux_thread_id,
+    set_pending_thread_rotation as _set_pending_thread_rotation,
+)
 
 
 ROLLING_BUFFER_SIZE = 8192
@@ -144,7 +148,7 @@ def run_monitor(
     save_recovery_incident_id: Callable[[str], None] | None = None,
     claim_recovery_incident_id: Callable[[str], bool] | None = None,
     resolve_goal_objective: Callable[[str], str | None] | None = None,
-    mark_thread_rotation: Callable[[int], None] | None = None,
+    mark_thread_rotation: Callable[[int, str, str], None] | None = None,
     verify_recovery: Callable[[str], bool] | None = None,
     initial_successful_compactions: int = 0,
     save_successful_compactions: Callable[[int], None] | None = None,
@@ -389,7 +393,11 @@ def run_monitor(
             not_before=phase_now + max(0, delay),
         )
         if mark_thread_rotation is not None:
-            mark_thread_rotation(controller.recovery_count)
+            mark_thread_rotation(
+                controller.recovery_count,
+                detail,
+                config.thread_id,
+            )
         mark_verified_progress_baseline(config.thread_id)
         incident_logs.flush()
         emit(
@@ -648,7 +656,24 @@ def run_monitor(
                         goal_objective=goal_objective,
                     ),
                 )
-            except TimeoutError:
+            except CompactionUpstreamError as exc:
+                handle_compaction_upstream_failure(
+                    exc,
+                    event_reason=event.reason,
+                    target=target,
+                    config=config,
+                    goal_state=effective_goal_state,
+                    recovery_attempt=controller.recovery_count,
+                    telemetry=(
+                        resolve_thread_telemetry(config.thread_id)
+                        if resolve_thread_telemetry is not None
+                        else None
+                    ),
+                    execute=run_execute,
+                    rotate=execute_rotation,
+                )
+                continue
+            except CompactionTimeoutError:
                 if event.reason not in COMPACTION_RECOVERY_REASONS:
                     raise
                 execute_rotation(
@@ -761,101 +786,16 @@ def _save_tmux_successful_compactions(target: str, count: int) -> None:
     _save_tmux_successful_compactions_impl(target, count)
 
 
-def _save_tmux_thread_id(target: str, thread_id: str) -> None:
-    previous_binding = load_session_binding(target)
-    pending_rotation_count = _pending_thread_rotation_count(target)
-    verification_pending = (
-        previous_binding.verification_pending
-        if previous_binding is not None
-        else None
-    )
-    verification_baseline = (
-        previous_binding.verification_baseline
-        if previous_binding is not None
-        else None
-    )
-    bound_recovery_phase = (
-        previous_binding.recovery_phase
-        if previous_binding is not None
-        else None
-    )
-    bound_recovery_not_before = (
-        previous_binding.recovery_not_before
-        if previous_binding is not None
-        else None
-    )
-    bound_recovery_reason = (
-        previous_binding.last_recovery_reason
-        if previous_binding is not None
-        else None
-    )
-    if pending_rotation_count is not None:
-        verification_pending = True
-    subprocess.run(
-        ["tmux", "set-option", "-t", target, "@codex_thread_id", thread_id],
-        check=True,
-    )
-    if pending_rotation_count is None:
-        _save_tmux_recovery_count(target, 0)
-        rebound_recovery_count = 0
-    else:
-        _save_tmux_recovery_count(target, pending_rotation_count)
-        rebound_recovery_count = pending_rotation_count
-        _clear_pending_thread_rotation(target)
-    _save_tmux_successful_compactions(target, 0)
-    pane_identity = _tmux_pane_identity(target)
-    if pane_identity is not None:
-        _, cwd = pane_identity
-        has_recovery_phase = (
-            bound_recovery_phase not in {None, "idle"}
-            or bound_recovery_not_before
-            or bound_recovery_reason
-        )
-        if has_recovery_phase:
-            save_session_binding(
-                session=target,
-                thread_id=thread_id,
-                cwd=cwd,
-                verification_pending=verification_pending,
-                verification_baseline=verification_baseline,
-                recovery_phase=bound_recovery_phase,
-                recovery_not_before=bound_recovery_not_before,
-                last_recovery_reason=bound_recovery_reason,
-            )
-            save_binding_runtime_state(
-                session=target,
-                recovery_count=rebound_recovery_count,
-                successful_compactions=0,
-                verification_pending=verification_pending,
-                verification_baseline=verification_baseline,
-                recovery_phase=bound_recovery_phase,
-                recovery_not_before=bound_recovery_not_before,
-                last_recovery_reason=bound_recovery_reason,
-            )
-        else:
-            save_session_binding(
-                session=target,
-                thread_id=thread_id,
-                cwd=cwd,
-                verification_pending=verification_pending,
-                verification_baseline=verification_baseline,
-            )
-            save_binding_runtime_state(
-                session=target,
-                recovery_count=rebound_recovery_count,
-                successful_compactions=0,
-                verification_pending=verification_pending,
-                verification_baseline=verification_baseline,
-            )
-
-
 def monitor_stdin(target: str, config: RecoveryConfig) -> None:
     print(f"[codex-goal-watchdog] monitor started: target={target}", flush=True)
     monitor_started_at = time.time()
     pane_identity = _tmux_pane_identity(target)
     telemetry_trackers: dict[str, ThreadTelemetryTracker] = {}
     binding = load_session_binding(target)
-    initial_rotation_pending = _pending_thread_rotation_count(target) is not None
+    initial_rotation_pending = (
+        _pending_thread_rotation_marker(target, thread_id=config.thread_id)
+        is not None
+    )
     initial_verification_pending = bool(
         binding is not None and binding.thread_id == config.thread_id
         and binding.verification_pending
@@ -917,6 +857,14 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
             and binding.recovery_not_before > time.time()
         )
 
+    def mark_thread_rotation(count: int, reason: str, thread_id: str) -> None:
+        _set_pending_thread_rotation(
+            target,
+            count,
+            reason=reason,
+            source_thread_id=thread_id,
+        )
+
     active_thread_id = resolve_thread_id(target)
     if active_thread_id and active_thread_id != config.thread_id:
         config = replace(config, thread_id=active_thread_id)
@@ -963,10 +911,7 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         resolve_goal_objective=lambda thread_id: find_latest_goal_objective(
             thread_id=thread_id
         ),
-        mark_thread_rotation=lambda count: _set_pending_thread_rotation(
-            target,
-            count,
-        ),
+        mark_thread_rotation=mark_thread_rotation,
         resolve_thread_telemetry=resolve_thread_telemetry,
         write_thread_handoff=write_handoff,
         resolve_goal_state=recovery_goal_state_on_screen,
@@ -974,7 +919,9 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         initial_verification_baseline=initial_verification_baseline,
         initial_rotation_pending=initial_rotation_pending,
         initial_goal_state=recovery_goal_state_on_screen(target),
-        pending_rotation=_pending_thread_rotation_count,
+        pending_rotation=lambda target: (
+            _pending_thread_rotation_marker(target, thread_id=config.thread_id)
+        ),
         save_verification_state=save_verification_state,
         recovery_deferred=recovery_deferred,
         codex_running=pane_codex_running,

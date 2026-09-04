@@ -380,6 +380,10 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep("wait_shell", "30"),
                 RecoveryStep("sleep", "0"),
                 RecoveryStep(
+                    "mark_compaction",
+                    "550e8400-e29b-41d4-a716-446655440000",
+                ),
+                RecoveryStep(
                     "shell_command",
                     "env -u NO_COLOR -u CODEX_THREAD_ID -u CODEX_CI "
                     "-u CODEX_SESSION_ID "
@@ -392,10 +396,6 @@ class RecoveryStepTests(unittest.TestCase):
                 RecoveryStep("wait_codex", "30"),
                 RecoveryStep("sleep", "5"),
                 RecoveryStep("leave_goal_paused", ""),
-                RecoveryStep(
-                    "mark_compaction",
-                    "550e8400-e29b-41d4-a716-446655440000",
-                ),
                 RecoveryStep("text", "/compact"),
                 RecoveryStep(
                     "wait_compaction",

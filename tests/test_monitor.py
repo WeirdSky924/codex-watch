@@ -7,9 +7,11 @@ from unittest.mock import patch
 from codex_goal_watchdog.monitor import (
     MONITOR_TICK,
     _claim_tmux_recovery_incident_id,
-    _save_tmux_thread_id,
     iter_decoded_chunks,
     run_monitor,
+)
+from codex_goal_watchdog.rotation_state import (
+    save_rebound_thread_id as _save_tmux_thread_id,
 )
 from codex_goal_watchdog.recovery import RecoveryConfig
 from codex_goal_watchdog.sessions import ThreadTelemetry
@@ -667,7 +669,9 @@ class MonitorTests(unittest.TestCase):
             save_recovery_count=persisted_counts.append,
             resolve_recovery_incident=lambda thread_id: next(incidents),
             resolve_goal_objective=lambda thread_id: "Goal ID: FE-CREATOR-8",
-            mark_thread_rotation=marked_rotation_counts.append,
+            mark_thread_rotation=lambda count, _reason, _thread_id: (
+                marked_rotation_counts.append(count)
+            ),
             claim_recovery_incident_id=lambda incident_id: True,
             now=iter([100.0, 101.0, 102.0, 103.0]).__next__,
             execute=lambda target, steps: calls.append((target, steps)),
@@ -716,12 +720,12 @@ class MonitorTests(unittest.TestCase):
             any(new_thread_id in step.value for step in calls[0][1])
         )
 
-    @patch("codex_goal_watchdog.monitor.save_session_binding")
+    @patch("codex_goal_watchdog.rotation_state.save_session_binding")
     @patch(
-        "codex_goal_watchdog.monitor._tmux_pane_identity",
+        "codex_goal_watchdog.rotation_state._tmux_pane_identity",
         return_value=(123, Path("/workspace/project-a")),
     )
-    @patch("codex_goal_watchdog.monitor.subprocess.run")
+    @patch("codex_goal_watchdog.rotation_state.subprocess.run")
     def test_clear_rebind_persists_new_thread_for_next_tmux_start(
         self,
         _run_mock,
@@ -740,25 +744,25 @@ class MonitorTests(unittest.TestCase):
             verification_baseline=None,
         )
 
-    @patch("codex_goal_watchdog.monitor._clear_pending_thread_rotation")
+    @patch("codex_goal_watchdog.rotation_state.clear_pending_thread_rotation")
     @patch(
-        "codex_goal_watchdog.monitor._pending_thread_rotation_count",
+        "codex_goal_watchdog.rotation_state.pending_thread_rotation_marker",
         return_value=3,
     )
-    @patch("codex_goal_watchdog.monitor._save_tmux_recovery_count")
-    @patch("codex_goal_watchdog.monitor.save_session_binding")
+    @patch("codex_goal_watchdog.rotation_state._save_tmux_recovery_count")
+    @patch("codex_goal_watchdog.rotation_state.save_session_binding")
     @patch(
-        "codex_goal_watchdog.monitor._tmux_pane_identity",
+        "codex_goal_watchdog.rotation_state._tmux_pane_identity",
         return_value=(123, Path("/workspace/project-a")),
     )
-    @patch("codex_goal_watchdog.monitor.subprocess.run")
+    @patch("codex_goal_watchdog.rotation_state.subprocess.run")
     def test_rotation_rebind_preserves_pending_recovery_count(
         self,
         _run_mock,
         _pane_identity_mock,
         _save_binding_mock,
         save_count_mock,
-        _pending_count_mock,
+        _pending_marker_mock,
         clear_pending_mock,
     ):
         new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
@@ -768,21 +772,27 @@ class MonitorTests(unittest.TestCase):
         save_count_mock.assert_called_once_with("project-a", 3)
         clear_pending_mock.assert_called_once_with("project-a")
 
-    @patch("codex_goal_watchdog.monitor.save_binding_runtime_state")
-    @patch("codex_goal_watchdog.monitor.load_session_binding")
-    @patch("codex_goal_watchdog.monitor.save_session_binding")
-    @patch("codex_goal_watchdog.monitor._pending_thread_rotation_count", return_value=3)
-    @patch("codex_goal_watchdog.monitor._save_tmux_recovery_count")
-    @patch("codex_goal_watchdog.monitor._save_tmux_successful_compactions")
-    @patch("codex_goal_watchdog.monitor._tmux_pane_identity", return_value=(123, Path("/workspace/project-a")))
-    @patch("codex_goal_watchdog.monitor.subprocess.run")
+    @patch("codex_goal_watchdog.rotation_state.save_binding_runtime_state")
+    @patch("codex_goal_watchdog.rotation_state.load_session_binding")
+    @patch("codex_goal_watchdog.rotation_state.save_session_binding")
+    @patch(
+        "codex_goal_watchdog.rotation_state.pending_thread_rotation_marker",
+        return_value=3,
+    )
+    @patch("codex_goal_watchdog.rotation_state._save_tmux_recovery_count")
+    @patch("codex_goal_watchdog.rotation_state._save_tmux_successful_compactions")
+    @patch(
+        "codex_goal_watchdog.rotation_state._tmux_pane_identity",
+        return_value=(123, Path("/workspace/project-a")),
+    )
+    @patch("codex_goal_watchdog.rotation_state.subprocess.run")
     def test_thread_rebind_preserves_verification_pending_state(
         self,
         _run_mock,
         _pane_identity_mock,
         _save_compactions_mock,
         _save_count_mock,
-        _pending_count_mock,
+        _pending_marker_mock,
         save_binding_mock,
         load_binding_mock,
         save_runtime_mock,
@@ -958,7 +968,9 @@ class MonitorTests(unittest.TestCase):
             write_thread_handoff=lambda **kwargs: (
                 handoffs.append(kwargs) or Path("/state/handoffs/latest.json")
             ),
-            mark_thread_rotation=marked_counts.append,
+            mark_thread_rotation=lambda count, _reason, _thread_id: (
+                marked_counts.append(count)
+            ),
             save_recovery_count=lambda count: None,
             now=iter([100.0, 101.0]).__next__,
             execute=lambda target, steps: calls.append((target, steps)),
@@ -1164,38 +1176,6 @@ class MonitorTests(unittest.TestCase):
         assert len(calls) == 2
         assert not any(step.kind == "sleep" and step.value == "300" for step in calls[0][1])
         assert any(step.kind == "sleep" and step.value == "300" for step in calls[1][1])
-
-    def test_compaction_timeout_falls_back_to_fresh_thread_rotation(self):
-        calls = []
-        handoffs = []
-
-        def execute(target, steps):
-            calls.append((target, steps))
-            if any(step.kind == "wait_compaction" for step in steps):
-                raise TimeoutError("compaction timed out")
-
-        run_monitor(
-            lines=[
-                "Pursuing goal (4m)\n",
-                "■ stream disconnected before completion: codex upstream stalled: "
-                "no real data for 5m0s, connection recycled\n",
-            ],
-            target="codex-goal",
-            config=RecoveryConfig(thread_id=THREAD_ID),
-            resolve_goal_objective=lambda thread_id: "Goal ID: FE-CREATOR-8",
-            write_thread_handoff=lambda **kwargs: (
-                handoffs.append(kwargs) or Path("/state/handoffs/latest.json")
-            ),
-            mark_thread_rotation=lambda count: None,
-            now=iter([100.0, 101.0]).__next__,
-            execute=execute,
-            log=lambda message: None,
-        )
-
-        self.assertEqual(2, len(calls))
-        self.assertTrue(any(step.kind == "wait_compaction" for step in calls[0][1]))
-        self.assertFalse(any(step.kind == "wait_compaction" for step in calls[1][1]))
-        self.assertEqual("compaction_timeout", handoffs[0]["reason"])
 
 if __name__ == "__main__":
     unittest.main()

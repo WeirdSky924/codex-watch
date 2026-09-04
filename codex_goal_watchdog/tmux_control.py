@@ -16,12 +16,19 @@ from pathlib import Path
 from .bindings import save_binding_runtime_state
 from .paths import state_dir
 from .recovery import (
+    CompactionTimeoutError,
+    CompactionUpstreamError,
     RecoveryConfig,
     RecoveryStep,
     build_codex_update_completion_steps,
     build_codex_update_steps,
+    classify_recovery_message,
 )
-from .sessions import compaction_event_exists_after, find_thread_rollout_path
+from .sessions import (
+    compaction_event_exists_after,
+    find_latest_task_failure_after,
+    find_thread_rollout_path,
+)
 
 
 PAUSED_GOAL_PICKER_MARKERS = (
@@ -62,7 +69,6 @@ SHELL_PROMPT_RE = re.compile(
 )
 PENDING_UPDATE_OPTION = "@codex_pending_update_version"
 UPDATE_COMPLETION_CONSUMED_OPTION = "@codex_update_completion_consumed"
-PENDING_THREAD_ROTATION_OPTION = "@codex_pending_thread_rotation_count"
 SUCCESSFUL_COMPACTIONS_OPTION = "@codex_successful_compactions"
 LAST_RECOVERY_INCIDENT_OPTION = "@codex_last_recovery_incident_id"
 RECOVERY_PHASE_OPTION = "@codex_recovery_phase"
@@ -170,49 +176,6 @@ def save_tmux_successful_compactions(target: str, count: int) -> None:
         session=target,
         recovery_count=tmux_recovery_count(target),
         successful_compactions=normalized_count,
-    )
-
-
-def pending_thread_rotation_count(target: str) -> int | None:
-    result = subprocess.run(
-        ["tmux", "show-option", "-v", "-t", target, PENDING_THREAD_ROTATION_OPTION],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    try:
-        return max(0, int(result.stdout.strip()))
-    except ValueError:
-        return None
-
-
-def set_pending_thread_rotation(target: str, count: int) -> None:
-    subprocess.run(
-        [
-            "tmux",
-            "set-option",
-            "-t",
-            target,
-            PENDING_THREAD_ROTATION_OPTION,
-            str(max(0, count)),
-        ],
-        check=True,
-    )
-
-
-def clear_pending_thread_rotation(target: str) -> None:
-    subprocess.run(
-        [
-            "tmux",
-            "set-option",
-            "-u",
-            "-t",
-            target,
-            PENDING_THREAD_ROTATION_OPTION,
-        ],
-        check=True,
     )
 
 
@@ -948,6 +911,18 @@ def execute_steps(
         )
 
 
+def _raise_compaction_upstream_failure(
+    compaction_offsets: dict[str, tuple[Path, int]],
+) -> None:
+    for path, offset in compaction_offsets.values():
+        failure = find_latest_task_failure_after(path, offset=offset)
+        if failure is None:
+            continue
+        reason = classify_recovery_message(failure.message)
+        if reason is not None:
+            raise CompactionUpstreamError(reason)
+
+
 def _execute_steps_unlocked(
     target: str,
     steps: list[RecoveryStep],
@@ -958,6 +933,11 @@ def _execute_steps_unlocked(
 ) -> None:
     compaction_offsets: dict[str, tuple[Path, int]] = {}
     for step in steps:
+        if compaction_offsets and step.kind not in {
+            "mark_compaction",
+            "wait_compaction",
+        }:
+            _raise_compaction_upstream_failure(compaction_offsets)
         if step.kind == "sleep":
             if not dry_run:
                 sleeper(float(step.value))
@@ -970,13 +950,20 @@ def _execute_steps_unlocked(
                     flush=True,
                 )
                 continue
-            wait_for_pane_state(
-                target,
-                state=state,
-                timeout_seconds=float(step.value),
-                runner=runner,
-                sleeper=sleeper,
-            )
+            try:
+                wait_for_pane_state(
+                    target,
+                    state=state,
+                    timeout_seconds=float(step.value),
+                    runner=runner,
+                    sleeper=sleeper,
+                )
+            except TimeoutError:
+                if state == "codex" and compaction_offsets:
+                    _raise_compaction_upstream_failure(compaction_offsets)
+                raise
+            if state == "codex" and compaction_offsets:
+                _raise_compaction_upstream_failure(compaction_offsets)
             continue
         if step.kind == "ensure_codex_version":
             if dry_run:
@@ -1011,12 +998,14 @@ def _execute_steps_unlocked(
             timeout = step.timeout_seconds or 600
             deadline = time.monotonic() + timeout
             while not compaction_event_exists_after(path, offset=offset):
+                _raise_compaction_upstream_failure({step.value: (path, offset)})
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
+                    raise CompactionTimeoutError(
                         f"thread {step.value} did not emit context_compacted "
                         f"within {timeout}s"
                     )
                 sleeper(1)
+            del compaction_offsets[step.value]
             continue
         if step.kind in {
             "leave_goal_paused",

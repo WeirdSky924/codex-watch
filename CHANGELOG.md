@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.25] - 2026-09-04
+
+### Fixed
+
+- Keep temporary upstream disconnects, 5xx responses, and other retryable
+  failures on the currently pinned Codex thread; they cannot consume a stale
+  pending thread-rotation marker to start a new thread.
+- Distinguish the native compaction timeout from unrelated tmux or submission
+  timeouts. A new retryable upstream failure observed during `/compact` aborts
+  the wait and resumes the pinned thread instead of rotating it.
+- Require pending thread-rotation state to include a supported reason and the
+  source thread ID. Legacy health-threshold markers are cleared fail-closed.
+
 ## [0.1.24] - 2026-08-31
 
 ### Changed

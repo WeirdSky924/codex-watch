@@ -11,7 +11,6 @@ from pathlib import Path
 from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
 from .monitor import (
     _claim_tmux_recovery_incident_id,
-    _set_pending_thread_rotation,
     _tmux_successful_compactions,
     normalize_terminal_text,
     recovery_incident_for_thread,
@@ -22,7 +21,6 @@ from .monitor import (
 from .paths import default_log_path
 from .bindings import (
     load_session_binding,
-    load_thread_handoff,
     save_binding_runtime_state,
 )
 from .recovery import (
@@ -31,7 +29,6 @@ from .recovery import (
     RecoveryConfig,
     RecoveryStep,
     build_post_update_restart_steps,
-    build_thread_rotation_prompt,
     build_recovery_steps,
     build_shell_restart_steps,
     classify_recovery_reason,
@@ -44,13 +41,11 @@ from .tmux_control import (
     RecoveryInProgress,
     codex_composer_pending,
     clear_pending_update_version,
-    clear_pending_thread_rotation,
     clear_update_completion_consumed,
     _execute_steps_unlocked,
     mark_update_completion_consumed,
     monitor_pipe_command,
     pane_codex_running,
-    pending_thread_rotation_count,
     retry_codex_submission,
     save_recovery_phase,
     recovery_phase,
@@ -58,7 +53,12 @@ from .tmux_control import (
     session_recovery_lock,
     update_prompt_version,
 )
-
+from .rotation_state import (
+    clear_pending_thread_rotation,
+    has_pending_thread_rotation,
+    pending_thread_rotation_prompt,
+    set_pending_thread_rotation,
+)
 
 UPDATE_SUCCESS_MARKER = "Update ran successfully! Please restart Codex."
 SHELL_COMMANDS = {"bash", "zsh", "sh", "fish"}
@@ -527,7 +527,9 @@ def _recover_visible_incident(
         reason=reason,
     )
     if reason == "upstream_access_denied":
-        _set_pending_thread_rotation(session, recovery_attempt)
+        set_pending_thread_rotation(
+            session, recovery_attempt, reason=reason, source_thread_id=config.thread_id
+        )
     _append_log(
         log_path,
         "visible recoverable error claimed during guardian handoff: "
@@ -558,20 +560,10 @@ def _pending_rotation_prompt(
     session: str,
     config: RecoveryConfig,
 ) -> str | None:
-    loaded = load_thread_handoff(session)
-    if loaded is None:
-        return None
-    path, payload = loaded
-    objective = payload.get("goal_objective")
-    objective = objective if isinstance(objective, str) and objective else None
-    reason = payload.get("reason")
-    reason = reason if isinstance(reason, str) and reason else "thread_health_rotation"
-    goal_state = recovery_goal_state_on_screen(session)
-    return build_thread_rotation_prompt(
-        objective,
-        resume_goal=goal_state not in {"blocked", "stalled"},
-        rotation_reason=reason,
-        handoff_path=str(path),
+    return pending_thread_rotation_prompt(
+        session,
+        thread_id=config.thread_id,
+        goal_state=recovery_goal_state_on_screen(session),
     )
 
 
@@ -579,7 +571,7 @@ def _pending_recovery_prompt(
     session: str,
     config: RecoveryConfig,
 ) -> str | None:
-    if pending_thread_rotation_count(session) is not None:
+    if has_pending_thread_rotation(session, thread_id=config.thread_id):
         rotation_prompt = _pending_rotation_prompt(session, config)
         if rotation_prompt is not None:
             return rotation_prompt
@@ -702,13 +694,15 @@ def run_guardian(
                 return True
 
             def missing_codex_recovery_needed() -> bool:
+                assert config is not None
                 binding = load_session_binding(session)
                 if _recovery_deferred(session):
                     return False
                 return _missing_codex_recovery_required(
                     goal_state=recovery_goal_state_on_screen(session),
-                    pending_rotation=(
-                        pending_thread_rotation_count(session) is not None
+                    pending_rotation=has_pending_thread_rotation(
+                        session,
+                        thread_id=config.thread_id,
                     ),
                     verification_pending=bool(
                         binding is not None and binding.verification_pending
@@ -722,7 +716,10 @@ def run_guardian(
                         recovery_attempt = _next_recovery_attempt(session)
                         goal_state = recovery_goal_state_on_screen(session)
                         _mark_verification_pending(session, config)
-                        if pending_thread_rotation_count(session) is not None:
+                        if has_pending_thread_rotation(
+                            session,
+                            thread_id=config.thread_id,
+                        ):
                             clear_pending_thread_rotation(session)
                         _append_log(
                             log_path,
@@ -757,7 +754,10 @@ def run_guardian(
                     return False
                 if time.monotonic() < pending_retry_after:
                     return False
-                if pending_thread_rotation_count(session) is None:
+                if not has_pending_thread_rotation(
+                    session,
+                    thread_id=config.thread_id,
+                ):
                     binding = load_session_binding(session)
                     if binding is None or not binding.verification_pending:
                         return False

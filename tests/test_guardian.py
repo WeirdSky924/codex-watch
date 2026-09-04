@@ -427,7 +427,7 @@ class GuardianTests(unittest.TestCase):
                     session="codex-goal",
                     thread_id="550e8400-e29b-41d4-a716-446655440000",
                     cwd=Path("/workspace/project"),
-                    reason="no_rollout_events",
+                    reason="compaction_timeout",
                     goal_objective="Goal ID: FE-CREATOR-8",
                     telemetry={},
                     state_root=state_root,

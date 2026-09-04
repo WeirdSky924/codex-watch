@@ -430,7 +430,8 @@ thread max repeated commands: 3
 compact。rollout 大小、无进展 token、无事件时长和重复内容/命令只作为诊断遥测，
 不会触发 thread rotation、compact 或业务恢复。没有 Goal、普通 paused Goal 或已
 完成 Goal 也不会因为这些指标被 watchdog 打断。需要新 thread 时，只能由 Codex
-自身、明确的 upstream access denied 恢复，或一次真实 compact timeout 恢复触发。
+自身、明确的 upstream access denied 恢复，或一次真实 compact timeout 恢复触发；
+普通 retryable upstream error 永远只恢复 pinned thread。
 
 `no_rollout_events` 只表示真正没有 rollout 活动的安静 thread。若终端持续出现
 503、502、429 或其他已识别的 fatal error，watchdog 会先处理统一 fatal recovery；
@@ -446,7 +447,10 @@ active turn 内的连续 streak 计数。它们只作为遥测提供给诊断和
 compact 等待超过 `--compact-wait-seconds` 时，流程会把它视为压缩失败，写入
 `compaction_timeout` handoff 并走同一套新 thread 轮换；不会无限等待，也不会
 反复让模型执行状态查询。该新 thread 例外仅适用于压缩确实超时，不能由
-compaction 次数触发。
+compaction 次数触发。如果 `/compact` 等待期间 rollout 新增了可识别的临时
+上游错误，watchdog 会立即停止等待并按普通 fatal recovery 恢复当前 pinned
+thread，不会创建 handoff 或新 thread。其他 tmux、Shell 或提交验证超时也不会
+被冒充为 `compaction_timeout`。
 
 恢复次数和恢复阶段保存在 watchdog session binding 中。guardian 接管、monitor
 重挂或 tmux 重启都不会清零；只有检测到新的成功 `task_complete`、成功
@@ -883,6 +887,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 从 `0.1.4` 开始，Codex 更新页即使出现在 thread ID 创建之前也会由 watchdog 处理。watchdog 会选择 `Update now`、等待官方安装命令结束，然后执行 `codex --version` 核验；如果版本仍低于更新页目标，会额外执行一次 `codex update` 并再次核验。只有真实版本达到目标后才会启动或恢复 Codex，不能再用旧版本继续运行并把更新页留在 tmux 中。
 
 从 `0.1.24` 开始，`--no-alt-screen` 在更新页上方保留旧对话时，watchdog 会识别屏幕尾部的完整更新选择块；如果选择块后已经出现新的 composer、Goal 状态或 Shell 提示，则按历史文本忽略。官方更新返回 Shell 后，pending update 会先核验目标版本，再恢复固定 thread。该重启属于更新流程，不增加 fatal recovery count，也不执行 fatal 的 300 秒冷静期；若原 Goal 已 achieved，只恢复 thread，不等待 Goal 选择页或发送续接文本。
+
+从 `0.1.25` 开始，普通临时上游断链、连续 503/502 等错误始终只恢复当前 pinned thread。`/compact` 等待期间新增的 retryable upstream failure 也会中止等待并回到该 thread；只有明确 `Upstream access denied` 或真实 `compaction_timeout` 才会进入新 thread 轮换。旧版遗留的 thread-rotation marker 如果缺少受支持原因或来源 thread ID，会被自动清理。
 
 monitor 启动时或运行中明确看到 `Goal achieved`，还会清除该 thread 遗留的 pending verification、recovery phase 和 recovery count。guardian 即使读到旧 binding，也不会在 achieved 或其他非恢复 Goal 状态下仅因 Codex 进程缺失而重启 thread。
 

@@ -29,6 +29,11 @@ THREAD_ROTATION_RECOVERY_REASONS = {
     "upstream_access_denied",
     THREAD_HEALTH_ROTATION_REASON,
 }
+# Only these reasons may leave a durable marker that asks guardian to finish
+# a new-thread handoff. Older health-threshold markers are stale state.
+PERSISTED_THREAD_ROTATION_REASONS = frozenset(
+    {"upstream_access_denied", "compaction_timeout"}
+)
 COMPACTION_RECOVERY_REASONS = {
     "codex_upstream_stalled",
 }
@@ -200,6 +205,63 @@ class RecoveryEvent:
     reason: str
     observed_at: float
     line: str
+
+
+class CompactionTimeoutError(TimeoutError):
+    """The native Codex compaction marker did not appear before its deadline."""
+
+
+class CompactionUpstreamError(RuntimeError):
+    """A recoverable upstream failure occurred during native compaction."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"compaction interrupted by {reason}")
+
+
+def pinned_recovery_reason_after_compaction_failure(reason: str) -> str | None:
+    """Return the same-thread fallback for one compaction-time upstream error."""
+    if reason == "upstream_access_denied":
+        return None
+    if reason == "codex_upstream_stalled":
+        return "retryable_upstream_error"
+    return reason
+
+
+def handle_compaction_upstream_failure(
+    error: CompactionUpstreamError,
+    *,
+    event_reason: str,
+    target: str,
+    config: RecoveryConfig,
+    goal_state: str | None,
+    recovery_attempt: int,
+    telemetry: object | None,
+    execute: Callable[[str, list[RecoveryStep]], None],
+    rotate: Callable[..., bool],
+) -> None:
+    """Route an upstream failure during compact without hiding its cause."""
+    if event_reason not in COMPACTION_RECOVERY_REASONS:
+        raise error
+    pinned_reason = pinned_recovery_reason_after_compaction_failure(error.reason)
+    if pinned_reason is None:
+        rotate(
+            detail=error.reason,
+            goal_state=goal_state,
+            telemetry=telemetry,
+            increment_attempt=False,
+        )
+        return
+    execute(
+        target,
+        build_recovery_steps(
+            config,
+            reason=pinned_reason,
+            recovery_attempt=recovery_attempt,
+            resume_goal=goal_state != "blocked",
+            resume_stalled_goal=goal_state == "stalled",
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -538,11 +600,11 @@ def build_recovery_steps(
         RecoveryStep("text", "/quit"),
         RecoveryStep("wait_shell", "30"),
         RecoveryStep("sleep", str(max(0, restart_delay))),
+        RecoveryStep("mark_compaction", config.thread_id),
         RecoveryStep("shell_command", compact_command),
         RecoveryStep("wait_codex", "30"),
         RecoveryStep("sleep", str(config.startup_wait_seconds)),
         RecoveryStep("leave_goal_paused", ""),
-        RecoveryStep("mark_compaction", config.thread_id),
         RecoveryStep("text", "/compact"),
         RecoveryStep(
             "wait_compaction",

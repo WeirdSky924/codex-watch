@@ -17,6 +17,14 @@ from .bindings import (
     save_binding_runtime_state,
     save_thread_handoff,
 )
+from .execution_profile import (
+    RecoveryIncident,
+    RecoveryIncidentLike,
+    apply_incident_execution_profile,
+    recovery_incident_from_failure,
+    resolve_and_claim_recovery_incident,
+    save_tmux_execution_profile,
+)
 from .recovery import (
     COMPACTION_RECOVERY_REASONS,
     CompactionTimeoutError,
@@ -26,7 +34,6 @@ from .recovery import (
     RecoveryConfig,
     IncidentLogAggregator,
     build_recovery_steps,
-    classify_recovery_message,
     classify_recovery_reason,
     handle_compaction_upstream_failure,
 )
@@ -84,14 +91,11 @@ def recovery_allowed_for_goal(value: str) -> bool:
     return recovery_allowed_for_goal_state(goal_state_from_text(value))
 
 
-def recovery_incident_for_thread(thread_id: str) -> tuple[str, str] | None:
+def recovery_incident_for_thread(thread_id: str) -> RecoveryIncident | None:
     failure = find_latest_task_failure(thread_id=thread_id)
     if failure is None:
         return None
-    reason = classify_recovery_message(failure.message)
-    if reason is None:
-        return None
-    return failure.incident_id, reason
+    return recovery_incident_from_failure(failure)
 
 
 def iter_decoded_chunks(
@@ -142,8 +146,9 @@ def run_monitor(
     resolve_thread_id: Callable[[str], str | None] | None = None,
     save_thread_id: Callable[[str], None] | None = None,
     resolve_recovery_incident: (
-        Callable[[str], tuple[str, str] | None] | None
+        Callable[[str], RecoveryIncidentLike | None] | None
     ) = None,
+    save_execution_profile: Callable[[str, str], None] | None = None,
     initial_recovery_incident_id: str = "",
     save_recovery_incident_id: Callable[[str], None] | None = None,
     claim_recovery_incident_id: Callable[[str], bool] | None = None,
@@ -211,6 +216,9 @@ def run_monitor(
     run_execute = execute or default_execute
     run_resume_goal = resume_goal or default_resume_goal
     run_update_codex = update_codex or default_update_codex
+    save_profile = save_execution_profile or (
+        lambda model, effort: save_tmux_execution_profile(target, model, effort)
+    )
     codex_process_running = codex_running
     rolling_output = ""
     last_goal_resume_at: float | None = None
@@ -512,6 +520,7 @@ def run_monitor(
         rolling_output = rolling_output[-ROLLING_BUFFER_SIZE:]
         observed_at = now()
         recovery_reason = classify_recovery_reason(rolling_output)
+        resolved_incident: RecoveryIncident | None = None
         if (
             recovery_reason is not None
             and recovery_deferred is not None
@@ -530,62 +539,19 @@ def run_monitor(
             )
             # Cooldown belongs inside the recovery steps.  Do not discard a
             # distinct fatal incident observed while another attempt waits.
-        if recovery_reason is not None and resolve_recovery_incident is not None:
-            incident = resolve_recovery_incident(config.thread_id)
-            if incident is None or incident[1] != recovery_reason:
-                incident_logs.record(
-                    key=f"unmatched:{recovery_reason}",
-                    first=(
-                        "[codex-goal-watchdog] ignored terminal error without "
-                        f"matching rollout event: {recovery_reason}"
-                    ),
-                    summary=(
-                        "[codex-goal-watchdog] unmatched terminal error aggregate: "
-                        f"{recovery_reason}"
-                    ),
-                )
+        if recovery_reason is not None:
+            resolved_incident, skip_incident = resolve_and_claim_recovery_incident(
+                resolver=resolve_recovery_incident,
+                thread_id=config.thread_id,
+                reason=recovery_reason,
+                handled_incident_ids=handled_incident_ids,
+                claim=claim_recovery_incident_id,
+                save=save_recovery_incident_id,
+                record=incident_logs.record,
+            )
+            if skip_incident:
                 rolling_output = ""
                 continue
-            incident_id, _ = incident
-            if incident_id in handled_incident_ids:
-                incident_logs.record(
-                    key=f"redrawn:{incident_id}",
-                    first=(
-                        "[codex-goal-watchdog] ignored redrawn fatal event: "
-                        f"{incident_id}"
-                    ),
-                    summary=(
-                        "[codex-goal-watchdog] fatal redraw aggregate: "
-                        f"{incident_id}"
-                    ),
-                )
-                rolling_output = ""
-                continue
-            handled_incident_ids[incident_id] = None
-            if len(handled_incident_ids) > 256:
-                handled_incident_ids.pop(next(iter(handled_incident_ids)))
-            if (
-                claim_recovery_incident_id is not None
-                and not claim_recovery_incident_id(incident_id)
-            ):
-                incident_logs.record(
-                    key=f"claimed:{incident_id}",
-                    first=(
-                        "[codex-goal-watchdog] ignored fatal incident claimed by "
-                        f"another recovery owner: {incident_id}"
-                    ),
-                    summary=(
-                        "[codex-goal-watchdog] claimed incident aggregate: "
-                        f"{incident_id}"
-                    ),
-                )
-                rolling_output = ""
-                continue
-            if (
-                claim_recovery_incident_id is None
-                and save_recovery_incident_id is not None
-            ):
-                save_recovery_incident_id(incident_id)
         rolling_goal_state = goal_state_from_text(rolling_output)
         effective_goal_state = rolling_goal_state or latest_goal_state
         if recovery_reason is not None and not recovery_allowed_for_goal_state(
@@ -606,6 +572,12 @@ def run_monitor(
                 f"{event.reason}"
             )
             persist_recovery_count()
+            if resolved_incident is not None:
+                config = apply_incident_execution_profile(
+                    config,
+                    resolved_incident,
+                    save=save_profile,
+                )
             goal_objective = (
                 resolve_goal_objective(config.thread_id)
                 if event.reason == "upstream_access_denied"
@@ -824,14 +796,11 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
 
     def resolve_incremental_recovery_incident(
         thread_id: str,
-    ) -> tuple[str, str] | None:
+    ) -> RecoveryIncident | None:
         telemetry = resolve_thread_telemetry(thread_id)
         if telemetry is None or telemetry.latest_failure is None:
             return None
-        reason = classify_recovery_message(telemetry.latest_failure.message)
-        if reason is None:
-            return None
-        return telemetry.latest_failure.incident_id, reason
+        return recovery_incident_from_failure(telemetry.latest_failure)
 
     def write_handoff(**kwargs) -> Path:
         cwd = pane_identity[1] if pane_identity is not None else Path.cwd()
@@ -886,7 +855,7 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
     if not initial_incident_id:
         current_incident = resolve_incremental_recovery_incident(config.thread_id)
         if current_incident is not None:
-            initial_incident_id = current_incident[0]
+            initial_incident_id = current_incident.incident_id
             _claim_tmux_recovery_incident_id(target, initial_incident_id)
     run_monitor(
         lines=iter_decoded_chunks(

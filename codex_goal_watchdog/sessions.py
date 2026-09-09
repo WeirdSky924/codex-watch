@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
+from .execution_profile import TurnExecutionProfileIndex
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 DEFAULT_SHELL_SNAPSHOTS_ROOT = Path.home() / ".codex" / "shell_snapshots"
@@ -35,6 +36,8 @@ class TaskFailure:
     incident_id: str
     message: str
     codex_error_info: str | None
+    model: str | None = None
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -280,6 +283,43 @@ def _event_epoch(event: dict, *, fallback: float) -> float:
         return fallback
 
 
+def _task_failure_from_event(
+    event: dict,
+    profiles: TurnExecutionProfileIndex,
+) -> TaskFailure | None:
+    profiles.observe(event)
+    payload = event.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    error = payload.get("error")
+    if (
+        event.get("type") != "event_msg"
+        or payload.get("type") != "task_complete"
+        or not isinstance(error, dict)
+        or not isinstance(error.get("message"), str)
+    ):
+        return None
+    incident_id = payload.get("turn_id") or event.get("timestamp")
+    if not isinstance(incident_id, str) or not incident_id:
+        return None
+    profile = profiles.profile_for(incident_id)
+    error_info = error.get("codex_error_info")
+    return TaskFailure(
+        incident_id=incident_id,
+        message=error["message"],
+        codex_error_info=(error_info if isinstance(error_info, str) else None),
+        model=(
+            payload["model"]
+            if isinstance(payload.get("model"), str) and payload["model"]
+            else profile.model
+        ),
+        reasoning_effort=(
+            payload["effort"]
+            if isinstance(payload.get("effort"), str) and payload["effort"]
+            else profile.reasoning_effort
+        ),
+    )
+
+
 def _normalized_content(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -348,6 +388,7 @@ class ThreadTelemetryTracker:
         self.progress_event_count = 0
         self.latest_failure: TaskFailure | None = None
         self.turn_active = False
+        self._turn_profiles = TurnExecutionProfileIndex()
         self._reset_repetition_streaks()
 
     def _reset_repetition_streaks(self) -> None:
@@ -478,19 +519,9 @@ class ThreadTelemetryTracker:
             self.tokens_at_last_progress = self.total_tokens
             self._progress_pending = True
 
-        if payload_type == "task_complete":
-            error = payload.get("error")
-            if isinstance(error, dict) and isinstance(error.get("message"), str):
-                incident_id = payload.get("turn_id") or event.get("timestamp")
-                if isinstance(incident_id, str) and incident_id:
-                    error_info = error.get("codex_error_info")
-                    self.latest_failure = TaskFailure(
-                        incident_id=incident_id,
-                        message=error["message"],
-                        codex_error_info=(
-                            error_info if isinstance(error_info, str) else None
-                        ),
-                    )
+        task_failure = _task_failure_from_event(event, self._turn_profiles)
+        if task_failure is not None:
+            self.latest_failure = task_failure
 
         if payload_type != "token_count":
             return
@@ -592,6 +623,7 @@ def find_latest_task_failure(
     if path is None:
         return None
     latest: TaskFailure | None = None
+    profiles = TurnExecutionProfileIndex()
     try:
         with path.open("r", encoding="utf-8") as stream:
             for line in stream:
@@ -599,26 +631,9 @@ def find_latest_task_failure(
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                payload = event.get("payload", {})
-                error = payload.get("error")
-                if (
-                    event.get("type") != "event_msg"
-                    or payload.get("type") != "task_complete"
-                    or not isinstance(error, dict)
-                    or not isinstance(error.get("message"), str)
-                ):
-                    continue
-                incident_id = payload.get("turn_id") or event.get("timestamp")
-                if not isinstance(incident_id, str) or not incident_id:
-                    continue
-                error_info = error.get("codex_error_info")
-                latest = TaskFailure(
-                    incident_id=incident_id,
-                    message=error["message"],
-                    codex_error_info=(
-                        error_info if isinstance(error_info, str) else None
-                    ),
-                )
+                failure = _task_failure_from_event(event, profiles)
+                if failure is not None:
+                    latest = failure
     except OSError:
         return None
     return latest
@@ -631,6 +646,7 @@ def find_latest_task_failure_after(
 ) -> TaskFailure | None:
     """Read only task failures appended after a recovery checkpoint."""
     latest: TaskFailure | None = None
+    profiles = TurnExecutionProfileIndex()
     try:
         with path.open("r", encoding="utf-8") as stream:
             stream.seek(max(0, offset))
@@ -639,26 +655,9 @@ def find_latest_task_failure_after(
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                payload = event.get("payload", {})
-                error = payload.get("error")
-                if (
-                    event.get("type") != "event_msg"
-                    or payload.get("type") != "task_complete"
-                    or not isinstance(error, dict)
-                    or not isinstance(error.get("message"), str)
-                ):
-                    continue
-                incident_id = payload.get("turn_id") or event.get("timestamp")
-                if not isinstance(incident_id, str) or not incident_id:
-                    continue
-                error_info = error.get("codex_error_info")
-                latest = TaskFailure(
-                    incident_id=incident_id,
-                    message=error["message"],
-                    codex_error_info=(
-                        error_info if isinstance(error_info, str) else None
-                    ),
-                )
+                failure = _task_failure_from_event(event, profiles)
+                if failure is not None:
+                    latest = failure
     except OSError:
         return None
     return latest

@@ -7,6 +7,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
+from functools import partial
 
 from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
 from .monitor import (
@@ -17,6 +18,13 @@ from .monitor import (
     recovery_allowed_for_goal,
     recovery_allowed_for_goal_state,
     recovery_goal_state_on_screen,
+)
+from .execution_profile import (
+    RecoveryIncidentLike,
+    apply_incident_execution_profile,
+    find_unhandled_recovery_incident,
+    normalize_recovery_incident,
+    recovery_incident_id,
 )
 from .paths import default_log_path
 from .bindings import (
@@ -383,29 +391,13 @@ def _recovery_reason_on_screen(session: str, *, runner=subprocess.run) -> str | 
     return classify_recovery_reason(screen)
 
 
-def _unhandled_recovery_incident_on_screen(
-    session: str,
-    *,
-    thread_id: str,
-    screen_reason: Callable[[str], str | None] = _recovery_reason_on_screen,
-    incident_resolver: Callable[
-        [str], tuple[str, str] | None
-    ] = recovery_incident_for_thread,
-    option_getter: Callable[[str, str, str], str] = _tmux_option,
-) -> tuple[str, str] | None:
-    reason = screen_reason(session)
-    if reason is None:
-        return None
-    incident = incident_resolver(thread_id)
-    if incident is None or incident[1] != reason:
-        return None
-    if incident[0] == option_getter(
-        session,
-        LAST_RECOVERY_INCIDENT_OPTION,
-        "",
-    ):
-        return None
-    return incident
+_unhandled_recovery_incident_on_screen = partial(
+    find_unhandled_recovery_incident,
+    screen_reason=_recovery_reason_on_screen,
+    incident_resolver=recovery_incident_for_thread,
+    option_getter=_tmux_option,
+    last_incident_option=LAST_RECOVERY_INCIDENT_OPTION,
+)
 
 
 def _recovery_config(
@@ -503,12 +495,16 @@ def _append_log(log_path: Path, message: str) -> None:
 def _recover_visible_incident(
     session: str,
     config: RecoveryConfig,
-    pending_incident: tuple[str, str],
+    pending_incident: RecoveryIncidentLike,
     *,
     log_path: Path,
     execute_steps: Callable[[str, list], None],
+    save_execution_profile: Callable[[str, str], None] | None = None,
 ) -> bool:
-    incident_id, reason = pending_incident
+    incident = normalize_recovery_incident(pending_incident)
+    if incident is None:
+        return False
+    incident_id, reason = incident.incident_id, incident.reason
     if not _claim_tmux_recovery_incident_id(session, incident_id):
         _append_log(
             log_path,
@@ -516,6 +512,9 @@ def _recover_visible_incident(
             f"{incident_id}",
         )
         return True
+    config = apply_incident_execution_profile(
+        config, incident, save=save_execution_profile, target=session
+    )
     goal_state = recovery_goal_state_on_screen(session)
     recovery_attempt = _next_recovery_attempt(session)
     _mark_verification_pending(session, config)
@@ -621,7 +620,7 @@ def run_guardian(
                     _tmux_option(session, "@codex_log_path", str(default_log_path()))
                 ).expanduser()
             config = _recovery_config(session) if session_exists else None
-            pending_incident: tuple[str, str] | None = None
+            pending_incident: RecoveryIncidentLike | None = None
 
             def stalled_screen() -> bool:
                 nonlocal pending_incident
@@ -647,7 +646,8 @@ def run_guardian(
                         )
                 except RecoveryInProgress:
                     record_contention(
-                        operation="visible incident", detail=pending_incident[0]
+                        operation="visible incident",
+                        detail=recovery_incident_id(pending_incident),
                     )
                     return False
                 except TimeoutError as exc:
@@ -681,9 +681,7 @@ def run_guardian(
                         if expected_version:
                             clear_pending_update_version(session)
                 except RecoveryInProgress:
-                    record_contention(
-                        operation="update restart", detail="session lock"
-                    )
+                    record_contention(operation="update restart", detail="session lock")
                     return False
                 except TimeoutError as exc:
                     _append_log(
@@ -736,9 +734,7 @@ def run_guardian(
                             ),
                         )
                 except RecoveryInProgress:
-                    record_contention(
-                        operation="missing Codex", detail="session lock"
-                    )
+                    record_contention(operation="missing Codex", detail="session lock")
                     return False
                 except TimeoutError as exc:
                     _append_log(

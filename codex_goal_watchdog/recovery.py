@@ -21,6 +21,9 @@ SERVERS_OVERLOADED_PATTERN = (
     "Our servers are currently overloaded. Please try again later."
 )
 UPSTREAM_ACCESS_DENIED_PATTERN = "Upstream access denied"
+UPSTREAM_ACCESS_FORBIDDEN_PATTERN = (
+    "Upstream access forbidden, please contact administrator"
+)
 PLAIN_UPSTREAM_REQUEST_FAILURE_PATTERN = (
     "stream disconnected before completion: Upstream request failed"
 )
@@ -132,6 +135,8 @@ def classify_recovery_message(message: str) -> str | None:
     if DEFAULT_STALL_PATTERN in message:
         return "codex_upstream_stalled"
     if PLAIN_UPSTREAM_REQUEST_FAILURE_PATTERN.lower() in message.lower():
+        return "retryable_upstream_error"
+    if UPSTREAM_ACCESS_FORBIDDEN_PATTERN.lower() in message.lower():
         return "retryable_upstream_error"
     if UPSTREAM_ACCESS_DENIED_PATTERN.lower() in message.lower():
         return "upstream_access_denied"

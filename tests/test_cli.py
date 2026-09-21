@@ -321,8 +321,10 @@ class ConsoleEntrypointTests(unittest.TestCase):
     @patch("codex_goal_watchdog.__main__.find_latest_thread_id")
     @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=False)
     @patch("codex_goal_watchdog.__main__.load_session_binding")
+    @patch("codex_goal_watchdog.__main__.thread_rollout_size", return_value=312)
     def test_default_start_resumes_thread_pinned_to_watchdog_session(
         self,
+        rollout_size_mock,
         load_binding_mock,
         _session_exists_mock,
         find_latest_mock,
@@ -347,10 +349,14 @@ class ConsoleEntrypointTests(unittest.TestCase):
             if call.args[0][0:2] == ["tmux", "new-session"]
         )
         self.assertIn(f"resume {thread_id}", new_session_command[-1])
-        save_binding_mock.assert_called_with(
-            session="project-a",
-            thread_id=thread_id,
-            cwd=Path.cwd().resolve(),
+        self.assertEqual("project-a", save_binding_mock.call_args.kwargs["session"])
+        self.assertEqual(thread_id, save_binding_mock.call_args.kwargs["thread_id"])
+        self.assertEqual(Path.cwd().resolve(), save_binding_mock.call_args.kwargs["cwd"])
+        rollout_size_mock.assert_called_once_with(thread_id=thread_id)
+        self.assertEqual(312, save_binding_mock.call_args.kwargs["launch_profile_offset"])
+        self.assertEqual(
+            "gpt-5.6-sol",
+            save_binding_mock.call_args.kwargs["launch_options"]["primary_model"],
         )
 
     @patch("codex_goal_watchdog.__main__.save_session_binding")

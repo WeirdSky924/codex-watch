@@ -309,7 +309,7 @@ codex-watch \
 
 ### 配置保存在哪里
 
-watchdog 会把模型、effort、阈值和续接提示保存在当前 tmux session 的 `@codex_*` 选项中。这些配置选项会在 tmux 消失后一起消失。恢复次数、成功 compact 次数和等待成功确认的状态另外写入持久 binding，因此 guardian/monitor 重连和 tmux 重启不会把恢复计数重置为 0。
+watchdog 会把模型、effort、阈值和续接提示写入当前 tmux session 的 `@codex_*` 选项，同时把启动参数和恢复状态写入持久 binding。tmux 关闭或机器重启后，裸 `codex-watch` 会恢复该 watchdog session 的参数和固定 thread；如果用户在 Codex 内切换过模型或推理强度，还会读取该 thread 的最新 rollout 设置，恢复实际使用的模型和 effort，不会无故退回内置默认值。恢复次数、成功 compact 次数和等待成功确认的状态也不会因 guardian/monitor 重连而清零。
 
 固定 thread ID 还会按 `--session` 名称持久保存到：
 
@@ -317,9 +317,9 @@ watchdog 会把模型、effort、阈值和续接提示保存在当前 tmux sessi
 ~/.local/state/codex-goal-watchdog/bindings/
 ```
 
-因此 `codex-watch --session project-a` 恢复的是 `project-a` 自己上次固定的 thread，不会选择 Codex 全局最近会话。同一目录使用多个 watchdog 时应给每个实例设置不同的 `--session`。执行 `/clear` 后，monitor 会把新 thread ID 同时写入 tmux 和该持久绑定。
+因此 `codex-watch --session project-a` 恢复的是 `project-a` 自己上次固定的 thread，不会选择 Codex 全局最近会话。同一目录使用多个 watchdog 时应给每个实例设置不同的 `--session`。执行 `/clear` 后，monitor 会把新 thread ID 同时写入 tmux 和该持久绑定。启动时明确传入的模型、effort 或其他选项优先于保存值；已保存 `--safe` 时可用 `--unsafe` 显式切回默认权限模式。`--new` 创建新 thread，使用本次明确给出的选项或内置默认值，不继承旧会话设置。
 
-模型等自定义参数仍应保存在自己的启动脚本中，避免每次重新输入长命令。
+首次启动时可以用命令行传入自定义参数；以后从同一目录用 `codex-watch`（或 `codex-watch --session project-a`）即可。下面的启动脚本适合需要**每次都固定覆盖**保存配置的人；如果曾在 Codex 中切换模型、希望下次启动延续切换后的模型，就不要在脚本中固定传入 `--primary-model` 和 `--primary-reasoning-effort`。
 
 下面示例会创建 `my-codex-watch`。先把四个 `replace-with-...` 值和 session 名称改成自己的配置：
 
@@ -350,7 +350,7 @@ chmod 700 "$HOME/.local/bin/my-codex-watch"
 my-codex-watch --dry-run
 ```
 
-以后启动和恢复都使用短命令：
+脚本中的显式参数每次启动都会覆盖 binding 和 rollout 中的对应配置。使用脚本时，启动和恢复的命令是：
 
 ```bash
 my-codex-watch
@@ -547,7 +547,7 @@ codex-watch --safe --no-attach
 1. 查找 `codex-goal` 自己持久保存的 thread ID；存在时恢复该 ID，不存在时才创建新 thread。
 2. 创建名为 `codex-goal` 的 tmux 会话并启动 Codex。
 3. 固定实际 thread ID；新建空白首页尚未写入 rollout 时会读取 Codex 自己创建的 shell snapshot。
-4. 持久保存 `codex-goal` 与 thread ID 的绑定，并保存运行参数到当前 tmux 会话。
+4. 持久保存 `codex-goal` 与 thread ID 的绑定及本次启动参数，并将兼容配置写入当前 tmux 会话。
 5. 挂载输出 monitor。
 6. 默认自动进入 tmux 界面。
 
@@ -708,7 +708,7 @@ codex-watch --safe
 
 当前版本的 guardian 会在开机后启动，但不会自动创建缺失的 tmux 会话。因此整机重启后仍须进入原项目目录执行一次上面的恢复命令。
 
-使用自定义模型时，必须重新传入模型参数，或者使用前面创建的固定启动脚本：
+使用自定义模型时，裸命令会恢复上次保存的启动参数和 thread 的最新模型设置；如需每次固定覆盖模型参数，再使用前面创建的固定启动脚本：
 
 ```bash
 cd "$PROJECT_DIR"
@@ -869,6 +869,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | `codex upstream stalled: no real data for 5m0s` | 切到 compact model，恢复固定 thread，执行 `/compact`，等待真实压缩事件，再切回 primary model 并继续 Goal |
 | Codex context window exhausted | 交由 Codex 自身处理，watchdog 不接管 |
 | HTTP 502 且消息为 `Upstream access denied` | 不再恢复被拒绝的 thread；创建新 thread，提取并重建上一 Goal，再自动更新 tmux 与持久绑定 |
+| `Upstream access forbidden, please contact administrator` | 使用 primary model 恢复当前固定 thread；后续失败等待 5 分钟，默认无限重试 |
 | HTTP 401（包括 `API DISABLE`）、402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
@@ -889,6 +890,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 从 `0.1.24` 开始，`--no-alt-screen` 在更新页上方保留旧对话时，watchdog 会识别屏幕尾部的完整更新选择块；如果选择块后已经出现新的 composer、Goal 状态或 Shell 提示，则按历史文本忽略。官方更新返回 Shell 后，pending update 会先核验目标版本，再恢复固定 thread。该重启属于更新流程，不增加 fatal recovery count，也不执行 fatal 的 300 秒冷静期；若原 Goal 已 achieved，只恢复 thread，不等待 Goal 选择页或发送续接文本。
 
 从 `0.1.25` 开始，普通临时上游断链、连续 503/502 等错误始终只恢复当前 pinned thread。`/compact` 等待期间新增的 retryable upstream failure 也会中止等待并回到该 thread；只有明确 `Upstream access denied` 或真实 `compaction_timeout` 才会进入新 thread 轮换。旧版遗留的 thread-rotation marker 如果缺少受支持原因或来源 thread ID，会被自动清理。
+
+从 `0.1.26` 开始，watchdog session 会把完整启动参数持久保存到 binding，裸 `codex-watch` 在 tmux 或机器被关闭、甚至被强制终止后，仍会恢复自己的 pinned thread 和启动配置。它还会从上次启动检查点之后的 rollout 记录读取最新模型与 reasoning effort；明确传入的命令行参数优先，`--new` 不继承旧 session 配置。rollout 正在写入时会从最后一条完整 JSONL 记录继续，避免强制终止造成模型状态漏读。guardian 使用同一套持久配置和 profile 校准。
 
 monitor 启动时或运行中明确看到 `Goal achieved`，还会清除该 thread 遗留的 pending verification、recovery phase 和 recovery count。guardian 即使读到旧 binding，也不会在 achieved 或其他非恢复 Goal 状态下仅因 Codex 进程缺失而重启 thread。
 
@@ -1238,6 +1241,7 @@ sha256sum -c SHA256SUMS
 --thread-id UUID                   恢复明确指定的 thread
 --new                              明确新建 thread 并覆盖该 --session 的旧绑定
 --safe                             不启用最高权限绕过
+--unsafe                           覆盖已保存的 --safe，启用默认最高权限模式
 --no-attach                        后台启动，不立即进入 tmux
 --cooldown-seconds N               首次恢复失败后再次重试前的等待秒数，默认 300
 --max-recoveries N                 最大恢复次数，0 表示无限

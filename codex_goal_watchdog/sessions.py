@@ -7,13 +7,13 @@ import json
 import re
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
-from .execution_profile import TurnExecutionProfileIndex
+from .execution_profile import ExecutionProfile, TurnExecutionProfileIndex
 
 DEFAULT_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 DEFAULT_SHELL_SNAPSHOTS_ROOT = Path.home() / ".codex" / "shell_snapshots"
@@ -267,6 +267,119 @@ def find_thread_rollout_path(
         if record.thread_id == normalized:
             return record.path
     return None
+
+
+def _rollout_lines_newest_first(
+    path: Path, *, offset: int = 0
+) -> Iterator[bytes]:
+    with path.open("rb") as stream:
+        end = stream.seek(0, 2)
+        start = max(0, offset) if offset <= end else 0
+        first_line_complete = start == 0
+        if start > 0:
+            stream.seek(start - 1)
+            first_line_complete = stream.read(1) == b"\n"
+        pending = b""
+        while end > start:
+            count = min(64 * 1024, end - start)
+            end -= count
+            stream.seek(end)
+            parts = (stream.read(count) + pending).split(b"\n")
+            for line in reversed(parts[1:]):
+                if line:
+                    yield line
+            pending = parts[0]
+        if first_line_complete and pending:
+            yield pending
+
+
+def find_latest_thread_execution_profile(
+    *,
+    thread_id: str,
+    sessions_root: Path = DEFAULT_SESSIONS_ROOT,
+    offset: int = 0,
+) -> ExecutionProfile | None:
+    """Return the latest complete model/effort pair for this pinned rollout."""
+    path = find_thread_rollout_path(
+        thread_id=thread_id, sessions_root=sessions_root
+    )
+    if path is None:
+        return None
+    try:
+        for line in _rollout_lines_newest_first(path, offset=offset):
+            if (
+                b'"turn_context"' not in line
+                and b'"thread_settings_applied"' not in line
+            ):
+                continue
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if event.get("type") == "turn_context":
+                model, effort = payload.get("model"), payload.get("effort")
+            elif (
+                event.get("type") == "event_msg"
+                and payload.get("type") == "thread_settings_applied"
+                and payload.get("thread_id", thread_id) == thread_id
+            ):
+                settings = payload.get("thread_settings")
+                if not isinstance(settings, dict):
+                    continue
+                model, effort = (
+                    settings.get("model"),
+                    settings.get("reasoning_effort"),
+                )
+            else:
+                continue
+            if (
+                isinstance(model, str)
+                and model.strip()
+                and isinstance(effort, str)
+                and effort.strip()
+            ):
+                return ExecutionProfile(
+                    model=model.strip(), reasoning_effort=effort.strip()
+                )
+    except OSError:
+        return None
+    return None
+
+
+def thread_rollout_size(
+    *, thread_id: str, sessions_root: Path = DEFAULT_SESSIONS_ROOT
+) -> int:
+    """Return a safe append checkpoint, never the middle of a JSONL record."""
+    path = find_thread_rollout_path(
+        thread_id=thread_id, sessions_root=sessions_root
+    )
+    if path is None:
+        return 0
+    try:
+        with path.open("rb") as stream:
+            end = stream.seek(0, 2)
+            if end == 0:
+                return 0
+            stream.seek(end - 1)
+            if stream.read(1) == b"\n":
+                return end
+            cursor = end
+            while cursor:
+                count = min(64 * 1024, cursor)
+                cursor -= count
+                stream.seek(cursor)
+                block = stream.read(count)
+                newline = block.rfind(b"\n")
+                if newline >= 0:
+                    return cursor + newline + 1
+            return 0
+    except OSError:
+        return 0
 
 
 def _nonnegative_int(value: object) -> int:

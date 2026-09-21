@@ -20,6 +20,7 @@ from codex_goal_watchdog.guardian import (
     guard_once,
 )
 from codex_goal_watchdog.bindings import SessionBinding, save_thread_handoff
+from codex_goal_watchdog.execution_profile import ExecutionProfile
 from codex_goal_watchdog.recovery import RecoveryConfig
 
 
@@ -59,6 +60,76 @@ class GuardianTests(unittest.TestCase):
             )
 
         self.assertEqual(persistent_thread_id, config.thread_id)
+
+    def test_recovery_config_prefers_persisted_launch_profile(self):
+        binding = SessionBinding(
+            session="codex-goal",
+            thread_id="550e8400-e29b-41d4-a716-446655440001",
+            cwd=Path("/workspace/project"),
+            launch_options={
+                "primary_model": "gpt-6-astra",
+                "primary_reasoning_effort": "xhigh",
+                "compact_model": "gpt-5.6-luna",
+                "compact_reasoning_effort": "high",
+                "cooldown_seconds": 17,
+                "codex_args": ["--search"],
+            },
+        )
+
+        with patch(
+            "codex_goal_watchdog.guardian.load_session_binding",
+            return_value=binding,
+        ):
+            config = _recovery_config(
+                "codex-goal",
+                option_getter=lambda session, name, default="": {
+                    "@codex_primary_model": "gpt-5.6-sol",
+                    "@codex_primary_effort": "max",
+                    "@codex_compact_model": "gpt-5.6-sol",
+                    "@codex_compact_effort": "max",
+                    "@codex_cooldown_seconds": "300",
+                }.get(name, default),
+            )
+
+        self.assertEqual("gpt-6-astra", config.primary_model)
+        self.assertEqual("xhigh", config.primary_reasoning_effort)
+        self.assertEqual("gpt-5.6-luna", config.compact_model)
+        self.assertEqual("high", config.compact_reasoning_effort)
+        self.assertEqual(17, config.cooldown_seconds)
+        self.assertEqual(
+            ("--dangerously-bypass-approvals-and-sandbox", "--search"),
+            config.codex_args,
+        )
+
+    def test_recovery_config_prefers_newest_rollout_profile(self):
+        binding = SessionBinding(
+            session="codex-goal",
+            thread_id="550e8400-e29b-41d4-a716-446655440001",
+            cwd=Path("/workspace/project"),
+            launch_options={
+                "primary_model": "gpt-5.6-sol",
+                "primary_reasoning_effort": "max",
+            },
+            launch_profile_offset=123,
+        )
+
+        with patch(
+            "codex_goal_watchdog.guardian.load_session_binding",
+            return_value=binding,
+        ), patch(
+            "codex_goal_watchdog.guardian.find_latest_thread_execution_profile",
+            return_value=ExecutionProfile(
+                model="gpt-6-astra", reasoning_effort="xhigh"
+            ),
+        ) as profile_mock:
+            config = _recovery_config("codex-goal")
+
+        self.assertEqual("gpt-6-astra", config.primary_model)
+        self.assertEqual("xhigh", config.primary_reasoning_effort)
+        profile_mock.assert_called_once_with(
+            thread_id=binding.thread_id,
+            offset=binding.launch_profile_offset,
+        )
 
     def test_achieved_goal_blocks_pending_missing_codex_recovery(self):
         self.assertFalse(
@@ -503,10 +574,16 @@ class GuardianTests(unittest.TestCase):
             "@codex_max_recoveries": "7",
         }
 
-        config = _recovery_config(
-            "codex-goal",
-            option_getter=lambda session, name, default="": options.get(name, default),
-        )
+        with patch(
+            "codex_goal_watchdog.guardian.load_session_binding",
+            return_value=None,
+        ):
+            config = _recovery_config(
+                "codex-goal",
+                option_getter=lambda session, name, default="": options.get(
+                    name, default
+                ),
+            )
 
         self.assertEqual(45, config.cooldown_seconds)
         self.assertEqual(7, config.max_recoveries)
@@ -524,10 +601,16 @@ class GuardianTests(unittest.TestCase):
             "@codex_thread_max_repeated_commands": "5",
         }
 
-        config = _recovery_config(
-            "codex-goal",
-            option_getter=lambda session, name, default="": options.get(name, default),
-        )
+        with patch(
+            "codex_goal_watchdog.guardian.load_session_binding",
+            return_value=None,
+        ):
+            config = _recovery_config(
+                "codex-goal",
+                option_getter=lambda session, name, default="": options.get(
+                    name, default
+                ),
+            )
 
         self.assertEqual(4, config.thread_max_compactions)
         self.assertEqual(1234, config.thread_max_rollout_bytes)

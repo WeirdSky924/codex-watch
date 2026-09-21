@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.27] - 2026-09-21
+
+### Fixed
+
+- Classify `Upstream access forbidden, please contact administrator` as a
+  retryable same-thread upstream failure. It now uses the standard five-minute
+  cooldown and unlimited retry policy instead of creating a new thread.
+
+## [0.1.26] - 2026-09-12
+
+### Fixed
+
+- Persist the complete watchdog startup profile independently of tmux, including
+  custom models, reasoning effort, recovery thresholds, permissions, and Codex
+  arguments.
+- On a bare restart, restore the pinned session's latest model and reasoning
+  effort from its rollout, while keeping explicitly supplied command-line
+  options authoritative.
+- Keep guardian recovery aligned with the same persisted and rollout-derived
+  primary execution profile when tmux options are stale.
+- Preserve the startup profile when `/clear` rebinds the watchdog to a new
+  thread, and handle rollout offset and truncation boundaries safely.
+
 ## [0.1.25] - 2026-09-04
 
 ### Fixed

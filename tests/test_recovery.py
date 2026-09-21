@@ -132,6 +132,21 @@ class RecoveryControllerTests(unittest.TestCase):
             classify_recovery_reason(f"■ {message}"),
         )
 
+    def test_classifies_upstream_access_forbidden_as_retryable_same_thread(self):
+        message = (
+            "stream disconnected before completion: Upstream access forbidden, "
+            "please contact administrator"
+        )
+
+        self.assertEqual(
+            "retryable_upstream_error",
+            classify_recovery_message(message),
+        )
+        self.assertEqual(
+            "retryable_upstream_error",
+            classify_recovery_reason(f"■ {message}"),
+        )
+
     def test_latest_terminal_fatal_wins_for_guardian_screen_recovery(self):
         screen = (
             "■ unexpected status 503 Service Unavailable: upstream failed\n"

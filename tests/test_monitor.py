@@ -608,6 +608,33 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(5, len(calls))
         self.assertEqual("0", calls[0][1][4].value)
+
+    def test_run_monitor_retries_upstream_access_forbidden_without_attempt_limit(self):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                *[
+                    "■ stream disconnected before completion: Upstream access "
+                    "forbidden, please contact administrator\n"
+                    for _ in range(5)
+                ],
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(
+                thread_id=THREAD_ID,
+                cooldown_seconds=300,
+                max_recoveries=0,
+            ),
+            now=iter(float(index) for index in range(6)).__next__,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(5, len(calls))
+        self.assertEqual("0", calls[0][1][4].value)
+        self.assertTrue(any(THREAD_ID in step.value for step in calls[0][1]))
         for _, steps in calls[1:]:
             self.assertEqual("300", steps[4].value)
 

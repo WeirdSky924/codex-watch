@@ -35,9 +35,11 @@ from .recovery import (
 from .sessions import (
     DEFAULT_SHELL_SNAPSHOTS_ROOT,
     find_latest_thread_id,
+    thread_rollout_size,
     validate_thread_id,
     wait_for_new_thread_id,
 )
+from .startup_state import restore_startup_options, snapshot_launch_options
 from .tmux_control import (
     capture_update_prompt_version,
     execute_steps,
@@ -87,6 +89,7 @@ def _guardian_enable_command(session: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog="codex-goal-watchdog",
         description="Run Codex CLI in tmux and auto-recover selected upstream stalls.",
@@ -141,10 +144,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="create a new thread and replace this watchdog session's binding",
     )
-    start.add_argument(
+    approval_mode = start.add_mutually_exclusive_group()
+    approval_mode.add_argument(
         "--safe",
         action="store_true",
         help="do not add --dangerously-bypass-approvals-and-sandbox",
+    )
+    approval_mode.add_argument(
+        "--unsafe",
+        dest="safe",
+        action="store_false",
+        help="override a saved --safe setting with the default bypass mode",
     )
     start.add_argument("--no-attach", action="store_true")
     start.add_argument("--dry-run", action="store_true")
@@ -194,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
     guardian.add_argument("--session", default="codex-goal")
     guardian.add_argument("--poll-seconds", type=float, default=5)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(effective_argv)
     if args.command == "guardian":
         run_guardian(args.session, poll_seconds=args.poll_seconds)
         return 0
@@ -224,11 +234,6 @@ def main(argv: list[str] | None = None) -> int:
 
     root_dir = Path(__file__).resolve().parents[1]
     working_dir = Path.cwd().resolve()
-    log_path = args.log_path or str(default_log_path())
-    codex_args = args.codex_args
-    if codex_args and codex_args[0] == "--":
-        codex_args = codex_args[1:]
-    codex_args = normalize_codex_args(codex_args, safe_mode=args.safe)
     session_exists = tmux_session_exists(args.session)
     thread_id = validate_thread_id(args.thread_id) if args.thread_id else None
     should_resume = args.resume or thread_id is not None
@@ -283,6 +288,22 @@ def main(argv: list[str] | None = None) -> int:
                 )
             thread_id = session_binding.thread_id
             should_resume = True
+
+    restore_startup_options(args, effective_argv, session_binding, thread_id)
+    log_path = args.log_path or str(default_log_path())
+    raw_codex_args = args.codex_args
+    if raw_codex_args and raw_codex_args[0] == "--":
+        raw_codex_args = raw_codex_args[1:]
+    codex_args = normalize_codex_args(raw_codex_args, safe_mode=args.safe)
+    launch_profile_offset = (
+        thread_rollout_size(thread_id=thread_id)
+        if (
+            thread_id
+            and session_binding is not None
+            and session_binding.thread_id == thread_id
+        )
+        else 0
+    )
 
     codex_command = build_codex_command(
         model=args.primary_model,
@@ -382,6 +403,8 @@ def main(argv: list[str] | None = None) -> int:
             session=args.session,
             thread_id=thread_id,
             cwd=working_dir,
+            launch_options=snapshot_launch_options(args, raw_codex_args),
+            launch_profile_offset=launch_profile_offset,
         )
         option_values = {
             "@codex_primary_model": args.primary_model,

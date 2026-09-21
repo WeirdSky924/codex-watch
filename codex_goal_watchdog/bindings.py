@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -27,6 +27,8 @@ class SessionBinding:
     recovery_phase: str = "idle"
     recovery_not_before: float = 0.0
     last_recovery_reason: str = ""
+    launch_options: dict[str, object] = field(default_factory=dict)
+    launch_profile_offset: int = 0
 
 
 def _binding_path(session: str, *, state_root: Path | None = None) -> Path:
@@ -70,6 +72,14 @@ def load_session_binding(
                 payload.get("last_recovery_reason", "")
                 if isinstance(payload.get("last_recovery_reason", ""), str)
                 else ""
+            ),
+            launch_options=(
+                payload["launch_options"]
+                if isinstance(payload.get("launch_options"), dict)
+                else {}
+            ),
+            launch_profile_offset=_nonnegative_int(
+                payload.get("launch_profile_offset", 0)
             ),
         )
     except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError):
@@ -118,6 +128,8 @@ def save_session_binding(
     recovery_phase: str | None = None,
     recovery_not_before: float | None = None,
     last_recovery_reason: str | None = None,
+    launch_options: dict[str, object] | None = None,
+    launch_profile_offset: int | None = None,
 ) -> SessionBinding:
     normalized_thread_id = validate_thread_id(thread_id)
     resolved_cwd = cwd.expanduser().resolve()
@@ -188,6 +200,22 @@ def save_session_binding(
         if last_recovery_reason is not None
         else previous_recovery_reason
     )
+    # A /clear or an access-denied handoff changes the thread but keeps the
+    # watchdog session's launch choices; --new supplies a fresh snapshot.
+    resolved_launch_options = (
+        launch_options
+        if launch_options is not None
+        else (
+            previous.launch_options
+            if previous is not None and previous.cwd == resolved_cwd
+            else {}
+        )
+    )
+    resolved_profile_offset = _nonnegative_int(
+        launch_profile_offset if launch_profile_offset is not None
+        else previous.launch_profile_offset if same_thread and previous is not None
+        else 0
+    )
     payload = {
         "session": session,
         "thread_id": normalized_thread_id,
@@ -199,6 +227,8 @@ def save_session_binding(
         "recovery_phase": resolved_recovery_phase,
         "recovery_not_before": resolved_recovery_not_before,
         "last_recovery_reason": resolved_recovery_reason,
+        "launch_options": resolved_launch_options,
+        "launch_profile_offset": resolved_profile_offset,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _atomic_json_write(path, payload)
@@ -213,6 +243,8 @@ def save_session_binding(
         recovery_phase=resolved_recovery_phase,
         recovery_not_before=resolved_recovery_not_before,
         last_recovery_reason=resolved_recovery_reason,
+        launch_options=resolved_launch_options,
+        launch_profile_offset=resolved_profile_offset,
     )
 
 

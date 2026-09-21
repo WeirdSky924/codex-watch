@@ -6,10 +6,14 @@ import json
 import subprocess
 import time
 from collections.abc import Callable
-from pathlib import Path
 from functools import partial
+from pathlib import Path
 
-from .launcher import DANGEROUS_BYPASS_ARG, tmux_session_exists
+from .launcher import (
+    DANGEROUS_BYPASS_ARG,
+    normalize_codex_args,
+    tmux_session_exists,
+)
 from .monitor import (
     _claim_tmux_recovery_incident_id,
     _tmux_successful_compactions,
@@ -20,6 +24,7 @@ from .monitor import (
     recovery_goal_state_on_screen,
 )
 from .execution_profile import (
+    ExecutionProfile,
     RecoveryIncidentLike,
     apply_incident_execution_profile,
     find_unhandled_recovery_incident,
@@ -41,7 +46,11 @@ from .recovery import (
     build_shell_restart_steps,
     classify_recovery_reason,
 )
-from .sessions import ThreadTelemetryTracker, find_latest_goal_objective
+from .sessions import (
+    ThreadTelemetryTracker,
+    find_latest_goal_objective,
+    find_latest_thread_execution_profile,
+)
 from .tmux_control import (
     LAST_RECOVERY_INCIDENT_OPTION,
     PENDING_UPDATE_OPTION,
@@ -406,71 +415,134 @@ def _recovery_config(
     option_getter: Callable[[str, str, str], str] = _tmux_option,
 ) -> RecoveryConfig:
     binding = load_session_binding(session)
+    binding_options = binding.launch_options if binding is not None else {}
+    thread_id = (
+        binding.thread_id
+        if binding is not None
+        else option_getter(session, "@codex_thread_id", "")
+    )
+
+    def saved_text(key: str, fallback: str) -> str:
+        value = binding_options.get(key)
+        return value if isinstance(value, str) and value else fallback
+
+    def saved_int(key: str, fallback: str) -> int:
+        value = binding_options.get(key)
+        if type(value) is int and value >= 0:
+            return value
+        return int(fallback)
+
     codex_args_json = option_getter(
         session,
         "@codex_args_json",
         json.dumps([DANGEROUS_BYPASS_ARG]),
     )
+    saved_args = binding_options.get("codex_args")
+    if (
+        isinstance(saved_args, list)
+        and all(isinstance(value, str) for value in saved_args)
+    ):
+        codex_args = tuple(
+            normalize_codex_args(
+                saved_args,
+                safe_mode=binding_options.get("safe") is True,
+            )
+        )
+    else:
+        codex_args = tuple(json.loads(codex_args_json))
+    profile: ExecutionProfile | None = None
+    if thread_id:
+        try:
+            profile = find_latest_thread_execution_profile(
+                thread_id=thread_id,
+                offset=(
+                    binding.launch_profile_offset
+                    if binding is not None and binding.thread_id == thread_id
+                    else 0
+                ),
+            )
+        except ValueError:
+            profile = None
+    if profile is not None and profile.complete:
+        assert profile.model is not None
+        assert profile.reasoning_effort is not None
+        primary_model = profile.model
+        primary_reasoning_effort = profile.reasoning_effort
+    else:
+        primary_model = saved_text(
+            "primary_model",
+            option_getter(session, "@codex_primary_model", "gpt-5.6-sol"),
+        )
+        primary_reasoning_effort = saved_text(
+            "primary_reasoning_effort",
+            option_getter(session, "@codex_primary_effort", "max"),
+        )
     return RecoveryConfig(
         # The persistent session binding survives tmux recreation and /clear;
         # tmux options are only the compatibility fallback.
-        thread_id=(
-            binding.thread_id
-            if binding is not None
-            else option_getter(session, "@codex_thread_id", "")
+        thread_id=thread_id,
+        primary_model=primary_model,
+        primary_reasoning_effort=primary_reasoning_effort,
+        compact_model=saved_text(
+            "compact_model",
+            option_getter(session, "@codex_compact_model", "gpt-5.6-luna"),
         ),
-        primary_model=option_getter(
-            session, "@codex_primary_model", "gpt-5.6-sol"
+        compact_reasoning_effort=saved_text(
+            "compact_reasoning_effort",
+            option_getter(session, "@codex_compact_effort", "xhigh"),
         ),
-        primary_reasoning_effort=option_getter(
-            session, "@codex_primary_effort", "max"
+        codex_args=codex_args,
+        cooldown_seconds=saved_int(
+            "cooldown_seconds",
+            option_getter(session, "@codex_cooldown_seconds", "300"),
         ),
-        compact_model=option_getter(
-            session, "@codex_compact_model", "gpt-5.6-luna"
+        max_recoveries=saved_int(
+            "max_recoveries",
+            option_getter(session, "@codex_max_recoveries", "0"),
         ),
-        compact_reasoning_effort=option_getter(
-            session, "@codex_compact_effort", "xhigh"
+        compact_wait_seconds=saved_int(
+            "compact_wait_seconds",
+            option_getter(session, "@codex_compact_wait_seconds", "600"),
         ),
-        codex_args=tuple(json.loads(codex_args_json)),
-        cooldown_seconds=int(
-            option_getter(session, "@codex_cooldown_seconds", "300")
+        thread_max_compactions=saved_int(
+            "thread_max_compactions",
+            option_getter(session, "@codex_thread_max_compactions", "0"),
         ),
-        max_recoveries=int(
-            option_getter(session, "@codex_max_recoveries", "0")
-        ),
-        compact_wait_seconds=int(
-            option_getter(session, "@codex_compact_wait_seconds", "600")
-        ),
-        thread_max_compactions=int(
-            option_getter(session, "@codex_thread_max_compactions", "0")
-        ),
-        thread_max_rollout_bytes=int(
+        thread_max_rollout_bytes=saved_int(
+            "thread_max_rollout_bytes",
             option_getter(
                 session,
                 "@codex_thread_max_rollout_bytes",
                 str(512 * 1024 * 1024),
-            )
+            ),
         ),
-        thread_max_context_tokens=int(
-            option_getter(session, "@codex_thread_max_context_tokens", "0")
+        thread_max_context_tokens=saved_int(
+            "thread_max_context_tokens",
+            option_getter(session, "@codex_thread_max_context_tokens", "0"),
         ),
-        thread_no_progress_tokens=int(
-            option_getter(session, "@codex_thread_no_progress_tokens", "1000000")
+        thread_no_progress_tokens=saved_int(
+            "thread_no_progress_tokens",
+            option_getter(session, "@codex_thread_no_progress_tokens", "1000000"),
         ),
-        thread_no_event_seconds=int(
-            option_getter(session, "@codex_thread_no_event_seconds", "1800")
+        thread_no_event_seconds=saved_int(
+            "thread_no_event_seconds",
+            option_getter(session, "@codex_thread_no_event_seconds", "1800"),
         ),
-        thread_health_poll_seconds=int(
-            option_getter(session, "@codex_thread_health_poll_seconds", "30")
+        thread_health_poll_seconds=saved_int(
+            "thread_health_poll_seconds",
+            option_getter(session, "@codex_thread_health_poll_seconds", "30"),
         ),
-        thread_max_repeated_content=int(
-            option_getter(session, "@codex_thread_max_repeated_content", "3")
+        thread_max_repeated_content=saved_int(
+            "thread_max_repeated_content",
+            option_getter(session, "@codex_thread_max_repeated_content", "3"),
         ),
-        thread_max_repeated_commands=int(
-            option_getter(session, "@codex_thread_max_repeated_commands", "3")
+        thread_max_repeated_commands=saved_int(
+            "thread_max_repeated_commands",
+            option_getter(session, "@codex_thread_max_repeated_commands", "3"),
         ),
-        resume_prompt=option_getter(
-            session, "@codex_resume_prompt", DEFAULT_RESUME_PROMPT
+        resume_prompt=saved_text(
+            "resume_prompt",
+            option_getter(session, "@codex_resume_prompt", DEFAULT_RESUME_PROMPT),
         ),
         recovery_phase=(
             binding.recovery_phase

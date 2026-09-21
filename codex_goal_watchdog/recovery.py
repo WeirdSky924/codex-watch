@@ -20,6 +20,10 @@ MODEL_AT_CAPACITY_PATTERN = (
 SERVERS_OVERLOADED_PATTERN = (
     "Our servers are currently overloaded. Please try again later."
 )
+MANUAL_API_DISABLED_PATTERN = re.compile(
+    r"\bapi(?:[_\s]+key)?[_\s]+(?:is[_\s]+)?disabled?\b",
+    re.IGNORECASE,
+)
 UPSTREAM_ACCESS_DENIED_PATTERN = "Upstream access denied"
 UPSTREAM_ACCESS_FORBIDDEN_PATTERN = (
     "Upstream access forbidden, please contact administrator"
@@ -128,6 +132,8 @@ def _is_retryable_upstream_error(text: str) -> bool:
 
 def classify_recovery_message(message: str) -> str | None:
     """Classify one structured task failure without terminal row markers."""
+    if MANUAL_API_DISABLED_PATTERN.search(message):
+        return None
     if MODEL_AT_CAPACITY_PATTERN in message:
         return "model_at_capacity"
     if SERVERS_OVERLOADED_PATTERN in message:
@@ -163,7 +169,13 @@ def classify_recovery_reason(text: str) -> str | None:
     for index in range(len(markers) - 1, -1, -1):
         marker = markers[index]
         end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
-        reason = classify_recovery_message(text[marker.end() : end].lstrip()[:1200])
+        fragment = text[marker.end() : end].lstrip()[:1200]
+        # A disabled API key requires human intervention. Stop here so an
+        # older fatal row elsewhere in the retained terminal screen cannot
+        # trigger recovery while this newer row is waiting for the key fix.
+        if MANUAL_API_DISABLED_PATTERN.search(fragment):
+            return None
+        reason = classify_recovery_message(fragment)
         if marker.group() == "⚠" and reason != "model_at_capacity":
             continue
         if reason is not None:

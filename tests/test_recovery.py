@@ -117,6 +117,14 @@ class RecoveryControllerTests(unittest.TestCase):
                     ),
                 )
 
+    def test_retries_other_http_401_errors(self):
+        self.assertEqual(
+            "retryable_http_401",
+            classify_recovery_reason(
+                "■ unexpected status 401 Unauthorized: upstream request failed"
+            )
+        )
+
     def test_classifies_upstream_access_denied_as_thread_ban(self):
         message = (
             "unexpected status 502 Bad Gateway: Upstream access denied, "
@@ -158,17 +166,25 @@ class RecoveryControllerTests(unittest.TestCase):
             classify_recovery_reason(screen),
         )
 
-    def test_classifies_terminal_401_api_disabled(self):
+    def test_ignores_disabled_api_key_for_manual_recovery(self):
         for message in (
-            "■ unexpected status 401 Unauthorized: API DISABLE",
+            '■ unexpected status 401 Unauthorized: {"code":"API_KEY_DISABLED",'
+            '"message":"API key is disabled"}, url: '
+            'https://weirdsky.cn/responses, request id: example',
             "■ 401 API DISABLE",
             "■ API disabled: status 401",
         ):
             with self.subTest(message=message):
-                self.assertEqual(
-                    "retryable_http_401",
-                    classify_recovery_reason(message),
-                )
+                self.assertIsNone(classify_recovery_reason(message))
+
+    def test_disabled_api_key_blocks_older_visible_fatal_rows(self):
+        text = (
+            "■ unexpected status 503 Service Unavailable: upstream failed\n"
+            '■ unexpected status 401 Unauthorized: {"code":"API_KEY_DISABLED",'
+            '"message":"API key is disabled"}\n'
+        )
+
+        self.assertIsNone(classify_recovery_reason(text))
 
     def test_does_not_classify_http_codes_without_terminal_error_marker(self):
         self.assertIsNone(

@@ -870,7 +870,8 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | Codex context window exhausted | 交由 Codex 自身处理，watchdog 不接管 |
 | HTTP 502 且消息为 `Upstream access denied` | 不再恢复被拒绝的 thread；创建新 thread，提取并重建上一 Goal，再自动更新 tmux 与持久绑定 |
 | `Upstream access forbidden, please contact administrator` | 使用 primary model 恢复当前固定 thread；后续失败等待 5 分钟，默认无限重试 |
-| HTTP 401（包括 `API DISABLE`）、402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
+| `API_KEY_DISABLED`、`API key is disabled`、`API DISABLE`、`API disabled` | 不自动重启、不进入 5 分钟重试；用户修复或重新启用 KEY 后，再手动启动/恢复原 thread 和 Goal |
+| HTTP 401（不含明确的 KEY 禁用错误）、402、429、500、502-504、520-524 | 第一次立即使用 primary model 恢复；再次 fatal 后等待冷静期重试 |
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
 | `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
@@ -901,7 +902,7 @@ monitor 启动时或运行中明确看到 `Goal achieved`，还会清除该 thre
 
 从 `0.1.6` 开始，在受管 Codex 会话中执行 `/clear` 后，watchdog 会从当前 tmux pane 的 Codex 进程树中识别最新顶层 CLI rollout，自动更新固定 thread ID，并将新 thread 的恢复计数重置为 0。子 Agent thread 和同目录下其他 Codex 进程不会被误绑定。
 
-从 `0.1.7` 开始，Codex TUI 中带 `■` fatal 标记的 HTTP 401（包括 `API DISABLE`）进入统一恢复流程：首次立即恢复，后续失败按冷静期继续重试，默认不限制次数。
+从 `0.1.7` 开始，终端 HTTP 401 进入统一恢复流程；当前规则保留普通 401 的自动恢复，但明确表示 API key 被禁用的错误需要用户处理，不再自动重启或循环重试。
 
 从 `0.1.8` 开始，每个 `--session` 的固定 thread ID 会持久保存在 watchdog 状态目录。tmux 消失后，不带模式参数重新启动会恢复该 watchdog session 自己的 ID；`/clear` 后的新 ID 会同步覆盖持久绑定。`--resume` 仅在显式使用时选择当前目录最近的 Codex thread，`--new` 用于明确创建新 thread。
 

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.28] - 2026-09-21
+
+### Changed
+
+- Keep ordinary HTTP 401 responses in automatic fatal recovery, while errors
+  such as `API_KEY_DISABLED`, `API key is disabled`, `API DISABLE`, and
+  `API disabled` wait for manual key recovery instead of restarting the pinned
+  thread.
+
 ## [0.1.27] - 2026-09-21
 
 ### Fixed

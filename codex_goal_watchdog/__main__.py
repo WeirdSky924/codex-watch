@@ -518,13 +518,27 @@ def main(argv: list[str] | None = None) -> int:
     if _guardian_unit_installed():
         run_command(_guardian_enable_command(args.session))
     if not args.dry_run:
-        handle_goal_prompt(
-            args.session,
-            action="resume",
-            prompt="",
-            timeout_seconds=0,
-            send_fallback_prompt=False,
-        )
+        goal_recovery_skipped = not pane_codex_running(args.session)
+        if not goal_recovery_skipped:
+            try:
+                handle_goal_prompt(
+                    args.session,
+                    action="resume",
+                    prompt="",
+                    timeout_seconds=0,
+                    send_fallback_prompt=False,
+                )
+            except TimeoutError:
+                goal_recovery_skipped = not pane_codex_running(args.session)
+                if not goal_recovery_skipped:
+                    raise
+        if goal_recovery_skipped:
+            print(
+                "[codex-goal-watchdog] Codex is not running in the tmux pane; "
+                "skipping Goal recovery input. Fix the Codex startup error, "
+                "then run codex-watch again.",
+                flush=True,
+            )
     if not args.no_attach:
         run_command(tmux_attach_command(args.session))
     return 0

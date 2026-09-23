@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.29] - 2026-09-23
+
+### Fixed
+
+- Skip automatic Goal recovery input after Codex exits to a shell during startup,
+  avoiding an uncaught refusal error and keeping Goal commands out of the shell.
+
 ## [0.1.28] - 2026-09-21
 
 ### Changed

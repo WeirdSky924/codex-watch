@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.30] - 2026-09-30
+
+### Fixed
+
+- Handle manual startup while another watchdog recovery owns the tmux session
+  without emitting a traceback or launching a duplicate recovery.
+
 ## [0.1.29] - 2026-09-23
 
 ### Fixed

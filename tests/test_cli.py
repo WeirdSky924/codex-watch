@@ -9,6 +9,7 @@ from unittest.mock import call, patch
 from codex_goal_watchdog import __version__
 from codex_goal_watchdog.__main__ import guardian_main, main, start_main
 from codex_goal_watchdog.bindings import SessionBinding
+from codex_goal_watchdog.tmux_control import RecoveryInProgress
 
 
 class ConsoleEntrypointTests(unittest.TestCase):
@@ -73,8 +74,10 @@ class ConsoleEntrypointTests(unittest.TestCase):
         return_value="550e8400-e29b-41d4-a716-446655440000",
     )
     @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    @patch("codex_goal_watchdog.__main__.pane_codex_running", return_value=True)
     def test_manual_attach_resumes_visible_paused_goal(
         self,
+        _pane_codex_running_mock,
         _session_exists_mock,
         _get_thread_id_mock,
         _run_mock,
@@ -133,6 +136,57 @@ class ConsoleEntrypointTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(shell_commands))
         self.assertIn(f"resume {thread_id}", shell_commands[0])
+
+    @patch("codex_goal_watchdog.__main__.save_session_binding")
+    @patch("codex_goal_watchdog.__main__.handle_goal_prompt")
+    @patch("codex_goal_watchdog.__main__.execute_steps")
+    @patch("codex_goal_watchdog.__main__.pane_codex_running", return_value=False)
+    @patch("codex_goal_watchdog.__main__.pane_shell_ready", return_value=True)
+    @patch("codex_goal_watchdog.__main__.subprocess.run")
+    @patch(
+        "codex_goal_watchdog.__main__.tmux_get_thread_id",
+        return_value="550e8400-e29b-41d4-a716-446655440000",
+    )
+    @patch("codex_goal_watchdog.__main__.tmux_session_exists", return_value=True)
+    @patch("codex_goal_watchdog.__main__.load_session_binding")
+    def test_manual_start_leaves_active_recovery_to_guardian(
+        self,
+        load_binding_mock,
+        _session_exists_mock,
+        _get_thread_id_mock,
+        run_mock,
+        _pane_codex_running_mock,
+        _pane_shell_ready_mock,
+        execute_steps_mock,
+        handle_goal_prompt_mock,
+        _save_binding_mock,
+    ):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        load_binding_mock.return_value = SessionBinding(
+            session="project-a",
+            thread_id=thread_id,
+            cwd=Path.cwd().resolve(),
+        )
+        execute_steps_mock.side_effect = RecoveryInProgress(
+            "recovery already in progress for tmux session project-a"
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                ["start", "--session", "project-a", "--no-attach"]
+            )
+
+        self.assertEqual(0, result)
+        self.assertIn("active recovery already owns", output.getvalue())
+        handle_goal_prompt_mock.assert_not_called()
+        self.assertFalse(
+            any(
+                call.args
+                and call.args[0][:2] == ["tmux", "pipe-pane"]
+                for call in run_mock.call_args_list
+            )
+        )
 
     @patch("codex_goal_watchdog.__main__._guardian_unit_installed", return_value=False)
     @patch("codex_goal_watchdog.__main__.save_session_binding")

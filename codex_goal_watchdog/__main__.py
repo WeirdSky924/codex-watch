@@ -41,6 +41,7 @@ from .sessions import (
 )
 from .startup_state import restore_startup_options, snapshot_launch_options
 from .tmux_control import (
+    RecoveryInProgress,
     capture_update_prompt_version,
     execute_steps,
     handle_goal_prompt,
@@ -479,17 +480,28 @@ def main(argv: list[str] | None = None) -> int:
             f"session; restarting pinned thread {thread_id}",
             flush=True,
         )
-        execute_steps(
-            args.session,
-            build_shell_restart_steps(
-                recovery_config,
-                recovery_attempt=next_recovery_attempt,
-                # The shared goal handler resumes ordinary paused Goals while
-                # retaining its blocked/stalled safeguards.
-                resume_goal=True,
-            ),
-            dry_run=args.dry_run,
-        )
+        try:
+            execute_steps(
+                args.session,
+                build_shell_restart_steps(
+                    recovery_config,
+                    recovery_attempt=next_recovery_attempt,
+                    # The shared goal handler resumes ordinary paused Goals while
+                    # retaining its blocked/stalled safeguards.
+                    resume_goal=True,
+                ),
+                dry_run=args.dry_run,
+            )
+        except RecoveryInProgress as exc:
+            print(
+                "[codex-goal-watchdog] An active recovery already owns "
+                f"tmux session {args.session!r}; {exc}. "
+                "Leaving recovery to the active watchdog.",
+                flush=True,
+            )
+            if not args.no_attach:
+                run_command(tmux_attach_command(args.session))
+            return 0
     pipe_command = monitor_pipe_command(
         root_dir=str(root_dir),
         session=args.session,

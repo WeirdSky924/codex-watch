@@ -28,6 +28,11 @@ UPSTREAM_ACCESS_DENIED_PATTERN = "Upstream access denied"
 UPSTREAM_ACCESS_FORBIDDEN_PATTERN = (
     "Upstream access forbidden, please contact administrator"
 )
+UPSTREAM_SERVICE_UNAVAILABLE_RE = re.compile(
+    r"\b(?:upstream\s+)?(?:service|server)\s+"
+    r"(?:is\s+)?(?:temporarily\s+)?unavailable\b",
+    re.IGNORECASE,
+)
 PLAIN_UPSTREAM_REQUEST_FAILURE_PATTERN = (
     "stream disconnected before completion: Upstream request failed"
 )
@@ -158,6 +163,8 @@ def classify_recovery_message(message: str) -> str | None:
     )
     if status and error_shaped:
         return f"retryable_http_{status.group(1)}"
+    if UPSTREAM_SERVICE_UNAVAILABLE_RE.search(message):
+        return "retryable_upstream_error"
     if RETRYABLE_NETWORK_RE.search(message):
         return "retryable_network"
     return None

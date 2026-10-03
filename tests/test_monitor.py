@@ -104,6 +104,35 @@ class MonitorTests(unittest.TestCase):
             any("Codex process is not running" in message for message in messages)
         )
 
+    @patch(
+        "codex_goal_watchdog.monitor.handle_goal_prompt",
+        side_effect=TimeoutError("resume remained in composer"),
+    )
+    def test_run_monitor_keeps_running_when_goal_resume_submission_times_out(
+        self,
+        handle_goal_prompt_mock,
+    ):
+        messages = []
+
+        run_monitor(
+            lines=["Goal paused (/goal resume)\n"],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            now=lambda: 100.0,
+            log=messages.append,
+        )
+
+        handle_goal_prompt_mock.assert_called_once_with(
+            "codex-goal",
+            action="resume",
+            prompt="",
+            timeout_seconds=0,
+            send_fallback_prompt=False,
+        )
+        self.assertTrue(
+            any("will retry later" in message for message in messages)
+        )
+
     def test_run_monitor_does_not_submit_update_when_codex_is_missing(self):
         update_calls = []
         messages = []
@@ -572,6 +601,28 @@ class MonitorTests(unittest.TestCase):
                 "Pursuing goal (4m)\n",
                 "■ stream disconnected before completion: Our servers are "
                 "currently overloaded. Please try again later.\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
+            now=lambda: 100.0,
+            execute=lambda target, steps: calls.append((target, steps)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertNotIn("/compact", [step.value for step in calls[0][1]])
+        self.assertEqual("0", calls[0][1][4].value)
+
+    def test_run_monitor_recovers_upstream_service_unavailable_without_compaction(
+        self,
+    ):
+        calls = []
+
+        run_monitor(
+            lines=[
+                "Pursuing goal (4m)\n",
+                "■ stream disconnected before completion: Upstream service "
+                "temporarily unavailable\n",
             ],
             target="codex-goal",
             config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),

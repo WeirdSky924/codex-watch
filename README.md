@@ -876,6 +876,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
 | `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
 | `Our servers are currently overloaded` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试，不执行 compact |
+| `Upstream service temporarily unavailable`、`service temporarily unavailable` | 使用 primary model 恢复当前固定 thread；再次出现时等待冷静期重试，不执行 compact |
 | Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread；不计入 fatal recovery 次数，也不执行 300 秒冷静期 |
 
 恢复普通 paused 或 usage-limited Goal 时，watchdog 会优先执行 `/goal resume`。`Goal blocked` 不会自动执行 `/goal resume`，也不会发送文本续接提示；用户完成审核、批准或外部条件处理后再手工恢复。Codex 当前没有向 watchdog 暴露稳定的 blocked 原因分类，因此本工具保守地将所有 blocked 状态都按人工审核处理。

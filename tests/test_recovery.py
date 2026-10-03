@@ -278,6 +278,27 @@ class RecoveryControllerTests(unittest.TestCase):
             classify_recovery_reason(f"■ {message}"),
         )
 
+    def test_classifies_service_unavailable_upstream_variants(self):
+        messages = (
+            "stream disconnected before completion: "
+            "Upstream service temporarily unavailable",
+            "stream disconnected before completion: "
+            "upstream service is temporarily unavailable",
+            "stream disconnected before completion: service unavailable",
+            "stream disconnected before completion: server temporarily unavailable",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    "retryable_upstream_error",
+                    classify_recovery_message(message),
+                )
+                self.assertEqual(
+                    "retryable_upstream_error",
+                    classify_recovery_reason(f"■ {message}"),
+                )
+
     def test_ignores_model_capacity_message_without_terminal_warning_marker(self):
         self.assertIsNone(
             classify_recovery_reason(

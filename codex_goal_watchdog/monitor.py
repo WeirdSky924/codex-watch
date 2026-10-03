@@ -187,13 +187,19 @@ def run_monitor(
             )
 
     def default_resume_goal(tmux_target: str) -> None:
-        handle_goal_prompt(
-            tmux_target,
-            action="resume",
-            prompt="",
-            timeout_seconds=0,
-            send_fallback_prompt=False,
-        )
+        try:
+            handle_goal_prompt(
+                tmux_target,
+                action="resume",
+                prompt="",
+                timeout_seconds=0,
+                send_fallback_prompt=False,
+            )
+        except (OSError, TimeoutError, subprocess.SubprocessError) as exc:
+            emit(
+                "[codex-goal-watchdog] Goal resume submission could not be "
+                f"verified; will retry later: {exc}"
+            )
 
     def default_update_codex(tmux_target: str, expected_version: str) -> None:
         visible_version = capture_update_prompt_version(tmux_target)

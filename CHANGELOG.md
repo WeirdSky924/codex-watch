@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.31] - 2026-10-03
+
+### Fixed
+
+- Recover terminal errors such as `Upstream service temporarily unavailable`
+  through the standard same-thread upstream retry flow.
+- Keep a transient Goal resume submission timeout from terminating the monitor;
+  the visible resume state is retried on the next monitor interval.
+
 ## [0.1.30] - 2026-09-30
 
 ### Fixed

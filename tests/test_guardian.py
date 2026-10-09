@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,8 +22,84 @@ from codex_goal_watchdog.guardian import (
     guard_once,
 )
 from codex_goal_watchdog.bindings import SessionBinding, save_thread_handoff
+from codex_goal_watchdog.app_server import CodexAppServerClient
 from codex_goal_watchdog.execution_profile import ExecutionProfile
 from codex_goal_watchdog.recovery import RecoveryConfig
+from codex_goal_watchdog.rotation_state import complete_native_goal_rotation
+
+
+FAKE_APP_SERVER = r"""
+import json, sys; goal = None
+for line in sys.stdin:
+    request = json.loads(line); method = request["method"]; request_id = request.get("id")
+    if method == "initialize":
+        print(json.dumps({"method": "remoteControl/status/changed", "params": {}}), flush=True)
+        result = {"userAgent": "fake"}
+    elif method == "thread/goal/get":
+        result = {"goal": goal}
+    elif method == "thread/goal/set":
+        params = request["params"]; goal = {"threadId": params["threadId"], "objective": params["objective"], "status": params["status"], "tokenBudget": params["tokenBudget"]}
+        result = {"goal": goal}
+    else:
+        continue
+    if request_id is not None:
+        print(json.dumps({"id": request_id, "result": result}), flush=True)
+"""
+
+
+class NativeGoalRecoveryTests(unittest.TestCase):
+    def test_app_server_goal_round_trip_and_rotation_prompt_order(self):
+        def fake_popen(_command, **kwargs):
+            return subprocess.Popen(
+                [sys.executable, "-u", "-c", FAKE_APP_SERVER], **kwargs
+            )
+
+        with CodexAppServerClient(popen_factory=fake_popen) as client:
+            self.assertIsNone(client.get_goal("source-thread"))
+            restored = client.set_goal(
+                thread_id="new-thread",
+                objective="Continue the current Goal",
+                status="blocked",
+                token_budget=None,
+            )
+            self.assertEqual("blocked", restored["status"])
+            self.assertIsNone(restored["tokenBudget"])
+            self.assertEqual("new-thread", client.get_goal("new-thread")["threadId"])
+        order = []
+
+        def execute(_target, steps):
+            order.append("submit")
+            self.assertEqual("text", steps[0].kind)
+            self.assertIn("native Goal", steps[0].value)
+            self.assertNotIn("创建 Goal", steps[0].value)
+
+        def restore(_target, _source_thread_id):
+            order.append("restore")
+            return "new-thread", {
+                "objective": "Goal ID: FE-CREATOR-8",
+                "status": "active",
+            }
+
+        complete_native_goal_rotation(
+            "codex-goal",
+            "source-thread",
+            "upstream_access_denied",
+            "/state/handoff.json",
+            execute,
+            restore_thread_goal=restore,
+        )
+        self.assertEqual(["restore", "submit"], order)
+        complete_native_goal_rotation(
+            "codex-goal",
+            "source-thread",
+            "upstream_access_denied",
+            "/state/handoff.json",
+            lambda *_args: self.fail("blocked Goal must not submit work"),
+            restore_thread_goal=lambda *_args: (
+                "new-thread",
+                {"objective": "Goal ID: FE-CREATOR-8", "status": "blocked"},
+            ),
+        )
 
 
 class GuardianTests(unittest.TestCase):
@@ -650,21 +728,20 @@ class GuardianTests(unittest.TestCase):
             _recovery_reason_on_screen("codex-goal", runner=runner),
         )
 
-    def test_visible_recovery_allows_stalled_goal_with_fatal_error(self):
+    def test_visible_recovery_ignores_protocol_incompatibility_error(self):
         def runner(command, **kwargs):
             class Result:
                 returncode = 0
                 stdout = (
                     "Goal stalled (/goal resume)\n"
-                    "■ unexpected status 503 Service Unavailable: upstream failed\n"
+                    "■ {\"error\":{\"message\":\"gpt-6.1-sol requires "
+                    "Responses for tool calls; this account only supports Chat "
+                    "Completions\",\"type\":\"invalid_request_error\"}}\n"
                 )
 
             return Result()
 
-        self.assertEqual(
-            "retryable_http_503",
-            _recovery_reason_on_screen("codex-goal", runner=runner),
-        )
+        self.assertIsNone(_recovery_reason_on_screen("codex-goal", runner=runner))
 
     def test_guardian_reads_blocked_state_before_recovery(self):
         def runner(command, **kwargs):

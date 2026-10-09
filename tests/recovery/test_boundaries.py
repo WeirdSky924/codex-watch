@@ -1,9 +1,17 @@
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from codex_goal_watchdog.bindings import save_thread_handoff
+from codex_goal_watchdog.bindings import (
+    load_thread_handoff,
+    save_session_binding,
+    save_thread_handoff,
+)
+from codex_goal_watchdog.app_server import CodexAppServerClient
 from codex_goal_watchdog.monitor import run_monitor
 from codex_goal_watchdog.recovery import (
     CompactionTimeoutError,
@@ -11,16 +19,49 @@ from codex_goal_watchdog.recovery import (
     RecoveryConfig,
 )
 from codex_goal_watchdog.sessions import TaskFailure
+from codex_goal_watchdog.rotation_state import find_rotation_goal_objective
 from codex_goal_watchdog.tmux_control import RecoveryStep, _execute_steps_unlocked
 from codex_goal_watchdog.rotation_state import (
+    _mark_rotation_handoff_rebound,
+    complete_native_goal_rotation,
+    restore_native_goal_for_thread,
     pending_thread_rotation_prompt,
     pending_thread_rotation_is_valid,
     pending_thread_rotation_marker,
     set_pending_thread_rotation,
+    write_thread_rotation_handoff,
 )
 
 
 THREAD_ID = "550e8400-e29b-41d4-a716-446655440000"
+FAKE_APP_SERVER = r"""
+import json
+import sys
+
+goal = None
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    request_id = request.get("id")
+    if method == "initialize":
+        print(json.dumps({"method": "remoteControl/status/changed", "params": {}}), flush=True)
+        response = {"userAgent": "fake"}
+    elif method == "thread/goal/get":
+        response = {"goal": goal}
+    elif method == "thread/goal/set":
+        params = request["params"]
+        goal = {
+            "threadId": params["threadId"],
+            "objective": params["objective"],
+            "status": params["status"],
+            "tokenBudget": params["tokenBudget"],
+        }
+        response = {"goal": goal}
+    else:
+        continue
+    if request_id is not None:
+        print(json.dumps({"id": request_id, "result": response}), flush=True)
+"""
 
 
 def _stall_lines() -> list[str]:
@@ -32,7 +73,213 @@ def _stall_lines() -> list[str]:
 
 
 class MonitorRecoveryBoundaryTests(unittest.TestCase):
-    def test_compaction_timeout_falls_back_to_fresh_thread_rotation(self):
+    def test_handoff_keeps_last_valid_native_goal_when_source_has_placeholder(self):
+        source_thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        objective = "Goal ID: FE-CREATOR-8 continue current ACTIVE plan"
+
+        class FakeAppServer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return None
+
+            def get_goal(self, _thread_id):
+                return {
+                    "threadId": source_thread_id,
+                    "objective": (
+                        "未能从旧 thread 的 rollout 提取 Goal Objective。"
+                    ),
+                    "status": "blocked",
+                    "tokenBudget": None,
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_root = Path(temp_dir)
+            with patch("codex_goal_watchdog.bindings.state_dir", return_value=state_root):
+                save_thread_handoff(
+                    session="codex-goal",
+                    thread_id=source_thread_id,
+                    cwd=Path("/workspace/project"),
+                    reason="upstream_access_denied",
+                    goal_objective=objective,
+                    telemetry={
+                        "native_goal": {
+                            "source_thread_id": source_thread_id,
+                            "objective": objective,
+                            "status": "blocked",
+                            "token_budget": None,
+                        },
+                        "rebound_thread_id": "550e8400-e29b-41d4-a716-446655440001",
+                    },
+                    state_root=state_root,
+                )
+                with patch(
+                    "codex_goal_watchdog.rotation_state.CodexAppServerClient",
+                    return_value=FakeAppServer(),
+                ):
+                    path = write_thread_rotation_handoff(
+                        session="codex-goal",
+                        thread_id="550e8400-e29b-41d4-a716-446655440001",
+                        cwd=Path("/workspace/project"),
+                        reason="upstream_access_denied",
+                    )
+                loaded = load_thread_handoff("codex-goal", state_root=state_root)
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(path, loaded[0])
+        self.assertEqual(objective, loaded[1]["goal_objective"])
+        self.assertEqual(
+            objective,
+            loaded[1]["telemetry"]["native_goal"]["objective"],
+        )
+        self.assertEqual(
+            "550e8400-e29b-41d4-a716-446655440001",
+            loaded[1]["telemetry"]["native_goal"]["source_thread_id"],
+        )
+
+    def test_handoff_does_not_reuse_cached_goal_after_clear(self):
+        source_thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        cleared_thread_id = "550e8400-e29b-41d4-a716-446655440002"
+        objective = "Goal ID: FE-CREATOR-8 continue current ACTIVE plan"
+
+        class FakeAppServer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return None
+
+            def get_goal(self, _thread_id):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_root = Path(temp_dir)
+            with patch("codex_goal_watchdog.bindings.state_dir", return_value=state_root):
+                save_thread_handoff(
+                    session="codex-goal",
+                    thread_id=source_thread_id,
+                    cwd=Path("/workspace/project"),
+                    reason="upstream_access_denied",
+                    goal_objective=objective,
+                    telemetry={
+                        "native_goal": {
+                            "source_thread_id": source_thread_id,
+                            "objective": objective,
+                            "status": "active",
+                            "token_budget": None,
+                        }
+                    },
+                    state_root=state_root,
+                )
+                with patch(
+                    "codex_goal_watchdog.rotation_state.CodexAppServerClient",
+                    return_value=FakeAppServer(),
+                ):
+                    write_thread_rotation_handoff(
+                        session="codex-goal",
+                        thread_id=cleared_thread_id,
+                        cwd=Path("/workspace/project"),
+                        reason="upstream_access_denied",
+                    )
+                loaded = load_thread_handoff("codex-goal", state_root=state_root)
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertNotIn("native_goal", loaded[1]["telemetry"])
+        self.assertEqual("", loaded[1]["goal_objective"])
+
+    def test_restore_native_goal_reads_back_objective_and_blocked_status(self):
+        source_thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        target_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        objective = "Goal ID: FE-CREATOR-8 continue current ACTIVE plan"
+
+        class FakeAppServer:
+            def __init__(self):
+                self.goal = None
+                self.set_calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return None
+
+            def get_goal(self, thread_id):
+                return self.goal if self.goal and self.goal["threadId"] == thread_id else None
+
+            def set_goal(self, **kwargs):
+                self.set_calls.append(kwargs)
+                self.goal = {
+                    "threadId": kwargs["thread_id"],
+                    "objective": kwargs["objective"],
+                    "status": kwargs["status"],
+                    "tokenBudget": kwargs["token_budget"],
+                }
+                return self.goal
+
+        app_server = FakeAppServer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_root = Path(temp_dir)
+            with patch("codex_goal_watchdog.bindings.state_dir", return_value=state_root):
+                save_session_binding(
+                    session="codex-goal",
+                    thread_id=target_thread_id,
+                    cwd=Path("/workspace/project"),
+                    verification_pending=True,
+                    last_recovery_reason="upstream_access_denied",
+                    state_root=state_root,
+                )
+                save_thread_handoff(
+                    session="codex-goal",
+                    thread_id=source_thread_id,
+                    cwd=Path("/workspace/project"),
+                    reason="upstream_access_denied",
+                    goal_objective=objective,
+                    telemetry={
+                        "native_goal": {
+                            "source_thread_id": source_thread_id,
+                            "objective": objective,
+                            "status": "blocked",
+                            "token_budget": None,
+                        },
+                        "rebound_thread_id": target_thread_id,
+                    },
+                    state_root=state_root,
+                )
+                restored = restore_native_goal_for_thread(
+                    "codex-goal",
+                    target_thread_id,
+                    app_server_factory=lambda: app_server,
+                )
+
+        self.assertEqual(1, len(app_server.set_calls))
+        self.assertEqual("automatic", app_server.set_calls[0]["origin"])
+        self.assertEqual(objective, restored["objective"])
+        self.assertEqual("blocked", restored["status"])
+
+    def test_goal_objective_falls_back_to_terminal_capture_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread_id = THREAD_ID
+            path = root / f"rollout-{thread_id}.jsonl"
+            events = [
+                {"type": "session_meta", "payload": {"id": thread_id, "cwd": "/workspace/project", "source": "cli", "timestamp": "2026-09-09T05:00:00Z"}},
+                {"type": "response_item", "payload": {"type": "custom_tool_call_output", "output": [{"type": "input_text", "text": "• Goal active Objective: Goal ID: FE-CREATOR-8\n继续最新计划\nTime: 2m."}]}},
+            ]
+            path.write_text("\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n", encoding="utf-8")
+
+            with patch(
+                "codex_goal_watchdog.rotation_state.find_thread_rollout_path",
+                return_value=path,
+            ):
+                objective = find_rotation_goal_objective(thread_id)
+
+        self.assertEqual("Goal ID: FE-CREATOR-8 继续最新计划", objective)
+
+    @patch("codex_goal_watchdog.monitor.complete_native_goal_rotation")
+    def test_compaction_timeout_falls_back_to_fresh_thread_rotation(self, _complete_rotation):
         calls = []
         handoffs = []
 
@@ -127,7 +374,8 @@ class MonitorRecoveryBoundaryTests(unittest.TestCase):
 
         self.assertEqual("retryable_http_503", raised.exception.reason)
 
-    def test_compaction_access_denied_keeps_new_thread_rotation(self):
+    @patch("codex_goal_watchdog.monitor.complete_native_goal_rotation")
+    def test_compaction_access_denied_keeps_new_thread_rotation(self, _complete_rotation):
         calls = []
         handoffs = []
 
@@ -225,6 +473,67 @@ class MonitorRecoveryBoundaryTests(unittest.TestCase):
 
 
 class RotationStateBoundaryTests(unittest.TestCase):
+    def test_app_server_goal_get_and_set_round_trip(self):
+        def fake_popen(_command, **kwargs):
+            return subprocess.Popen(
+                [sys.executable, "-u", "-c", FAKE_APP_SERVER], **kwargs
+            )
+
+        with CodexAppServerClient(popen_factory=fake_popen) as client:
+            self.assertIsNone(client.get_goal("source-thread"))
+            restored = client.set_goal(
+                thread_id="new-thread",
+                objective="Continue the current Goal",
+                status="blocked",
+                token_budget=None,
+            )
+            self.assertEqual("new-thread", restored["threadId"])
+            self.assertEqual("blocked", restored["status"])
+            self.assertIsNone(restored["tokenBudget"])
+            self.assertEqual("Continue the current Goal", restored["objective"])
+            self.assertEqual("new-thread", client.get_goal("new-thread")["threadId"])
+
+    def test_native_rotation_submits_only_after_active_goal_restore(self):
+        order = []
+        objective = "Goal ID: FE-CREATOR-8 continue current ACTIVE plan"
+
+        def restore(_target, _source_thread_id):
+            order.append("restore")
+            return "new-thread", {"objective": objective, "status": "active"}
+
+        def execute(_target, steps):
+            order.append("submit")
+            self.assertEqual("text", steps[0].kind)
+            self.assertIn("native Goal", steps[0].value)
+            self.assertIn(objective, steps[0].value)
+            self.assertNotIn("创建 Goal", steps[0].value)
+
+        complete_native_goal_rotation(
+            "codex-goal",
+            THREAD_ID,
+            "upstream_access_denied",
+            "/state/handoff.json",
+            execute,
+            restore_thread_goal=restore,
+        )
+
+        self.assertEqual(["restore", "submit"], order)
+
+    def test_native_rotation_does_not_submit_blocked_goal(self):
+        calls = []
+        complete_native_goal_rotation(
+            "codex-goal",
+            THREAD_ID,
+            "upstream_access_denied",
+            "/state/handoff.json",
+            lambda _target, steps: calls.append(steps),
+            restore_thread_goal=lambda _target, _source: (
+                "new-thread",
+                {"objective": "Goal ID: FE-CREATOR-8", "status": "blocked"},
+            ),
+        )
+        self.assertEqual([], calls)
+
     @patch("codex_goal_watchdog.rotation_state.subprocess.run")
     def test_rotation_count_is_written_after_reason_and_source(
         self,
@@ -262,6 +571,15 @@ class RotationStateBoundaryTests(unittest.TestCase):
             return Result()
 
         self.assertFalse(
+            pending_thread_rotation_is_valid(
+                "codex-goal", thread_id=THREAD_ID, runner=runner
+            )
+        )
+        values["@codex_pending_thread_rotation_reason"] = (
+            "upstream_access_denied"
+        )
+        values["@codex_pending_thread_rotation_thread_id"] = THREAD_ID
+        self.assertTrue(
             pending_thread_rotation_is_valid(
                 "codex-goal", thread_id=THREAD_ID, runner=runner
             )
@@ -399,6 +717,94 @@ class RotationStateBoundaryTests(unittest.TestCase):
                 )
 
         self.assertIsNone(prompt)
+
+    def test_stale_rotation_handoff_requires_the_exact_rebound_thread_id(self):
+        old_thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        current_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+        objective = "Goal ID: FE-CREATOR-8 continue current ACTIVE plan"
+        native_goal = {
+            "source_thread_id": old_thread_id,
+            "objective": objective,
+            "status": "active",
+            "token_budget": None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_root = Path(temp_dir)
+            with patch("codex_goal_watchdog.bindings.state_dir", return_value=state_root):
+                save_thread_handoff(
+                    session="codex-goal",
+                    thread_id=old_thread_id,
+                    cwd=Path("/workspace/project"),
+                    reason="upstream_access_denied",
+                    goal_objective=objective,
+                    telemetry={"native_goal": native_goal},
+                    state_root=state_root,
+                )
+                save_session_binding(
+                    session="codex-goal",
+                    thread_id=current_thread_id,
+                    cwd=Path("/workspace/project"),
+                    verification_pending=True,
+                    last_recovery_reason="retryable_http_503",
+                    state_root=state_root,
+                )
+                prompt = pending_thread_rotation_prompt(
+                    "codex-goal",
+                    thread_id=current_thread_id,
+                    goal_state="pursuing",
+                )
+                save_thread_handoff(
+                    session="codex-goal",
+                    thread_id=old_thread_id,
+                    cwd=Path("/workspace/project"),
+                    reason="upstream_access_denied",
+                    goal_objective=objective,
+                    telemetry={
+                        "native_goal": native_goal,
+                        "rebound_thread_id": current_thread_id,
+                    },
+                    state_root=state_root,
+                )
+                rebound_prompt = pending_thread_rotation_prompt(
+                    "codex-goal",
+                    thread_id=current_thread_id,
+                    goal_state="pursuing",
+                )
+
+        self.assertIsNone(prompt)
+        self.assertIsNotNone(rebound_prompt)
+
+    def test_rotation_handoff_records_the_bound_new_thread(self):
+        old_thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_root = Path(temp_dir)
+            with patch("codex_goal_watchdog.bindings.state_dir", return_value=state_root):
+                save_thread_handoff(
+                    session="codex-goal",
+                    thread_id=old_thread_id,
+                    cwd=Path("/workspace/project"),
+                    reason="upstream_access_denied",
+                    goal_objective="Goal ID: FE-CREATOR-8",
+                    telemetry={},
+                    state_root=state_root,
+                )
+                _mark_rotation_handoff_rebound(
+                    "codex-goal",
+                    old_thread_id=old_thread_id,
+                    new_thread_id=new_thread_id,
+                    cwd=Path("/workspace/project"),
+                )
+                loaded = load_thread_handoff("codex-goal", state_root=state_root)
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(
+            new_thread_id,
+            loaded[1]["telemetry"]["rebound_thread_id"],
+        )
 
     @patch("codex_goal_watchdog.rotation_state.clear_pending_thread_rotation")
     @patch(

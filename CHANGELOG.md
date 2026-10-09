@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.32] - 2026-10-06
+
+### Fixed
+
+- Recover terminal stream failures formatted as `OPENAI返回：Selected model is ...`
+  through the standard same-thread upstream retry flow.
+
+## [0.1.33] - 2026-10-08
+
+### Fixed
+
+- Restore the exact native Goal through Codex app-server and verify its thread,
+  objective, status, and token budget before sending the continuation prompt. Keep
+  blocked Goals blocked and retain the last valid Goal snapshot if a later thread
+  contains only the legacy placeholder objective.
+- Do not classify the Responses/Chat Completions protocol mismatch as recoverable;
+  watchdog takes no automated action for that error.
+
 ## [0.1.31] - 2026-10-03
 
 ### Fixed

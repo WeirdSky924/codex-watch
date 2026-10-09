@@ -1,14 +1,11 @@
 """Independent supervisor for the tmux output monitor."""
-
 from __future__ import annotations
-
 import json
 import subprocess
 import time
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-
 from .launcher import (
     DANGEROUS_BYPASS_ARG,
     normalize_codex_args,
@@ -40,15 +37,13 @@ from .recovery import (
     DEFAULT_RESUME_PROMPT,
     IncidentLogAggregator,
     RecoveryConfig,
-    RecoveryStep,
+    RecoveryStep, THREAD_ROTATION_RECOVERY_REASONS,
     build_post_update_restart_steps,
     build_recovery_steps,
     build_shell_restart_steps,
     classify_recovery_reason,
 )
 from .sessions import (
-    ThreadTelemetryTracker,
-    find_latest_goal_objective,
     find_latest_thread_execution_profile,
 )
 from .tmux_control import (
@@ -72,15 +67,17 @@ from .tmux_control import (
 )
 from .rotation_state import (
     clear_pending_thread_rotation,
+    complete_native_goal_rotation,
     has_pending_thread_rotation,
+    pending_recovery_prompt,
     pending_thread_rotation_prompt,
+    restore_pending_native_goal,
     set_pending_thread_rotation,
+    write_thread_rotation_handoff,
 )
 
 UPDATE_SUCCESS_MARKER = "Update ran successfully! Please restart Codex."
 SHELL_COMMANDS = {"bash", "zsh", "sh", "fish"}
-
-
 class _RecoveryContentionLogger:
     """Collapse repeated lock-contention messages into one bounded record."""
 
@@ -103,8 +100,6 @@ class _RecoveryContentionLogger:
 
     def flush(self) -> None:
         self._aggregator.flush()
-
-
 def guard_once(
     *,
     session_exists: Callable[[], bool],
@@ -555,15 +550,11 @@ def _recovery_config(
             else recovery_not_before(session)
         ),
     )
-
-
 def _append_log(log_path: Path, message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"[{timestamp}] [codex-goal-guardian] {message}\n")
-
-
 def _recover_visible_incident(
     session: str,
     config: RecoveryConfig,
@@ -597,10 +588,19 @@ def _recover_visible_incident(
         not_before=time.time() + max(0, delay),
         reason=reason,
     )
-    if reason == "upstream_access_denied":
+    if reason in THREAD_ROTATION_RECOVERY_REASONS:
         set_pending_thread_rotation(
             session, recovery_attempt, reason=reason, source_thread_id=config.thread_id
         )
+    handoff_path: str | None = None
+    if reason in THREAD_ROTATION_RECOVERY_REASONS:
+        binding = load_session_binding(session)
+        handoff_path = str(write_thread_rotation_handoff(
+            session=session,
+            thread_id=config.thread_id,
+            cwd=binding.cwd if binding is not None else Path.cwd(),
+            reason=reason,
+        ))
     _append_log(
         log_path,
         "visible recoverable error claimed during guardian handoff: "
@@ -615,18 +615,20 @@ def _recover_visible_incident(
                 recovery_attempt=recovery_attempt,
                 resume_goal=goal_state != "blocked",
                 resume_stalled_goal=goal_state == "stalled",
-                goal_objective=(
-                    find_latest_goal_objective(thread_id=config.thread_id)
-                    if reason == "upstream_access_denied"
-                    else None
-                ),
+                handoff_path=handoff_path,
             ),
         )
+        if reason in THREAD_ROTATION_RECOVERY_REASONS:
+            complete_native_goal_rotation(
+                session,
+                config.thread_id,
+                reason,
+                handoff_path,
+                execute_steps,
+            )
     finally:
         _set_recovery_phase(session, "awaiting_verification", reason=reason)
     return True
-
-
 def _pending_rotation_prompt(
     session: str,
     config: RecoveryConfig,
@@ -636,25 +638,16 @@ def _pending_rotation_prompt(
         thread_id=config.thread_id,
         goal_state=recovery_goal_state_on_screen(session),
     )
-
-
 def _pending_recovery_prompt(
     session: str,
     config: RecoveryConfig,
 ) -> str | None:
-    if has_pending_thread_rotation(session, thread_id=config.thread_id):
-        rotation_prompt = _pending_rotation_prompt(session, config)
-        if rotation_prompt is not None:
-            return rotation_prompt
-    goal_state = recovery_goal_state_on_screen(session)
-    if goal_state in {"paused", "usage_limited", "stalled"}:
-        return "/goal resume"
-    binding = load_session_binding(session)
-    if binding is not None and binding.verification_pending:
-        return config.resume_prompt
-    return None
-
-
+    return pending_recovery_prompt(
+        session,
+        thread_id=config.thread_id,
+        goal_state=recovery_goal_state_on_screen(session),
+        resume_prompt=config.resume_prompt,
+    )
 def run_guardian(
     session: str,
     *,
@@ -832,14 +825,19 @@ def run_guardian(
                 if not pane_codex_running(session):
                     return False
                 prompt = _pending_recovery_prompt(session, config)
+                if prompt is None:
+                    return False
                 return codex_composer_pending(session, expected=prompt)
 
             def recover_pending_submission() -> bool:
                 nonlocal pending_retry_after
                 assert config is not None
                 prompt = _pending_recovery_prompt(session, config)
+                if prompt is None:
+                    return False
                 try:
                     with session_recovery_lock(session):
+                        restore_pending_native_goal(session, config.thread_id)
                         recovered = retry_codex_submission(
                             session,
                             expected=prompt,
@@ -849,7 +847,7 @@ def run_guardian(
                         operation="pending submission", detail="session lock"
                     )
                     return False
-                except TimeoutError as exc:
+                except (RuntimeError, TimeoutError) as exc:
                     pending_retry_after = time.monotonic() + max(
                         1, config.cooldown_seconds
                     )

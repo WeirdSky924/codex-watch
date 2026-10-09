@@ -556,9 +556,11 @@ codex-watch --safe --no-attach
 ### 第三步：创建并运行 Goal
 
 进入 Codex 后，按正常 Codex CLI 流程创建 Goal。通常 watchdog 只负责在 fatal
-error 后恢复当前固定 thread。唯一例外是 `Upstream access denied`：旧 thread
-已无法恢复时，watchdog 会从其 rollout 提取上一 Goal Objective，在全新 thread
-中要求 Codex 重新创建该 Goal 并接力。
+error 后恢复当前固定 thread。遇到 `Upstream access denied` 时，watchdog 会新建
+thread，通过 Codex app-server 读取原生 Goal，并在新 thread 中恢复后读回校验，再
+提交续接指令。handoff 保存最近一次有效
+Goal 快照；旧 thread 只有占位目标时不会覆盖它。Goal 为 blocked 时继续保持 blocked，
+watchdog 不会自动越过审核。
 
 ## 6. tmux 日常操作
 

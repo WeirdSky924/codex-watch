@@ -104,7 +104,7 @@ class TmuxControlTests(unittest.TestCase):
     def test_submit_text_retries_when_initial_codex_composer_stays_open(self):
         calls = []
         sleeps = []
-        captures = iter(("Create a plan?\n", "Working (1s)\n"))
+        captures = iter(("» Create a plan?\n", "Working (1s)\n"))
 
         def runner(command, **kwargs):
             calls.append(command)

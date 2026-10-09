@@ -78,8 +78,6 @@ LAST_RECOVERY_REASON_OPTION = "@codex_last_recovery_reason"
 
 class RecoveryInProgress(RuntimeError):
     """Another watchdog owner currently controls this session recovery."""
-
-
 @contextmanager
 def session_recovery_lock(
     target: str,
@@ -111,8 +109,6 @@ def session_recovery_lock(
 def normalize_terminal_text(value: str) -> str:
     """Remove terminal control sequences and normalize visual line wrapping."""
     return " ".join(ANSI_ESCAPE_RE.sub("", value).split())
-
-
 def tmux_recovery_count(target: str) -> int:
     result = subprocess.run(
         ["tmux", "show-option", "-v", "-t", target, "@codex_recovery_count"],
@@ -555,7 +551,9 @@ def _codex_composer_pending_text(
     """Identify an active Codex composer without mistaking transcript text."""
     lines = ANSI_ESCAPE_RE.sub("", screen).splitlines()
     prompt_indices = [
-        index for index, line in enumerate(lines) if line.lstrip().startswith("›")
+        index
+        for index, line in enumerate(lines)
+        if line.lstrip()[:1] in "›»"
     ]
     if not prompt_indices:
         return False
@@ -653,7 +651,7 @@ def _submission_pending_kind(screen: str, value: str) -> str | None:
 
     prompt_indices: list[tuple[int, str]] = []
     for index, line in enumerate(lines):
-        if line.lstrip().startswith("›"):
+        if line.lstrip()[:1] in "›»":
             prompt_indices.append((index, "codex"))
         elif SHELL_PROMPT_RE.match(line):
             prompt_indices.append((index, "shell"))

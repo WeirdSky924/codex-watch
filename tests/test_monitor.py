@@ -613,7 +613,7 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn("/compact", [step.value for step in calls[0][1]])
         self.assertEqual("0", calls[0][1][4].value)
 
-    def test_run_monitor_recovers_upstream_service_unavailable_without_compaction(
+    def test_run_monitor_recovers_openai_selected_model_failure_without_compaction(
         self,
     ):
         calls = []
@@ -621,8 +621,8 @@ class MonitorTests(unittest.TestCase):
         run_monitor(
             lines=[
                 "Pursuing goal (4m)\n",
-                "■ stream disconnected before completion: Upstream service "
-                "temporarily unavailable\n",
+                "■ stream disconnected before completion: OPENAI返回："
+                "Selected model is 布拉布拉\n",
             ],
             target="codex-goal",
             config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
@@ -714,20 +714,13 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([2], persisted_counts)
         self.assertEqual("300", calls[0][1][4].value)
 
-    def test_access_denied_rotation_rebinds_and_preserves_retry_cooldown(self):
-        new_thread_id = "550e8400-e29b-41d4-a716-446655440001"
-        calls = []
-        rebound_ids = []
-        persisted_counts = []
-        marked_rotation_counts = []
-        thread_ids = iter([THREAD_ID, THREAD_ID, new_thread_id, new_thread_id])
-        incidents = iter(
-            [
-                ("turn-ban-old", "upstream_access_denied"),
-                ("turn-ban-new", "upstream_access_denied"),
-            ]
-        )
-
+    @patch("codex_goal_watchdog.monitor.complete_native_goal_rotation")
+    def test_thread_rotation_rebinds_and_preserves_retry_cooldown(self, complete_rotation):
+        new_thread = "550e8400-e29b-41d4-a716-446655440001"
+        calls, rebound, counts = [], [], []
+        ids = iter([THREAD_ID, THREAD_ID, new_thread, new_thread])
+        incidents = iter([("turn-ban", "upstream_access_denied"),
+                          ("turn-ban-again", "upstream_access_denied")])
         run_monitor(
             lines=[
                 "Pursuing goal (4m)\n",
@@ -736,33 +729,48 @@ class MonitorTests(unittest.TestCase):
                 "■ unexpected status 502 Bad Gateway: Upstream access denied\n",
             ],
             target="codex-goal",
-            config=RecoveryConfig(
-                thread_id=THREAD_ID,
-                cooldown_seconds=300,
-                max_recoveries=0,
-            ),
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
             initial_recovery_count=2,
-            resolve_thread_id=lambda target: next(thread_ids),
-            save_thread_id=rebound_ids.append,
-            save_recovery_count=persisted_counts.append,
-            resolve_recovery_incident=lambda thread_id: next(incidents),
-            resolve_goal_objective=lambda thread_id: "Goal ID: FE-CREATOR-8",
-            mark_thread_rotation=lambda count, _reason, _thread_id: (
-                marked_rotation_counts.append(count)
-            ),
-            claim_recovery_incident_id=lambda incident_id: True,
+            resolve_thread_id=lambda _target: next(ids),
+            save_thread_id=rebound.append,
+            save_recovery_count=counts.append,
+            resolve_recovery_incident=lambda _thread: next(incidents),
+            resolve_goal_objective=lambda _thread: "Goal ID: FE-CREATOR-8",
+            mark_thread_rotation=lambda *_args: None,
+            write_thread_handoff=lambda **_kwargs: Path("/state/handoff.json"),
+            claim_recovery_incident_id=lambda _incident: True,
             now=iter([100.0, 101.0, 102.0, 103.0]).__next__,
             execute=lambda target, steps: calls.append((target, steps)),
-            log=lambda message: None,
+            log=lambda _message: None,
+        )
+        self.assertEqual([new_thread], rebound)
+        self.assertEqual([3, 3, 4], counts)
+        self.assertEqual(2, complete_rotation.call_count)
+        self.assertNotIn(THREAD_ID, calls[0][1][5].value)
+        self.assertEqual("300", calls[1][1][4].value)
+
+    @patch("codex_goal_watchdog.monitor.complete_native_goal_rotation")
+    def test_protocol_mismatch_error_does_not_trigger_recovery(self, rotate):
+        calls = []
+        message = (
+            '■ {"error":{"message":"gpt-6.1-sol requires Responses for tool calls; '
+            'this account only supports Chat Completions",'
+            '"type":"invalid_request_error"}}\n'
         )
 
-        self.assertEqual([new_thread_id], rebound_ids)
-        self.assertEqual([3, 3, 4], persisted_counts)
-        self.assertEqual([3, 4], marked_rotation_counts)
-        self.assertEqual(2, len(calls))
-        self.assertNotIn(THREAD_ID, calls[0][1][5].value)
-        self.assertIn("Goal ID: FE-CREATOR-8", calls[0][1][-1].value)
-        self.assertEqual("300", calls[1][1][4].value)
+        run_monitor(
+            lines=["Pursuing goal (4m)\n", message],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            initial_recovery_count=2,
+            execute=lambda *args: calls.append(args),
+            mark_thread_rotation=lambda *args: self.fail("must not mark rotation"),
+            write_thread_handoff=lambda **kwargs: self.fail("must not write handoff"),
+            log=lambda _message: None,
+        )
+
+        self.assertEqual([], calls)
+        rotate.assert_not_called()
 
     def test_run_monitor_rebinds_after_clear_before_recovery(self):
         new_thread_id = "550e8400-e29b-41d4-a716-446655440001"

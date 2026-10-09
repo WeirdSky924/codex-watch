@@ -15,7 +15,6 @@ from typing import BinaryIO
 from .bindings import (
     load_session_binding,
     save_binding_runtime_state,
-    save_thread_handoff,
 )
 from .execution_profile import (
     RecoveryIncident,
@@ -41,7 +40,6 @@ from .sessions import (
     ThreadTelemetry,
     ThreadTelemetryTracker,
     find_active_cli_thread_id,
-    find_latest_goal_objective,
     find_latest_task_failure,
 )
 from .tmux_control import (
@@ -67,12 +65,13 @@ from .tmux_control import (
 from .tmux_control import recovery_goal_state_on_screen
 from .launcher import tmux_pane_identity as _tmux_pane_identity
 from .rotation_state import (
+    complete_native_goal_rotation,
+    find_rotation_goal_objective,
     pending_thread_rotation_marker as _pending_thread_rotation_marker,
     save_rebound_thread_id as _save_tmux_thread_id,
     set_pending_thread_rotation as _set_pending_thread_rotation,
+    write_thread_rotation_handoff,
 )
-
-
 ROLLING_BUFFER_SIZE = 8192
 GOAL_RESUME_STATUS_MARKERS = (
     "Goal paused (/goal resume)",
@@ -81,8 +80,6 @@ GOAL_RESUME_STATUS_MARKERS = (
 GOAL_RESUME_RETRY_SECONDS = 10
 RECOVERABLE_GOAL_STATES = {"pursuing", "blocked", "stalled"}
 MONITOR_TICK = object()
-
-
 def recovery_allowed_for_goal_state(state: str | None) -> bool:
     return state in RECOVERABLE_GOAL_STATES
 
@@ -344,36 +341,11 @@ def run_monitor(
     ) -> str | None:
         if write_thread_handoff is None:
             return None
-        objective = (
-            resolve_goal_objective(config.thread_id)
-            if resolve_goal_objective is not None
-            else None
-        )
-        metrics = {}
-        if telemetry is not None:
-            metrics = {
-                "rollout_path": str(telemetry.rollout_path),
-                "rollout_bytes": telemetry.rollout_bytes,
-                "total_tokens": telemetry.total_tokens,
-                "context_tokens": telemetry.context_tokens,
-                "context_window": telemetry.context_window,
-                "compaction_count": telemetry.compaction_count,
-                "tokens_at_last_progress": telemetry.tokens_at_last_progress,
-                "last_event_at": telemetry.last_event_at,
-                "last_progress_at": telemetry.last_progress_at,
-                "turn_active": telemetry.turn_active,
-                "repeated_content_count": telemetry.repeated_content_count,
-                "repeated_command_count": telemetry.repeated_command_count,
-                "repeated_content_signature": telemetry.repeated_content_signature,
-                "repeated_command_signature": telemetry.repeated_command_signature,
-            }
         return str(
             write_thread_handoff(
                 session=target,
                 thread_id=config.thread_id,
                 reason=reason,
-                goal_objective=objective,
-                telemetry=metrics,
             )
         )
 
@@ -427,15 +399,18 @@ def run_monitor(
                     recovery_attempt=controller.recovery_count,
                     resume_goal=goal_state != "blocked",
                     resume_stalled_goal=goal_state == "stalled",
-                    goal_objective=(
-                        resolve_goal_objective(config.thread_id)
-                        if resolve_goal_objective is not None
-                        else None
-                    ),
                     handoff_path=handoff_path,
                     rotation_detail=detail,
                 ),
             )
+            if handoff_path is not None:
+                complete_native_goal_rotation(
+                    target,
+                    config.thread_id,
+                    detail,
+                    str(handoff_path),
+                    run_execute,
+                )
         finally:
             finalize_recovery_phase(detail)
         return True
@@ -585,8 +560,8 @@ def run_monitor(
                     save=save_profile,
                 )
             goal_objective = (
-                resolve_goal_objective(config.thread_id)
-                if event.reason == "upstream_access_denied"
+                find_rotation_goal_objective(config.thread_id)
+                if event.reason in THREAD_ROTATION_RECOVERY_REASONS
                 and resolve_goal_objective is not None
                 else None
             )
@@ -810,7 +785,12 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
 
     def write_handoff(**kwargs) -> Path:
         cwd = pane_identity[1] if pane_identity is not None else Path.cwd()
-        return save_thread_handoff(cwd=cwd, **kwargs)
+        return write_thread_rotation_handoff(
+            session=kwargs["session"],
+            thread_id=kwargs["thread_id"],
+            cwd=cwd,
+            reason=kwargs["reason"],
+        )
 
     def save_verification_state(pending: bool, baseline: int) -> None:
         save_binding_runtime_state(
@@ -883,9 +863,7 @@ def monitor_stdin(target: str, config: RecoveryConfig) -> None:
         claim_recovery_incident_id=lambda incident_id: (
             _claim_tmux_recovery_incident_id(target, incident_id)
         ),
-        resolve_goal_objective=lambda thread_id: find_latest_goal_objective(
-            thread_id=thread_id
-        ),
+        resolve_goal_objective=find_rotation_goal_objective,
         mark_thread_rotation=mark_thread_rotation,
         resolve_thread_telemetry=resolve_thread_telemetry,
         write_thread_handoff=write_handoff,

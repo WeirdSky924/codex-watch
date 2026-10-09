@@ -17,6 +17,10 @@ DEFAULT_STALL_PATTERN = (
 MODEL_AT_CAPACITY_PATTERN = (
     "Selected model is at capacity. Please try a different model"
 )
+OPENAI_SELECTED_MODEL_ERROR_RE = re.compile(
+    r"openai\s*返回\s*[:：]\s*selected\s+model\s+is\b",
+    re.IGNORECASE,
+)
 SERVERS_OVERLOADED_PATTERN = (
     "Our servers are currently overloaded. Please try again later."
 )
@@ -44,7 +48,10 @@ THREAD_ROTATION_RECOVERY_REASONS = {
 # Only these reasons may leave a durable marker that asks guardian to finish
 # a new-thread handoff. Older health-threshold markers are stale state.
 PERSISTED_THREAD_ROTATION_REASONS = frozenset(
-    {"upstream_access_denied", "compaction_timeout"}
+    {
+        "upstream_access_denied",
+        "compaction_timeout",
+    }
 )
 COMPACTION_RECOVERY_REASONS = {
     "codex_upstream_stalled",
@@ -62,15 +69,15 @@ def build_thread_rotation_prompt(
     rotation_reason: str = "upstream_access_denied",
     handoff_path: str | None = None,
 ) -> str:
-    objective = goal_objective or (
-        "未能从旧 thread 的 rollout 提取 Goal Objective。请从最新工作树、"
-        "唯一 ACTIVE Plan 和项目 canonical 恢复文档识别仍在进行的目标。"
-    )
+    if not isinstance(goal_objective, str) or not goal_objective.strip():
+        raise ValueError("native Goal objective is required for thread rotation")
+    objective = goal_objective.strip()
     state_instruction = (
-        "上一 Goal 处于 blocked 人工审核态。重新创建 Goal 只用于保留目标与恢复"
-        "上下文，不得继续产品执行或绕过审核；保持 blocked 边界并等待用户明确处理。"
+        "native Goal 仍处于 blocked 人工审核态。保持该状态，不要执行 Goal；"
+        "等待用户明确处理。"
         if not resume_goal
-        else "上一 Goal 可继续执行；完成状态校准后从最新可执行入口接力推进。"
+        else "native Goal 已恢复。完成状态校准后继续现有 Goal，"
+        "不要创建、清除或替换 Goal。"
     )
     encoded_objective = json.dumps(objective, ensure_ascii=False)
     reason_text = (
@@ -86,15 +93,15 @@ def build_thread_rotation_prompt(
     )
     return (
         f"上一 Codex thread 因 {reason_text}，禁止恢复或重试"
-        "旧 thread。请创建一个不设置 token budget 的新 Goal，并持续接力执行。"
+        "旧 thread。Codex app-server 已在当前 thread 恢复原生 Goal。"
         f"{handoff_instruction}"
-        "上一 Goal Objective 原文采用 JSON 字符串无损编码，解码后原样使用："
+        "恢复的 Goal Objective 原文采用 JSON 字符串无损编码，解码后原样使用："
         f"{encoded_objective}。"
         "恢复前必须重新核对状态，优先级为：最新用户要求 > 当前工作树 > 唯一 "
         "ACTIVE Plan State 及 current executable entry > canonical 规则/规范 > "
         "handoff 缓存。计划或 handoff 可能滞后；发生冲突时使用更高优先级证据，"
-        "不得恢复历史授权、旧 checkpoint 或重复已完成操作。先检查现状，再用上述"
-        f" Objective 原文创建 Goal。{state_instruction}"
+        "不得恢复历史授权、旧 checkpoint 或重复已完成操作。先检查现状，再从最新"
+        f"可执行入口接力。{state_instruction}"
     )
 RETRYABLE_HTTP_CODES = (
     401,
@@ -141,6 +148,8 @@ def classify_recovery_message(message: str) -> str | None:
         return None
     if MODEL_AT_CAPACITY_PATTERN in message:
         return "model_at_capacity"
+    if OPENAI_SELECTED_MODEL_ERROR_RE.search(message):
+        return "retryable_upstream_error"
     if SERVERS_OVERLOADED_PATTERN in message:
         return "servers_overloaded"
     if DEFAULT_STALL_PATTERN in message:
@@ -590,17 +599,6 @@ def build_recovery_steps(
             RecoveryStep("shell_command", fresh_command),
             RecoveryStep("wait_codex", "30"),
             RecoveryStep("sleep", str(config.startup_wait_seconds)),
-            RecoveryStep(
-                "text",
-                build_thread_rotation_prompt(
-                    goal_objective,
-                    resume_goal=resume_goal,
-                    rotation_reason=(
-                        rotation_detail or reason
-                    ),
-                    handoff_path=handoff_path,
-                ),
-            ),
         ]
     if reason not in COMPACTION_RECOVERY_REASONS:
         return [

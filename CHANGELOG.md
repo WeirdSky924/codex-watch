@@ -2,12 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.32] - 2026-10-06
+## [0.1.34] - 2026-10-10
 
 ### Fixed
 
-- Recover terminal stream failures formatted as `OPENAI返回：Selected model is ...`
-  through the standard same-thread upstream retry flow.
+- Retry Responses/Chat Completions protocol incompatibility errors on the pinned
+  thread after a 30-minute wait on every attempt, independently of the global
+  recovery cooldown.
 
 ## [0.1.33] - 2026-10-08
 
@@ -19,6 +20,13 @@ All notable changes to this project will be documented in this file.
   contains only the legacy placeholder objective.
 - Do not classify the Responses/Chat Completions protocol mismatch as recoverable;
   watchdog takes no automated action for that error.
+
+## [0.1.32] - 2026-10-06
+
+### Fixed
+
+- Recover terminal stream failures formatted as `OPENAI返回：Selected model is ...`
+  through the standard same-thread upstream retry flow.
 
 ## [0.1.31] - 2026-10-03
 

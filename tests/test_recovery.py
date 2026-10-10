@@ -260,11 +260,19 @@ class RecoveryControllerTests(unittest.TestCase):
             'for tool calls; this account only supports Chat Completions",'
             '"type":"invalid_request_error"}}'
         )
-        self.assertIsNone(classify_recovery_message(message))
-        self.assertIsNone(classify_recovery_reason(f"■ {message}"))
+        self.assertEqual(
+            "protocol_incompatible_retry",
+            classify_recovery_message(message),
+        )
+        self.assertEqual(
+            "protocol_incompatible_retry",
+            classify_recovery_reason(f"■ {message}"),
+        )
         controller = RecoveryController(RecoveryConfig())
-        self.assertIsNone(controller.observe(f"■ {message}", now=100.0))
-        self.assertEqual(0, controller.recovery_count)
+        event = controller.observe(f"■ {message}", now=100.0)
+        self.assertIsNotNone(event)
+        self.assertEqual("protocol_incompatible_retry", event.reason)
+        self.assertEqual(1, controller.recovery_count)
 
     def test_classifies_server_overload_rollout_failure_message(self):
         message = (
@@ -666,6 +674,33 @@ class RecoveryStepTests(unittest.TestCase):
                 self.assertEqual(RecoveryStep("sleep", "0"), first_steps[4])
                 self.assertEqual(RecoveryStep("wait_shell", "30"), retry_steps[3])
                 self.assertEqual(RecoveryStep("sleep", "300"), retry_steps[4])
+
+    def test_protocol_incompatibility_waits_30_minutes_before_every_retry(self):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        config = RecoveryConfig(
+            thread_id=thread_id,
+            primary_model="gpt-6.1-sol",
+            primary_reasoning_effort="max",
+            cooldown_seconds=300,
+        )
+
+        first_steps = build_recovery_steps(
+            config,
+            reason="protocol_incompatible_retry",
+            recovery_attempt=1,
+        )
+        retry_steps = build_recovery_steps(
+            config,
+            reason="protocol_incompatible_retry",
+            recovery_attempt=2,
+        )
+        for attempt, steps in enumerate((first_steps, retry_steps), start=1):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(RecoveryStep("sleep", "1800"), steps[4])
+                command = next(step.value for step in steps if step.kind == "shell_command")
+                self.assertIn(f"resume {thread_id}", command)
+                self.assertIn("gpt-6.1-sol", command)
+                self.assertNotIn("/compact", [step.value for step in steps])
 
     def test_upstream_error_recovery_restarts_sol_without_compaction(self):
         config = RecoveryConfig(

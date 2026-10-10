@@ -21,6 +21,11 @@ OPENAI_SELECTED_MODEL_ERROR_RE = re.compile(
     r"openai\s*返回\s*[:：]\s*selected\s+model\s+is\b",
     re.IGNORECASE,
 )
+PROTOCOL_INCOMPATIBILITY_ERROR_RE = re.compile(
+    r"requires\s+responses\s+for\s+tool\s+calls.*"
+    r"only\s+supports\s+chat\s+completions",
+    re.IGNORECASE | re.DOTALL,
+)
 SERVERS_OVERLOADED_PATTERN = (
     "Our servers are currently overloaded. Please try again later."
 )
@@ -41,6 +46,8 @@ PLAIN_UPSTREAM_REQUEST_FAILURE_PATTERN = (
     "stream disconnected before completion: Upstream request failed"
 )
 THREAD_HEALTH_ROTATION_REASON = "thread_health_rotation"
+PROTOCOL_INCOMPATIBILITY_RETRY_REASON = "protocol_incompatible_retry"
+PROTOCOL_INCOMPATIBILITY_RETRY_SECONDS = 30 * 60
 THREAD_ROTATION_RECOVERY_REASONS = {
     "upstream_access_denied",
     THREAD_HEALTH_ROTATION_REASON,
@@ -146,6 +153,8 @@ def classify_recovery_message(message: str) -> str | None:
     """Classify one structured task failure without terminal row markers."""
     if MANUAL_API_DISABLED_PATTERN.search(message):
         return None
+    if PROTOCOL_INCOMPATIBILITY_ERROR_RE.search(message):
+        return PROTOCOL_INCOMPATIBILITY_RETRY_REASON
     if MODEL_AT_CAPACITY_PATTERN in message:
         return "model_at_capacity"
     if OPENAI_SELECTED_MODEL_ERROR_RE.search(message):
@@ -177,6 +186,18 @@ def classify_recovery_message(message: str) -> str | None:
     if RETRYABLE_NETWORK_RE.search(message):
         return "retryable_network"
     return None
+
+
+def recovery_delay_seconds(
+    reason: str,
+    recovery_attempt: int,
+    default_cooldown_seconds: int,
+) -> int:
+    if reason == PROTOCOL_INCOMPATIBILITY_RETRY_REASON:
+        return PROTOCOL_INCOMPATIBILITY_RETRY_SECONDS
+    if recovery_attempt > 1:
+        return max(0, default_cooldown_seconds)
+    return 0
 
 
 def classify_recovery_reason(text: str) -> str | None:
@@ -565,7 +586,11 @@ def build_recovery_steps(
     """Build tmux actions for model fallback, compaction, and resume."""
     if not config.thread_id:
         raise ValueError("recovery requires a pinned Codex thread ID")
-    restart_delay = config.cooldown_seconds if recovery_attempt > 1 else 0
+    restart_delay = recovery_delay_seconds(
+        reason,
+        recovery_attempt,
+        config.cooldown_seconds,
+    )
     compact_command = shlex.join(
         build_codex_command(
             model=config.compact_model,

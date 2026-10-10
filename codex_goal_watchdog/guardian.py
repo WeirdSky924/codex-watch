@@ -42,6 +42,7 @@ from .recovery import (
     build_recovery_steps,
     build_shell_restart_steps,
     classify_recovery_reason,
+    recovery_delay_seconds,
 )
 from .sessions import (
     find_latest_thread_execution_profile,
@@ -581,7 +582,11 @@ def _recover_visible_incident(
     goal_state = recovery_goal_state_on_screen(session)
     recovery_attempt = _next_recovery_attempt(session)
     _mark_verification_pending(session, config)
-    delay = config.cooldown_seconds if recovery_attempt > 1 else 0
+    delay = recovery_delay_seconds(
+        reason,
+        recovery_attempt,
+        config.cooldown_seconds,
+    )
     _set_recovery_phase(
         session,
         "cooldown" if delay else "action",

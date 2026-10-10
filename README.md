@@ -877,6 +877,7 @@ Codex TUI 中带 `■` 的 fatal error 行会触发恢复；`⚠ Selected model 
 | connection reset/closed、broken pipe、gateway/request timeout、unexpected EOF | 使用 primary model 重启固定 thread |
 | 结构化 `upstream_error` JSON | 使用 primary model 重启固定 thread |
 | `Selected model is at capacity` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试 |
+| `requires Responses for tool calls; this account only supports Chat Completions` | 等待 30 分钟后使用 primary model 重试当前固定 thread；再次出现时仍等待 30 分钟 |
 | `Our servers are currently overloaded` | 第一次立即使用 primary model 恢复；再次出现时等待冷静期重试，不执行 compact |
 | `Upstream service temporarily unavailable`、`service temporarily unavailable` | 使用 primary model 恢复当前固定 thread；再次出现时等待冷静期重试，不执行 compact |
 | Codex 出现更新选择页 | 选择官方更新、等待返回 Shell、核验实际安装版本，再恢复固定 thread；不计入 fatal recovery 次数，也不执行 300 秒冷静期 |

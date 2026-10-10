@@ -728,7 +728,7 @@ class GuardianTests(unittest.TestCase):
             _recovery_reason_on_screen("codex-goal", runner=runner),
         )
 
-    def test_visible_recovery_ignores_protocol_incompatibility_error(self):
+    def test_visible_recovery_classifies_protocol_incompatibility_for_retry(self):
         def runner(command, **kwargs):
             class Result:
                 returncode = 0
@@ -741,7 +741,10 @@ class GuardianTests(unittest.TestCase):
 
             return Result()
 
-        self.assertIsNone(_recovery_reason_on_screen("codex-goal", runner=runner))
+        self.assertEqual(
+            "protocol_incompatible_retry",
+            _recovery_reason_on_screen("codex-goal", runner=runner),
+        )
 
     def test_guardian_reads_blocked_state_before_recovery(self):
         def runner(command, **kwargs):

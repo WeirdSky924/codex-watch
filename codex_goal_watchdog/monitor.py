@@ -35,6 +35,7 @@ from .recovery import (
     build_recovery_steps,
     classify_recovery_reason,
     handle_compaction_upstream_failure,
+    recovery_delay_seconds,
 )
 from .sessions import (
     ThreadTelemetry,
@@ -371,7 +372,11 @@ def run_monitor(
         handoff_path = create_handoff(reason=detail, telemetry=telemetry)
         preserve_recovery_count_on_rebind = True
         awaiting_verified_success = True
-        delay = config.cooldown_seconds if controller.recovery_count > 1 else 0
+        delay = recovery_delay_seconds(
+            THREAD_HEALTH_ROTATION_REASON,
+            controller.recovery_count,
+            config.cooldown_seconds,
+        )
         phase_now = observed_at if observed_at is not None else time.time()
         persist_recovery_phase(
             "cooldown" if delay else "action",
@@ -588,10 +593,10 @@ def run_monitor(
                         True,
                         verified_event_baselines[config.thread_id],
                     )
-                recovery_delay = (
-                    config.cooldown_seconds
-                    if controller.recovery_count > 1
-                    else 0
+                recovery_delay = recovery_delay_seconds(
+                    event.reason,
+                    controller.recovery_count,
+                    config.cooldown_seconds,
                 )
                 persist_recovery_phase(
                     "cooldown" if recovery_delay else "action",

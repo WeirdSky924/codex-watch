@@ -749,8 +749,7 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn(THREAD_ID, calls[0][1][5].value)
         self.assertEqual("300", calls[1][1][4].value)
 
-    @patch("codex_goal_watchdog.monitor.complete_native_goal_rotation")
-    def test_protocol_mismatch_error_does_not_trigger_recovery(self, rotate):
+    def test_protocol_mismatch_waits_30_minutes_and_retries_pinned_thread(self):
         calls = []
         message = (
             '■ {"error":{"message":"gpt-6.1-sol requires Responses for tool calls; '
@@ -761,16 +760,19 @@ class MonitorTests(unittest.TestCase):
         run_monitor(
             lines=["Pursuing goal (4m)\n", message],
             target="codex-goal",
-            config=RecoveryConfig(thread_id=THREAD_ID),
-            initial_recovery_count=2,
+            config=RecoveryConfig(thread_id=THREAD_ID, cooldown_seconds=300),
             execute=lambda *args: calls.append(args),
             mark_thread_rotation=lambda *args: self.fail("must not mark rotation"),
             write_thread_handoff=lambda **kwargs: self.fail("must not write handoff"),
             log=lambda _message: None,
         )
 
-        self.assertEqual([], calls)
-        rotate.assert_not_called()
+        self.assertEqual(1, len(calls))
+        steps = calls[0][1]
+        self.assertEqual("1800", steps[4].value)
+        command = next(step.value for step in steps if step.kind == "shell_command")
+        self.assertIn(f"resume {THREAD_ID}", command)
+        self.assertNotIn("/compact", [step.value for step in steps])
 
     def test_run_monitor_rebinds_after_clear_before_recovery(self):
         new_thread_id = "550e8400-e29b-41d4-a716-446655440001"

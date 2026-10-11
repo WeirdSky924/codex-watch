@@ -347,7 +347,7 @@ class RecoveryStepTests(unittest.TestCase):
         steps = build_startup_update_steps(codex_command, "0.145.0")
 
         self.assertEqual("key", steps[0].kind)
-        self.assertEqual("1", steps[0].value)
+        self.assertEqual("Enter", steps[0].value)
         self.assertEqual("wait_shell", steps[1].kind)
         self.assertEqual(RecoveryStep("ensure_codex_version", "0.145.0"), steps[2])
         self.assertEqual("codex --no-alt-screen -m gpt-5.6-sol", steps[3].value)
@@ -363,7 +363,7 @@ class RecoveryStepTests(unittest.TestCase):
 
         steps = build_codex_update_steps(config, "0.145.0")
 
-        self.assertEqual(RecoveryStep("key", "1"), steps[0])
+        self.assertEqual(RecoveryStep("key", "Enter"), steps[0])
         self.assertEqual(RecoveryStep("ensure_codex_version", "0.145.0"), steps[2])
         self.assertIn(config.thread_id, steps[3].value)
         self.assertEqual("resume_goal_or_prompt", steps[-1].kind)

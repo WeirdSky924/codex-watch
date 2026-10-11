@@ -434,7 +434,7 @@ def build_startup_update_steps(
 ) -> list[RecoveryStep]:
     """Install a startup update before Codex has created a thread."""
     return [
-        RecoveryStep("key", "1"),
+        RecoveryStep("key", "Enter"),
         RecoveryStep("wait_shell", "300"),
         RecoveryStep("ensure_codex_version", expected_version),
         RecoveryStep("shell_command", shlex.join(codex_command)),
@@ -481,7 +481,7 @@ def build_codex_update_steps(
 ) -> list[RecoveryStep]:
     """Accept the official updater and restore only after version verification."""
     return [
-        RecoveryStep("key", "1"),
+        RecoveryStep("key", "Enter"),
         *build_codex_update_completion_steps(
             config,
             expected_version,

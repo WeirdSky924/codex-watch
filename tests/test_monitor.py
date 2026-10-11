@@ -149,7 +149,7 @@ class MonitorTests(unittest.TestCase):
             update_codex=lambda target, version: update_calls.append(
                 (target, version)
             ),
-            now=iter([100.0, 101.0, 102.0]).__next__,
+            now=lambda: 100.0,
             log=messages.append,
         )
 
@@ -536,6 +536,26 @@ class MonitorTests(unittest.TestCase):
         )
 
         self.assertEqual([("codex-goal", "0.145.0")], updates)
+
+    def test_run_monitor_executes_update_for_current_codex_picker_format(self):
+        updates = []
+
+        run_monitor(
+            lines=[
+                "  Update available · 0.162.0 → 0.162.1\n",
+                "  Release notes: https://github.com/openai/codex/releases/latest\n",
+                "› 1. Update now (runs `npm install -g @openai/codex`)\n",
+                "  2. Skip\n3. Skip until next version\n",
+                "  enter continue · esc skip\n",
+            ],
+            target="codex-goal",
+            config=RecoveryConfig(thread_id=THREAD_ID),
+            now=lambda: 100.0,
+            update_codex=lambda target, version: updates.append((target, version)),
+            log=lambda message: None,
+        )
+
+        self.assertEqual([("codex-goal", "0.162.1")], updates)
 
     def test_run_monitor_detects_wrapped_ansi_stall_output(self):
         calls = []

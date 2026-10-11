@@ -365,7 +365,7 @@ class ConsoleEntrypointTests(unittest.TestCase):
 
         self.assertEqual(0, result)
         update_steps = execute_steps_mock.call_args.args[1]
-        self.assertEqual("1", update_steps[0].value)
+        self.assertEqual("Enter", update_steps[0].value)
         self.assertEqual("ensure_codex_version", update_steps[2].kind)
         self.assertEqual("0.145.0", update_steps[2].value)
 

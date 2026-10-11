@@ -48,8 +48,10 @@ GOAL_STATE_MARKERS = (
     ("achieved", "Goal completed"),
 )
 UPDATE_PROMPT_RE = re.compile(
-    r"Update available!\s+v?(?P<current>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
-    r"\s*->\s*v?(?P<latest>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
+    r"Update available(?:!|\s*[·•])\s+"
+    r"v?(?P<current>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
+    r"\s*(?:->|→)\s*"
+    r"v?(?P<latest>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
 )
 CODEX_VERSION_RE = re.compile(
     r"\b(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b"
@@ -284,6 +286,7 @@ def goal_state_from_text(text: str) -> str | None:
 
 
 def update_prompt_version(text: str) -> str | None:
+    text = ANSI_ESCAPE_RE.sub("", text)
     match = UPDATE_PROMPT_RE.search(text)
     if (
         match is None
@@ -300,7 +303,7 @@ def _current_update_prompt_version(text: str) -> str | None:
     candidates: list[int] = []
     offset = 0
     for line in text.splitlines(keepends=True):
-        marker_index = line.find("Update available!")
+        marker_index = line.find("Update available")
         if marker_index >= 0 and not any(
             character.isalnum() or character == "_"
             for character in line[:marker_index]

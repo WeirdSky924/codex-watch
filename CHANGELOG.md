@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.35] - 2026-10-12
+
+### Fixed
+
+- Detect the current Codex update picker format and confirm its selected
+  `Update now` option with Enter before verifying and restarting the pinned thread.
+
 ## [0.1.34] - 2026-10-10
 
 ### Fixed

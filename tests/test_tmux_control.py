@@ -508,6 +508,19 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual("0.145.0", update_prompt_version(screen))
         self.assertIsNone(update_prompt_version("Update available! in documentation"))
 
+    def test_update_prompt_version_accepts_current_codex_picker_format(self):
+        screen = (
+            "  Update available · 0.162.0 → 0.162.1\n"
+            "  Release notes: https://github.com/openai/codex/releases/latest\n"
+            "\n"
+            "› 1. Update now (runs `npm install -g @openai/codex`)\n"
+            "  2. Skip\n"
+            "  3. Skip until next version\n"
+            "  enter continue · esc skip\n"
+        )
+
+        self.assertEqual("0.162.1", update_prompt_version(screen))
+
     def test_capture_update_prompt_version_reads_tmux_screen(self):
         def runner(command, **kwargs):
             class Result:
@@ -521,6 +534,25 @@ class TmuxControlTests(unittest.TestCase):
 
         self.assertEqual(
             "0.145.0",
+            capture_update_prompt_version("codex-goal", runner=runner),
+        )
+
+    def test_capture_update_prompt_version_reads_current_codex_picker(self):
+        def runner(command, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = (
+                    "  Update available · 0.162.0 → 0.162.1\n"
+                    "  Release notes: https://github.com/openai/codex/releases/latest\n"
+                    "› 1. Update now (runs `npm install -g @openai/codex`)\n"
+                    "  2. Skip\n3. Skip until next version\n"
+                    "  enter continue · esc skip\n"
+                )
+
+            return Result()
+
+        self.assertEqual(
+            "0.162.1",
             capture_update_prompt_version("codex-goal", runner=runner),
         )
 

@@ -535,12 +535,13 @@ def _submit_codex_text(
     sleeper=time.sleep,
 ) -> None:
     """Submit text only while the pane is owned by Codex."""
-    pane_command = _current_pane_command(target, runner=runner)
-    if pane_command in SHELL_COMMANDS:
+    if not pane_codex_running(target, runner=runner):
         if value.strip() == "/quit":
             return
+        pane_command = _current_pane_command(target, runner=runner)
         raise TimeoutError(
-            f"refusing to send Codex text to {target}: pane is {pane_command}"
+            f"refusing to send Codex text to {target}: Codex is not running "
+            f"(pane is {pane_command or '<unknown>'})"
         )
     _submit_text(target, value, runner=runner, sleeper=sleeper)
 
@@ -632,13 +633,21 @@ def _submit_shell_command(
     sleeper=time.sleep,
 ) -> None:
     """Submit a generated command after resetting any Bash continuation line."""
-    pane_command = _current_pane_command(target, runner=runner)
-    if pane_command not in SHELL_COMMANDS:
+    if not pane_shell_ready(target, runner=runner):
+        pane_command = _current_pane_command(target, runner=runner)
         raise TimeoutError(
-            f"refusing to send Shell command to {target}: "
-            f"pane is {pane_command or '<unknown>'}"
+            f"refusing to send Shell command to {target}: pane is not an "
+            f"idle shell (current command is {pane_command or '<unknown>'})"
         )
     runner(["tmux", "send-keys", "-t", target, "C-c"], check=True)
+    sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
+    if not pane_shell_ready(target, runner=runner):
+        pane_command = _current_pane_command(target, runner=runner)
+        raise TimeoutError(
+            f"refusing to send Shell command to {target}: pane stopped being "
+            f"an idle shell after interrupt (current command is "
+            f"{pane_command or '<unknown>'})"
+        )
     runner(["tmux", "send-keys", "-t", target, "-l", value], check=True)
     sleeper(TEXT_SUBMIT_SETTLE_SECONDS)
     runner(["tmux", "send-keys", "-t", target, "Enter"], check=True)

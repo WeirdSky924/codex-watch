@@ -339,10 +339,13 @@ class TmuxControlTests(unittest.TestCase):
                         pass
 
     @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
-    def test_submit_codex_text_refuses_to_inject_prompt_into_shell(self, _command_mock):
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=False)
+    def test_submit_codex_text_refuses_to_inject_prompt_into_shell(
+        self, _codex_running_mock, _command_mock
+    ):
         calls = []
 
-        with self.assertRaisesRegex(TimeoutError, "Codex text"):
+        with self.assertRaisesRegex(TimeoutError, "Codex is not running"):
             _submit_codex_text(
                 "codex-goal",
                 '继续执行，检查 "当前状态"。',
@@ -352,8 +355,27 @@ class TmuxControlTests(unittest.TestCase):
 
         self.assertEqual([], calls)
 
+    @patch("codex_goal_watchdog.tmux_control._submit_text")
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=True)
+    def test_submit_codex_text_accepts_shell_wrapper_with_codex_child(
+        self, _codex_running_mock, submit_mock
+    ):
+        runner = lambda command, **kwargs: None
+        sleeper = lambda seconds: None
+
+        _submit_codex_text(
+            "codex-goal", "/goal resume", runner=runner, sleeper=sleeper
+        )
+
+        submit_mock.assert_called_once_with(
+            "codex-goal", "/goal resume", runner=runner, sleeper=sleeper
+        )
+
     @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
-    def test_submit_codex_quit_is_skipped_when_codex_already_exited(self, _command_mock):
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=False)
+    def test_submit_codex_quit_is_skipped_when_codex_already_exited(
+        self, _codex_running_mock, _command_mock
+    ):
         calls = []
 
         _submit_codex_text(
@@ -365,8 +387,10 @@ class TmuxControlTests(unittest.TestCase):
 
         self.assertEqual([], calls)
 
-    @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
-    def test_submit_shell_command_cancels_bash_continuation_before_launch(self, _command_mock):
+    @patch("codex_goal_watchdog.tmux_control.pane_shell_ready", return_value=True)
+    def test_submit_shell_command_cancels_bash_continuation_before_launch(
+        self, shell_ready_mock
+    ):
         calls = []
         sleeps = []
 
@@ -385,7 +409,47 @@ class TmuxControlTests(unittest.TestCase):
             ],
             calls,
         )
-        self.assertEqual([0.5], sleeps)
+        self.assertEqual([0.5, 0.5], sleeps)
+        self.assertEqual(2, shell_ready_mock.call_count)
+
+    @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
+    @patch("codex_goal_watchdog.tmux_control.pane_shell_ready", return_value=False)
+    def test_submit_shell_command_refuses_shell_wrapper_with_codex_child(
+        self, _shell_ready_mock, _command_mock
+    ):
+        calls = []
+
+        with self.assertRaisesRegex(TimeoutError, "not an idle shell"):
+            _submit_shell_command(
+                "codex-goal",
+                "env codex resume abc",
+                runner=lambda command, **kwargs: calls.append(command),
+                sleeper=lambda seconds: None,
+            )
+
+        self.assertEqual([], calls)
+
+    @patch("codex_goal_watchdog.tmux_control._current_pane_command", return_value="bash")
+    @patch(
+        "codex_goal_watchdog.tmux_control.pane_shell_ready",
+        side_effect=[True, False],
+    )
+    def test_submit_shell_command_rechecks_pane_after_interrupt(
+        self, _shell_ready_mock, _command_mock
+    ):
+        calls = []
+
+        with self.assertRaisesRegex(TimeoutError, "stopped being an idle shell"):
+            _submit_shell_command(
+                "codex-goal",
+                "env codex resume abc",
+                runner=lambda command, **kwargs: calls.append(command),
+                sleeper=lambda seconds: None,
+            )
+
+        self.assertEqual(
+            [["tmux", "send-keys", "-t", "codex-goal", "C-c"]], calls
+        )
 
     def test_active_turn_is_not_rotated_for_no_progress_tokens(self):
         calls = []
@@ -679,7 +743,10 @@ class TmuxControlTests(unittest.TestCase):
             calls,
         )
 
-    def test_handle_goal_prompt_sends_fallback_prompt_when_no_picker(self):
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=True)
+    def test_handle_goal_prompt_sends_fallback_prompt_when_no_picker(
+        self, _codex_running_mock
+    ):
         calls = []
 
         def runner(command, **kwargs):
@@ -702,14 +769,6 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
-                [
-                    "tmux",
-                    "display-message",
-                    "-p",
-                    "-t",
-                    "codex-goal",
-                    "#{pane_current_command}",
-                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "继续 goal"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
@@ -858,7 +917,10 @@ class TmuxControlTests(unittest.TestCase):
             calls,
         )
 
-    def test_handle_goal_prompt_uses_latest_goal_state_from_screen_history(self):
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=True)
+    def test_handle_goal_prompt_uses_latest_goal_state_from_screen_history(
+        self, _codex_running_mock
+    ):
         calls = []
         sleeps = []
 
@@ -886,21 +948,14 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
-                [
-                    "tmux",
-                    "display-message",
-                    "-p",
-                    "-t",
-                    "codex-goal",
-                    "#{pane_current_command}",
-                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
             calls,
         )
 
-    def test_handle_goal_prompt_resumes_paused_goal(self):
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=True)
+    def test_handle_goal_prompt_resumes_paused_goal(self, _codex_running_mock):
         calls = []
         sleeps = []
 
@@ -925,14 +980,6 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
-                [
-                    "tmux",
-                    "display-message",
-                    "-p",
-                    "-t",
-                    "codex-goal",
-                    "#{pane_current_command}",
-                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
@@ -987,7 +1034,10 @@ class TmuxControlTests(unittest.TestCase):
             calls,
         )
 
-    def test_handle_goal_prompt_resumes_stalled_goal_after_fatal_recovery(self):
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=True)
+    def test_handle_goal_prompt_resumes_stalled_goal_after_fatal_recovery(
+        self, _codex_running_mock
+    ):
         calls = []
         sleeps = []
 
@@ -1012,14 +1062,6 @@ class TmuxControlTests(unittest.TestCase):
         self.assertEqual(
             [
                 ["tmux", "capture-pane", "-p", "-t", "codex-goal"],
-                [
-                    "tmux",
-                    "display-message",
-                    "-p",
-                    "-t",
-                    "codex-goal",
-                    "#{pane_current_command}",
-                ],
                 ["tmux", "send-keys", "-t", "codex-goal", "-l", "/goal resume"],
                 ["tmux", "send-keys", "-t", "codex-goal", "Enter"],
             ],
@@ -1232,7 +1274,10 @@ class TmuxControlTests(unittest.TestCase):
             commands,
         )
 
-    def test_execute_steps_waits_for_text_to_settle_before_enter(self):
+    @patch("codex_goal_watchdog.tmux_control.pane_codex_running", return_value=True)
+    def test_execute_steps_waits_for_text_to_settle_before_enter(
+        self, _codex_running_mock
+    ):
         events = []
 
         execute_steps(
@@ -1244,17 +1289,6 @@ class TmuxControlTests(unittest.TestCase):
 
         self.assertEqual(
             [
-                (
-                    "run",
-                    [
-                        "tmux",
-                        "display-message",
-                        "-p",
-                        "-t",
-                        "codex-goal",
-                        "#{pane_current_command}",
-                    ],
-                ),
                 (
                     "run",
                     ["tmux", "send-keys", "-t", "codex-goal", "-l", "/quit"],

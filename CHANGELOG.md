@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.36] - 2026-10-20
+
+### Fixed
+
+- Use descendant-aware tmux pane state before sending Codex prompts or shell
+  commands, preventing restart commands from interrupting a running Codex TUI.
+- Recheck that the pane remains an idle shell after interrupting a Bash
+  continuation, before sending the generated command.
+
 ## [0.1.35] - 2026-10-12
 
 ### Fixed

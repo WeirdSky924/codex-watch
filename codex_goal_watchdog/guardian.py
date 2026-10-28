@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from functools import partial
@@ -30,6 +31,7 @@ from .execution_profile import (
 )
 from .paths import default_log_path
 from .bindings import (
+    SessionBinding,
     load_session_binding,
     save_binding_runtime_state,
 )
@@ -46,6 +48,7 @@ from .recovery import (
 )
 from .sessions import (
     find_latest_thread_execution_profile,
+    ThreadTelemetryTracker,
 )
 from .tmux_control import (
     LAST_RECOVERY_INCIDENT_OPTION,
@@ -79,6 +82,46 @@ from .rotation_state import (
 
 UPDATE_SUCCESS_MARKER = "Update ran successfully! Please restart Codex."
 SHELL_COMMANDS = {"bash", "zsh", "sh", "fish"}
+MISSING_SESSION_RETRY_REASON = "tmux_session_missing"
+
+
+def _start_bound_session(
+    session: str,
+    binding: SessionBinding,
+    *,
+    runner=subprocess.run,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "codex_goal_watchdog",
+        "start",
+        "--session",
+        session,
+        "--thread-id",
+        binding.thread_id,
+        "--no-attach",
+    ]
+    return runner(
+        command,
+        cwd=binding.cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
+    )
+
+
+def _binding_cooldown_seconds(binding: SessionBinding) -> int:
+    value = binding.launch_options.get("cooldown_seconds")
+    return max(1, value) if type(value) is int and value >= 0 else 300
+
+
+def _process_error_detail(exc: BaseException) -> str:
+    detail = " ".join(str(exc).split())
+    return detail[:500]
+
+
 class _RecoveryContentionLogger:
     """Collapse repeated lock-contention messages into one bounded record."""
 
@@ -117,10 +160,26 @@ def guard_once(
     recover_missing_codex: Callable[[], bool | None] | None = None,
     pending_submission_recovery_needed: Callable[[], bool] | None = None,
     recover_pending_submission: Callable[[], bool | None] | None = None,
+    missing_session_recovery_needed: Callable[[], bool] | None = None,
+    recover_missing_session: Callable[[], bool | None] | None = None,
     inspect_active_screen: bool = True,
 ) -> str:
     if not session_exists():
-        return "session_missing"
+        if (
+            missing_session_recovery_needed is None
+            or not missing_session_recovery_needed()
+        ):
+            return "session_missing"
+        if recover_missing_session is None:
+            raise ValueError("missing session recovery callback is required")
+        if recover_missing_session() is False:
+            return "recovery_in_progress"
+        if not session_exists():
+            return "session_missing"
+        if pipe_active():
+            return "recovered_session"
+        attach_monitor()
+        return "recovered_session_and_reattached"
     codex_is_running = codex_running is None or codex_running()
     if codex_is_running and clear_update_completion is not None:
         clear_update_completion()
@@ -353,12 +412,8 @@ def _guardian_update_restart_needed(
 def _missing_codex_recovery_required(
     *,
     goal_state: str | None,
-    pending_rotation: bool,
-    verification_pending: bool,
 ) -> bool:
-    return recovery_allowed_for_goal_state(goal_state) and (
-        pending_rotation or verification_pending
-    )
+    return recovery_allowed_for_goal_state(goal_state)
 
 
 def _restart_pinned_thread_after_update(
@@ -664,6 +719,8 @@ def run_guardian(
     last_status = ""
     active_screen_check_pending = True
     pending_retry_after = 0.0
+    missing_session_retry_after = 0.0
+    missing_session_blocked_reason = ""
     contention_logs = _RecoveryContentionLogger(
         lambda message: _append_log(log_path, message)
     )
@@ -763,18 +820,10 @@ def run_guardian(
 
             def missing_codex_recovery_needed() -> bool:
                 assert config is not None
-                binding = load_session_binding(session)
                 if _recovery_deferred(session):
                     return False
                 return _missing_codex_recovery_required(
                     goal_state=recovery_goal_state_on_screen(session),
-                    pending_rotation=has_pending_thread_rotation(
-                        session,
-                        thread_id=config.thread_id,
-                    ),
-                    verification_pending=bool(
-                        binding is not None and binding.verification_pending
-                    ),
                 )
 
             def recover_missing_codex() -> bool:
@@ -869,6 +918,144 @@ def run_guardian(
                     )
                 return recovered
 
+            def missing_session_recovery_needed() -> bool:
+                nonlocal missing_session_blocked_reason
+                if (
+                    time.monotonic() < missing_session_retry_after
+                    or _recovery_deferred(session)
+                ):
+                    return False
+                binding = load_session_binding(session)
+                if binding is None:
+                    reason = "no durable pinned-thread binding"
+                    if missing_session_blocked_reason != reason:
+                        _append_log(
+                            log_path,
+                            "cannot recreate missing tmux session: " + reason,
+                        )
+                        missing_session_blocked_reason = reason
+                    return False
+                if not binding.cwd.is_dir():
+                    reason = f"bound working directory is unavailable: {binding.cwd}"
+                    if missing_session_blocked_reason != reason:
+                        _append_log(
+                            log_path,
+                            "cannot recreate missing tmux session: " + reason,
+                        )
+                        missing_session_blocked_reason = reason
+                    return False
+                missing_session_blocked_reason = ""
+                return True
+
+            def recover_missing_session() -> bool:
+                nonlocal config, log_path, missing_session_retry_after
+                binding = load_session_binding(session)
+                if binding is None:
+                    return False
+                try:
+                    with session_recovery_lock(session):
+                        if tmux_session_exists(session):
+                            config = _recovery_config(session)
+                            return True
+                        if _recovery_deferred(session):
+                            return False
+                        telemetry = ThreadTelemetryTracker(
+                            thread_id=binding.thread_id
+                        ).snapshot()
+                        verification_baseline = (
+                            telemetry.verified_event_count
+                            if telemetry is not None
+                            else binding.verification_baseline
+                        )
+                        successful_compactions = max(
+                            binding.successful_compactions,
+                            telemetry.compaction_count
+                            if telemetry is not None
+                            else 0,
+                        )
+                        recovery_count = binding.recovery_count + 1
+                        save_binding_runtime_state(
+                            session=session,
+                            recovery_count=recovery_count,
+                            successful_compactions=successful_compactions,
+                            verification_pending=True,
+                            verification_baseline=verification_baseline,
+                            recovery_phase="action",
+                            recovery_not_before=0.0,
+                            last_recovery_reason=MISSING_SESSION_RETRY_REASON,
+                        )
+                        model = binding.launch_options.get(
+                            "primary_model", "saved model"
+                        )
+                        effort = binding.launch_options.get(
+                            "primary_reasoning_effort", "saved effort"
+                        )
+                        _append_log(
+                            log_path,
+                            "tmux session missing; recreating pinned thread "
+                            f"{binding.thread_id} with saved profile "
+                            f"{model}/{effort}; recovery #{recovery_count}",
+                        )
+                        launch_error = ""
+                        try:
+                            _start_bound_session(session, binding)
+                        except (
+                            OSError,
+                            subprocess.SubprocessError,
+                            TimeoutError,
+                        ) as exc:
+                            launch_error = _process_error_detail(exc)
+
+                        if not tmux_session_exists(session):
+                            cooldown = _binding_cooldown_seconds(binding)
+                            missing_session_retry_after = (
+                                time.monotonic() + cooldown
+                            )
+                            save_binding_runtime_state(
+                                session=session,
+                                recovery_count=recovery_count,
+                                successful_compactions=successful_compactions,
+                                verification_pending=True,
+                                verification_baseline=verification_baseline,
+                                recovery_phase="cooldown",
+                                recovery_not_before=time.time() + cooldown,
+                                last_recovery_reason=MISSING_SESSION_RETRY_REASON,
+                            )
+                            detail = (
+                                launch_error
+                                or "codex-watch did not create the tmux session"
+                            )
+                            _append_log(
+                                log_path,
+                                "missing tmux session recovery failed; "
+                                f"retry delayed {cooldown}s: {detail}",
+                            )
+                            return False
+
+                        config = _recovery_config(session)
+                        log_path = Path(
+                            _tmux_option(
+                                session,
+                                "@codex_log_path",
+                                str(default_log_path()),
+                            )
+                        ).expanduser()
+                        missing_session_retry_after = 0.0
+                        missing_session_blocked_reason = ""
+                        _append_log(
+                            log_path,
+                            "recreated tmux session on pinned thread "
+                            f"{config.thread_id}; model="
+                            f"{config.primary_model}/{config.primary_reasoning_effort}",
+                        )
+                        return True
+                except RecoveryInProgress:
+                    record_contention(
+                        operation="missing tmux session",
+                        detail=binding.thread_id,
+                    )
+                    return False
+
             def consume_update_completion() -> None:
                 mark_update_completion_consumed(session)
 
@@ -922,11 +1109,15 @@ def run_guardian(
                 recover_missing_codex=recover_missing_codex,
                 pending_submission_recovery_needed=pending_submission_recovery_needed,
                 recover_pending_submission=recover_pending_submission,
+                missing_session_recovery_needed=missing_session_recovery_needed,
+                recover_missing_session=recover_missing_session,
                 inspect_active_screen=active_screen_check_pending,
             )
             active_screen_check_pending = status in {
                 "session_missing",
                 "restarted_after_update",
+                "recovered_session",
+                "recovered_session_and_reattached",
             }
             if status != last_status or status not in {
                 "healthy",

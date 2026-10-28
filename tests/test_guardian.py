@@ -15,6 +15,7 @@ from codex_goal_watchdog.guardian import (
     _recovery_config,
     _recovery_reason_on_screen,
     _restart_pinned_thread_after_update,
+    _start_bound_session,
     _update_target_version_on_screen,
     recovery_goal_state_on_screen,
     _unhandled_recovery_incident_on_screen,
@@ -213,16 +214,26 @@ class GuardianTests(unittest.TestCase):
         self.assertFalse(
             _missing_codex_recovery_required(
                 goal_state="achieved",
-                pending_rotation=True,
-                verification_pending=True,
             )
         )
         self.assertTrue(
             _missing_codex_recovery_required(
                 goal_state="pursuing",
-                pending_rotation=False,
-                verification_pending=True,
             )
+        )
+
+    def test_missing_codex_recovery_does_not_need_pending_watchdog_marker(self):
+        self.assertTrue(
+            _missing_codex_recovery_required(goal_state="pursuing")
+        )
+        self.assertTrue(
+            _missing_codex_recovery_required(goal_state="stalled")
+        )
+        self.assertTrue(
+            _missing_codex_recovery_required(goal_state="blocked")
+        )
+        self.assertFalse(
+            _missing_codex_recovery_required(goal_state="paused")
         )
 
     def test_guardian_recovers_completed_update_with_pending_version(self):
@@ -419,6 +430,119 @@ class GuardianTests(unittest.TestCase):
         )
 
         self.assertEqual("session_missing", status)
+
+    def test_guard_once_recreates_missing_session_and_keeps_existing_monitor(self):
+        state = {"session": False, "pipe": False}
+        calls = []
+
+        def recreate():
+            calls.append("recreate")
+            state["session"] = True
+            state["pipe"] = True
+            return True
+
+        status = guard_once(
+            session_exists=lambda: state["session"],
+            pipe_active=lambda: state["pipe"],
+            stalled_screen=lambda: False,
+            recover=lambda: calls.append("recover"),
+            attach_monitor=lambda: calls.append("attach"),
+            missing_session_recovery_needed=lambda: True,
+            recover_missing_session=recreate,
+        )
+
+        self.assertEqual("recovered_session", status)
+        self.assertEqual(["recreate"], calls)
+
+    def test_guard_once_attaches_monitor_after_recreating_missing_session(self):
+        state = {"session": False}
+        calls = []
+
+        def recreate():
+            state["session"] = True
+            return True
+
+        status = guard_once(
+            session_exists=lambda: state["session"],
+            pipe_active=lambda: False,
+            stalled_screen=lambda: False,
+            recover=lambda: None,
+            attach_monitor=lambda: calls.append("attach"),
+            missing_session_recovery_needed=lambda: True,
+            recover_missing_session=recreate,
+        )
+
+        self.assertEqual("recovered_session_and_reattached", status)
+        self.assertEqual(["attach"], calls)
+
+    def test_guard_once_does_not_recreate_missing_session_without_binding(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: False,
+            pipe_active=lambda: False,
+            stalled_screen=lambda: False,
+            recover=lambda: None,
+            attach_monitor=lambda: calls.append("attach"),
+            missing_session_recovery_needed=lambda: False,
+            recover_missing_session=lambda: calls.append("recreate"),
+        )
+
+        self.assertEqual("session_missing", status)
+        self.assertEqual([], calls)
+
+    def test_guard_once_reports_failed_missing_session_recovery(self):
+        calls = []
+
+        status = guard_once(
+            session_exists=lambda: False,
+            pipe_active=lambda: False,
+            stalled_screen=lambda: False,
+            recover=lambda: None,
+            attach_monitor=lambda: calls.append("attach"),
+            missing_session_recovery_needed=lambda: True,
+            recover_missing_session=lambda: calls.append("recreate") or False,
+        )
+
+        self.assertEqual("recovery_in_progress", status)
+        self.assertEqual(["recreate"], calls)
+
+    def test_start_bound_session_uses_saved_thread_and_bound_working_directory(self):
+        thread_id = "550e8400-e29b-41d4-a716-446655440000"
+        binding = SessionBinding(
+            session="codex-goal",
+            thread_id=thread_id,
+            cwd=Path("/workspace/project"),
+            launch_options={"primary_model": "gpt-6.1-sol"},
+        )
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        result = _start_bound_session("codex-goal", binding, runner=runner)
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(1, len(calls))
+        command, options = calls[0]
+        self.assertEqual(
+            [
+                sys.executable,
+                "-m",
+                "codex_goal_watchdog",
+                "start",
+                "--session",
+                "codex-goal",
+                "--thread-id",
+                thread_id,
+                "--no-attach",
+            ],
+            command,
+        )
+        self.assertEqual(binding.cwd, options["cwd"])
+        self.assertTrue(options["check"])
+        self.assertEqual(300, options["timeout"])
 
     def test_guard_once_restarts_after_update_even_when_pipe_is_active(self):
         calls = []

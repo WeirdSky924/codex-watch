@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.37] - 2026-10-28
+
+### Fixed
+
+- Recreate a vanished tmux session from its durable pinned-thread binding, saved
+  launch profile, and working directory; retry failed recreation after cooldown.
+- Restart a missing Codex process whenever its native Goal remains pursuing,
+  stalled, or blocked, even when no prior recovery marker was persisted.
+
 ## [0.1.36] - 2026-10-20
 
 ### Fixed

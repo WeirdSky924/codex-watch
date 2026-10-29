@@ -7,6 +7,7 @@ import json
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -87,6 +88,47 @@ def _guardian_enable_command(session: str) -> list[str]:
         "--now",
         f"codex-watch-guardian@{session}.service",
     ]
+
+
+def _attach_tmux_session(
+    session: str,
+    *,
+    runner=None,
+    session_exists=None,
+    sleeper=time.sleep,
+) -> None:
+    if runner is None:
+        runner = subprocess.run
+    if session_exists is None:
+        session_exists = tmux_session_exists
+
+    command = tmux_attach_command(session)
+    immediate_retry_used = False
+    while True:
+        try:
+            runner(command, check=True)
+            return
+        except subprocess.CalledProcessError:
+            if session_exists(session):
+                if immediate_retry_used:
+                    raise
+                immediate_retry_used = True
+                sleeper(1)
+                continue
+
+            immediate_retry_used = False
+            print(
+                "[codex-goal-watchdog] tmux session disappeared while "
+                "attaching; waiting for Guardian to restore it "
+                "(Ctrl-C to stop waiting)",
+                flush=True,
+            )
+            while not session_exists(session):
+                sleeper(1)
+            print(
+                "[codex-goal-watchdog] tmux session is back; attaching again",
+                flush=True,
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -500,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             if not args.no_attach:
-                run_command(tmux_attach_command(args.session))
+                _attach_tmux_session(args.session)
             return 0
     pipe_command = monitor_pipe_command(
         root_dir=str(root_dir),
@@ -552,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
     if not args.no_attach:
-        run_command(tmux_attach_command(args.session))
+        _attach_tmux_session(args.session)
     return 0
 
 

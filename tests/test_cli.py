@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -7,12 +8,78 @@ from pathlib import Path
 from unittest.mock import call, patch
 
 from codex_goal_watchdog import __version__
-from codex_goal_watchdog.__main__ import guardian_main, main, start_main
+from codex_goal_watchdog.__main__ import (
+    _attach_tmux_session,
+    guardian_main,
+    main,
+    start_main,
+)
 from codex_goal_watchdog.bindings import SessionBinding
 from codex_goal_watchdog.tmux_control import RecoveryInProgress
 
 
 class ConsoleEntrypointTests(unittest.TestCase):
+    def test_attach_waits_for_guardian_to_restore_missing_session(self):
+        session_states = iter([False, False, True])
+        attach_error = subprocess.CalledProcessError(1, ["tmux", "attach"])
+        attach_calls = []
+        sleeps = []
+
+        def runner(command, *, check):
+            attach_calls.append((command, check))
+            if len(attach_calls) == 1:
+                raise attach_error
+            return subprocess.CompletedProcess(command, 0)
+
+        _attach_tmux_session(
+            "codex-goal",
+            runner=runner,
+            session_exists=lambda _session: next(session_states),
+            sleeper=sleeps.append,
+        )
+
+        self.assertEqual(2, len(attach_calls))
+        self.assertTrue(all(check for _command, check in attach_calls))
+        self.assertEqual([1], sleeps)
+
+    def test_attach_retries_once_when_session_exists_after_failure(self):
+        attach_error = subprocess.CalledProcessError(1, ["tmux", "attach"])
+        calls = []
+
+        def runner(command, *, check):
+            calls.append(command)
+            if len(calls) == 1:
+                raise attach_error
+            return subprocess.CompletedProcess(command, 0)
+
+        _attach_tmux_session(
+            "codex-goal",
+            runner=runner,
+            session_exists=lambda _session: True,
+            sleeper=lambda _seconds: None,
+        )
+
+        self.assertEqual(2, len(calls))
+
+    def test_attach_preserves_persistent_failure_when_session_exists(self):
+        attach_error = subprocess.CalledProcessError(1, ["tmux", "attach"])
+        calls = []
+
+        def runner(command, *, check):
+            calls.append(command)
+            raise attach_error
+
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            _attach_tmux_session(
+                "codex-goal",
+                runner=runner,
+                session_exists=lambda _session: True,
+                sleeper=lambda _seconds: None,
+            )
+
+        self.assertIs(attach_error, raised.exception)
+        self.assertEqual(2, len(calls))
+
     @patch("codex_goal_watchdog.__main__.main", return_value=7)
     def test_codex_watch_injects_start_subcommand(self, main_mock):
         with patch.object(sys, "argv", ["codex-watch", "--resume", "--safe"]):
